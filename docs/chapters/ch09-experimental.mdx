@@ -1,0 +1,1526 @@
+---
+title: 第 9 章　实验线：chord、pi-durable、pi-env
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 9 章　实验线：chord、pi-durable、pi-env
+
+## 导读
+
+<Say id="k09-01" cue="session">这一章讲 pi 仓库里的另一条线：持久化的 agent 运行时。</Say>
+<Say id="k09-02">pi CLI 目前不用这三个包，它们自成一套，解决进程会死、要跨进程、要远程执行的问题。</Say>
+<Say id="k09-03" cue="chord">chord 是底座：跨进程的对象和引用，状态用快照加增量同步，代码可以热重载。</Say>
+<Say id="k09-04" cue="storage">pi-durable 的核心规则是先写入存储，再给人看。</Say>
+<Say id="k09-05" cue="scheduler">模型调用和工具调用都是带检查点的任务，进程崩了，重开存储就从检查点继续。</Say>
+<Say id="k09-06" cue="daemon">pi-env 是一个 Rust 小程序，经 SSH 跑在远程机器上，替 durable 读写文件、执行命令。</Say>
+<Say id="k09-07">读完你应该能讲清：一次跨进程调用发了哪些帧，一次状态同步怎么只传增量。</Say>
+<Say id="k09-08">还能讲清：模型流式输出到一半进程被杀，重启后会发生什么。</Say>
+
+## 1. 三个包的定位
+
+前面八章讲的都是 `pi` CLI 用到的包：pi-ai、pi-agent-core、pi-coding-agent、pi-tui 等。`packages/` 下还有三个包，`pi` CLI 一个也没依赖。在仓库里搜 `package.json`，只有它们自己互相引用：
+
+| 包 | npm 名 | 语言 | 依赖 | 一句话 |
+| --- | --- | --- | --- | --- |
+| chord | `@earendil-works/chord` | TS | pi-telemetry、typebox | 跨进程对象运行时：契约、引用、可复制状态、RPC、热重载 |
+| pi-durable | `@earendil-works/pi-durable` | TS | chord、pi-ai、pi-codemode、pi-telemetry | 持久化 agent harness：所有进展先提交到存储再展示，崩溃后接着跑 |
+| pi-env | `@earendil-works/pi-env` | TS + Rust | chord、pi-durable | 远程执行环境：Rust daemon 经 SSH 部署，TS 端实现 durable 的 `ExecutionEnv` |
+
+依赖关系见 [durable/package.json](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/package.json) 和 [env/package.json](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/env/package.json)。有三点读源码前就要知道，否则容易想错：
+
+1. **pi-durable 不依赖 pi-agent-core。** 它没有复用第 2 章的 `runLoop`，而是把“调模型、执行工具、再调模型”拆成可持久化的任务自己实现了一遍。它直接用 pi-ai 的 `Models.streamSimple()` 调模型。源码里唯一提到 agent-core 的是一行注释（[generation.ts:662](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/src/harness/generation.ts#L662)）。
+2. **pi-durable 只用 chord 的“底座”，不用 chord 的对象和 RPC。** durable 从 chord 导入的是 `Context`、`JsonValue`、`Draft`、`copyJson`、`Watch`/`WatchHandle`、`@earendil-works/chord/delta` 的增量操作，以及 `@earendil-works/chord/sqlite` 的 SQLite 适配。`createHost`、`remote()` 这些对象层 API 在 chord 包外没有任何调用。chord 的规范里把 durable 的任务阶段称为 “code holder”（长期运行、不属于某个调用树的执行体），说明两者设计时就考虑了组合，但组合代码在应用层，不在本仓库。
+3. **pi-env 是 durable 的插件。** durable 定义了 `ExecutionEnv` 接口（文件系统 + shell），自带一个本机实现 `NodeExecutionEnv`。pi-env 提供 `RemoteExecutionEnv`，语义上对齐“在远程机器上跑 `NodeExecutionEnv`”。
+
+下图是三者在运行时的关系：应用通过 Harness 提交输入，所有写入经过 Session 的提交线落到 Storage；调度器运行生成任务和工具任务，生成任务调 pi-ai，工具任务通过 `ExecutionEnv` 经 SSH 到达远程 daemon；chord 提供增量和 watch，应用看到的永远是已提交的状态。
+
+<Diagram src="/diagrams/ch09-experimental.html" title="实验线：pi-durable、chord、pi-env 的运行时关系" />
+
+下面按 chord → pi-durable → pi-env 的顺序讲，因为后者都建立在前者之上。
+
+## 2. chord：对象、引用与跨进程调用
+
+### 2.1 要解决的问题
+
+设想一个 agent 服务：主进程是 server，每个会话跑在一个 worker 子进程里，浏览器标签页也要看会话状态、发消息。直接写会遇到三类问题：
+
+- 浏览器要调用 worker 里的方法，但它不知道对象在哪个进程，也不该知道。
+- 浏览器要实时看会话状态。每次全量推送太贵，自己写增量协议又容易丢帧、乱序。
+- 开发时改了插件代码，不想重启 worker，因为里面有正在跑的任务和内存状态。
+
+chord 的答案写在 README 开头：应用由**对象**组成，对象可以分布在多个进程里，并且能在运行中热重载。下表是它的核心术语，来自 [docs/spec.md](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/docs/spec.md) 第 1 节：
+
+| 术语 | 含义 |
+| --- | --- |
+| contract（契约） | 对象类型的运行时描述，用 TypeBox schema 写成。`remote` 类型可跨进程寻址，`local` 类型只在本进程 |
+| facet | 一个插件在某个 host 上的代码，负责 `serve` 若干对象类型 |
+| host | 一个运行 chord 的进程（或进程内实例），有名字，通过 link 连到父 host 或子 host |
+| object | 某类型的一个实例，身份由“类型 + 规范化输入 + principal”决定，被引用时存活 |
+| reference | `get` 返回的东西：对对象的晚绑定引用，永远拿不到对象本身。本地和远程用法相同，热重载后依然有效 |
+| principal | 调用方身份，由应用定义，由 link 盖章。同一地址，owner 和 guest 拿到的是两个对象 |
+| root | 一棵短调用树，带 `rootId` 和 `codeVersion`，在可信入口创建（link 请求、UI 事件、定时器、`host.root`） |
+| code version | 一个 host 上一次提交的整套实现。host 最多同时保留 current 和 previous 两个 |
+
+### 2.2 契约与放置
+
+先看 README 的最小例子。`Counter` 是一个 `remote` 类型，`host: hostNamed("server")` 声明它的对象只住在名叫 `server` 的 host 上：
+
+```ts title="packages/chord/README.md:30-63"
+import { Type } from "typebox";
+import { createHost, hostNamed, method, remote } from "@earendil-works/chord";
+
+// contract.ts: shared by provider and consumers
+export const Counter = remote("demo.counter", {
+	version: 1,
+	input: Type.Object({ name: Type.String() }),
+	host: hostNamed("server"), // where its objects live; callers never name a host
+	variants: {
+		default: {
+			state: { count: Type.Number() },
+			methods: { increment: method(Type.Object({ by: Type.Number() })) },
+		},
+	},
+});
+
+const host = createHost({ name: "server", self: { kind: "server" } });
+
+host.serve(Counter, ({ name }, _principal, self) => {
+	const count = self.state("count", Type.Number(), 0);
+	return {
+		variant: "default",
+		count,
+		increment: async ({ by }, ctx) => {
+			count.change(ctx, (n) => n + by);
+		},
+	};
+});
+
+await host.root(async (ctx) => {
+	const clicks = await ctx.get(Counter, { name: "clicks" }); // ready, with its state; released when this root ends
+	clicks.count.subscribe((n) => console.log("count", n));
+	await clicks.increment({ by: 2 }, ctx); // logs 0, then 2
+});
+```
+
+几个要点：
+
+- 契约是**运行时值**，不只是 TS 类型。因为插件可能是单独打包的第三方代码，运行时没有 TypeScript，只能靠 schema 校验参数、结果和状态。
+- 工厂函数 `(input, principal, self) => implementation` 必须同步。`self.state(...)` 声明一个状态单元（cell），返回的实现对象里既有方法也有状态成员。
+- 调用方只写 `ctx.get(Counter, { name: "clicks" })`，从不写 host 名。放置规则由契约决定。
+
+放置有两种：`hostNamed(name)` 固定一个 host；`hostFamily(prefix, key)` 用输入里的某个字段拼出 host 名，例如 `hostFamily("session:", "session")` 把 `{ session: "S1" }` 放到 `session:S1`。解析函数很短：
+
+```ts title="packages/chord/src/contract.ts:84-93"
+/** The host an object of `placement` with this (normalized) input lives on. Throws `invalid/placement`. */
+export function resolveHost(typeName: string, placement: Placement, input: unknown): string {
+	if ("name" in placement) return placement.name;
+	const value =
+		input !== null && typeof input === "object" ? (input as Record<string, unknown>)[placement.key] : undefined;
+	if (typeof value !== "string" || value === "")
+		throw invalid("placement", `${typeName}: input field ${placement.key} names no host`);
+	return placement.prefix + value;
+}
+```
+
+host 在 `get` 时用它判断对象是在本地还是在别处：
+
+```ts title="packages/chord/src/host.ts:507-513"
+	#elsewhere(type: AnyContract, input: unknown): { readonly at: string; readonly input: unknown } | undefined {
+		const placement = type.description.host;
+		if (type.scope !== "remote" || placement === undefined) return undefined;
+		const normalized = normalize(type.input, input, `${type.name} input`);
+		const at = resolveHost(type.name, placement, normalized);
+		return at === this.name ? undefined : { at, input: normalized };
+	}
+```
+
+返回 `undefined` 就在本地激活对象；否则建立一个远程绑定（`RemoteBinding`），通过 link 发 `hold` 帧。注意远程引用的地址里没有 host 名，只有类型、规范化输入和 principal，所以对象换了宿主是契约的破坏性变更，必须升版本。
+
+### 2.3 线协议：帧和 link
+
+host 之间只交换 JSON 帧。所有帧在 [wire.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/src/wire.ts) 里用一个 TypeBox union 定义一次，收到的每一帧都先按 schema 校验。文件头的注释把方向讲得很清楚：
+
+```ts title="packages/chord/src/wire.ts:6-24"
+// JSON frames between two hosts (or a host and a client). Ids are chosen by the side that creates the hold, call or
+// subscription; every frame type has one direction, so ids never collide:
+//   consumer → provider: hold, release, call, cancel, sub, unsub, resync
+//   provider → consumer: shape, gone, result, state
+// State is addressed by (hold id, member): a hold implies the state of its variant, sent as units (a shape followed by
+// a snapshot of each member the consumer lacks; see Connection).
+//   both: hello, ping, pong, bye, root_end, ack; parent → child: invalidate, prepare, commit, abort, retire;
+//   child → parent: vote
+//
+// Each frame is declared once, as the schema every received frame is checked against (`isFrame`); the types are derived
+// from it. Payloads (hold inputs, call args, results, snapshots) stay `unknown`: they are validated where they are
+// used, against the contract. State ops are checked op by op by the delta decoder.
+
+/**
+ * The link protocol version, announced in `hello`. Peers of different versions do not talk: the side that notices
+ * closes the link with reason `protocol-version <its version>`, so the other side learns it too
+ * (`LinkOptions.onProtocolMismatch`).
+ */
+export const PROTOCOL_VERSION = 4;
+```
+
+“每种帧只有一个方向”是个小而关键的设计：hold、call、sub 的 id 都由发起方分配，而反方向的帧不会发起同类请求，所以两端各自计数也不会撞 id。和本章相关的几种帧如下：
+
+```ts title="packages/chord/src/wire.ts:73-140"
+	Type.Object({
+		t: Type.Literal("hold"),
+		id: Id,
+		/**
+		 * Target host name, resolved by the consumer from the token's `host` and `input`. Relays route on it after
+		 * checking it against both; the target refuses an input its own contract places elsewhere.
+		 */
+		at: Name,
+		/** The consumer's contract token; the provider checks that it covers it. Remote tokens carry `host`. */
+		token: DescriptionSchema,
+		/** Normalized with the consumer's contract. */
+		input: Type.Unknown(),
+		// ...
+	}),
+	Type.Object({ t: Type.Literal("release"), id: Id }),
+	Type.Object({
+		t: Type.Literal("shape"),
+		id: Id,
+		variant: Type.Optional(Type.String()),
+		members: List(Type.String()),
+		contract: Type.String(),
+		/** The state members whose snapshots follow this frame; the consumer applies the shape once they are here. */
+		state: List(Name),
+	}),
+	Type.Object({ t: Type.Literal("gone"), id: Id, error: WireErrorSchema }),
+	Type.Object({
+		t: Type.Literal("call"),
+		id: Id,
+		hold: Id,
+		member: Name,
+		args: Type.Optional(Type.Unknown()),
+		/** Absent: the receiving host starts a root (browsers never carry roots). */
+		root: Type.Optional(RootRefSchema),
+	}),
+	Type.Object({
+		t: Type.Literal("result"),
+		id: Id,
+		value: Type.Optional(Type.Unknown()),
+		error: Type.Optional(WireErrorSchema),
+	}),
+	// ...
+	Type.Object({
+		t: Type.Literal("state"),
+		hold: Id,
+		m: Name,
+		/** `snap`/`reset` without `value`: the value is `undefined`. */
+		as: Type.Union([Type.Literal("snap"), Type.Literal("reset"), Type.Literal("ops"), Type.Literal("error")]),
+		value: Type.Optional(Type.Unknown()),
+		/** Encoded with the stream's delta encoder; the decoder validates each op. */
+		ops: Type.Optional(List(List(Type.Unknown()))),
+		error: Type.Optional(WireErrorSchema),
+	}),
+```
+
+注意：chord 没有单独的 `get` 帧。远程引用就是一个 `hold`，provider 回 `shape`（或 `gone`），之后的方法调用都挂在这个 hold 的 id 上。
+
+帧走在 link 上。link 只是一个很薄的传输接口，内置内存对（测试用）、Node IPC（父子进程）和 WebSocket（浏览器）三种实现：
+
+```ts title="packages/chord/src/link.ts:5-18"
+export interface Link {
+	readonly closed: boolean;
+	/**
+	 * Returns the size of the encoded frame as sent (JSON text length, or bytes of a packed message) when the transport
+	 * knows it. The connection's flow control counts these sizes; frames without one count as zero, so a link that never
+	 * reports sizes is not windowed.
+	 */
+	send(frame: Frame): number | undefined;
+	/** Sets the single receiver. Frames arriving earlier are queued. */
+	receive(handler: (frame: Frame) => void): void;
+	onClose(handler: (reason: string) => void): void;
+	/** Closes both ends: the peer gets a `bye`. */
+	close(reason?: string): void;
+}
+```
+
+### 2.4 一次跨进程调用的完整路径
+
+用一个具体场景走一遍：worker 里的某段代码持有 server 上 `Counter` 的远程引用 `clicks`，调用 `clicks.increment({ by: 2 }, ctx)`。
+
+**第 1 步：消费端引用生成 caller。** 远程引用的成员是按契约懒生成的。方法成员是一个闭包：
+
+```ts title="packages/chord/src/remote.ts:624-657"
+	#caller(name: string): (...given: unknown[]) => Promise<unknown> {
+		let caller = this.#callers.get(name);
+		if (caller === undefined) {
+			const noArgs = takesNoArgs(this.contract, name);
+			caller = (...given) => {
+				// A method without arguments is called as `ref.name(ctx)`.
+				const [args, ctx] = (noArgs ? [undefined, given[0]] : given) as [unknown, Ctx | undefined];
+				const host = this.binding.host;
+				if (host.inFactory > 0)
+					throw new ChordError("not_ready", `${this.address}.${name} called inside a factory`);
+				// ...
+				if (ctx === undefined || ctx.holder) {
+					return host.root((root) => this.#call(name, args, root), { signal: ctx?.signal });
+				}
+				return this.#call(name, args, ctx);
+			};
+			this.#callers.set(name, caller);
+		}
+		return caller;
+	}
+
+	#call(name: string, args: unknown, ctx: Ctx): Promise<unknown> {
+		if (this.ended) return Promise.reject(this.terminalError());
+		return this.binding.call(name, args, ctx);
+	}
+```
+
+第 644 行是 root 规则：没有 ctx，或 ctx 来自一个长期运行的 “holder”（例如 `self.task` 的循环，或 durable 的任务阶段），就先开一个新的 root。这样每次调用都属于一棵短调用树，热重载时才能判断“这棵树用的是哪个代码版本”。
+
+**第 2 步：绑定等待 live，按自己的契约裁剪参数。**
+
+```ts title="packages/chord/src/remote.ts:334-356"
+	/** Calls `name` over the current hold, waiting for it while the binding (re)holds. */
+	async call(name: string, args: unknown, ctx: Ctx): Promise<unknown> {
+		for (;;) {
+			if (this.ended) throw this.terminalError();
+			if (this.status !== "live" || this.hold === undefined) await raceSignal(this.#live.promise, ctx.signal);
+			const hold = this.hold;
+			if (hold === undefined || this.status !== "live") continue;
+			const variant = this.shape?.variant;
+			const description = variant === undefined ? undefined : this.contract.description.variants[variant]?.[name];
+			if (description?.kind !== "method") {
+				throw new ChordError("not_in_variant", `${this.key}: ${name} is not a method of variant ${variant}`);
+			}
+			// Send only what the consumer's own schema knows (the additive rule's premise; see ObjectImpl.call).
+			const sent = description.args === undefined ? undefined : Value.Clean(description.args, Value.Clone(args));
+			return hold.channel.call(
+				hold.id,
+				name,
+				sent,
+				{ rootId: ctx.rootId, codeVersion: ctx.codeVersion },
+				ctx.signal,
+			);
+		}
+	}
+```
+
+`for (;;)` 处理 link 断开后重新 hold 的情况：调用会等到绑定重新 live 再发。`Value.Clean` 只保留消费端 schema 认识的字段，这是“新增字段不算破坏性变更”这条兼容规则的前提。
+
+**第 3 步：Connection 发 `call` 帧。**
+
+```ts title="packages/chord/src/connection.ts:700-729"
+	call(hold: number, member: string, args: unknown, root: RootRef | undefined, signal: AbortSignal): Promise<unknown> {
+		const id = this.nextId();
+		return new Promise<unknown>((resolve, reject) => {
+			if (signal.aborted) {
+				reject(new ChordError("aborted", "call aborted"));
+				return;
+			}
+			const onAbort = (): void => {
+				this.calls.delete(id);
+				this.send({ t: "cancel", id });
+				reject(new ChordError("aborted", "call aborted", { cause: signal.reason }));
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			// ...
+			// Clients never carry roots or code versions: the server starts roots for them.
+			const carried = root !== undefined && this.host.kind === "host";
+			if (carried) this.host.rootSent(root.rootId, this);
+			this.send({ t: "call", id, hold, member, args, ...(carried ? { root } : {}) });
+		});
+	}
+```
+
+两个细节：取消会发 `cancel` 帧，服务端据此中止对应的 `AbortController`；浏览器（`client`）永远不带 root，因为服务端不信任客户端声明的代码版本。
+
+**第 4 步：提供端收帧、校验、开 root。** 收到的任何帧先过 `isFrame`，不合法就关闭 link；合法的进 `#dispatch` 分发。`call` 帧到 `#onCall`：
+
+```ts title="packages/chord/src/connection.ts:1100-1146"
+	#onCall(frame: Extract<Frame, { t: "call" }>): void {
+		if (this.incoming.has(frame.id)) {
+			this.#violation(`duplicate call id ${frame.id}`);
+			return;
+		}
+		if (this.incoming.size >= this.#maxCalls) {
+			// ...
+			this.send({ t: "result", id: frame.id, error: toWireError(error) });
+			return;
+		}
+		const served = this.served.get(frame.hold);
+		if (served === undefined) {
+			this.send({ t: "result", id: frame.id, error: toWireError(new ChordError("gone", "unknown hold")) });
+			return;
+		}
+		const controller = new AbortController();
+		this.incoming.set(frame.id, controller);
+		// Roots are honored from hosts only; a request without one (or from a client) starts one here.
+		const root = this.peer.kind === "host" ? this.#admitRoot(frame.root) : undefined;
+		const principal = served.kind === "local" ? served.principal : served.relay.principal;
+		const options = { principal, signal: controller.signal };
+		const run =
+			served.kind === "local"
+				? (ctx: Ctx) => served.ref.object.call(served.ref, frame.member, unpack(frame.args), ctx as CtxImpl)
+				: (ctx: Ctx) =>
+						relayCall(
+							served.relay,
+							frame,
+							// ...
+						);
+		const result =
+			root === undefined
+				? this.host.root(run, options)
+				: this.host.joinRoot(root.rootId, root.codeVersion, run, { ...options, from: this });
+		result
+			.then(
+				(value) => this.send({ t: "result", id: frame.id, value }),
+				(error: unknown) => this.send({ t: "result", id: frame.id, error: toWireError(error) }),
+			)
+			.finally(() => this.incoming.delete(frame.id));
+	}
+```
+
+`served.kind` 区分两种情况：对象就在本 host（`local`），或者本 host 只是中继（`relay`，例如 server 把浏览器的调用转给 worker）。principal 不取自帧里的字段，而取自 hold 建立时 link 盖的章，防止伪造身份。
+
+**第 5 步：对象按代码版本分派。** `ObjectImpl.call` 先做准入，再取**这个 root 的代码版本**对应的实现：
+
+```ts title="packages/chord/src/object.ts:1521-1537"
+	admit(ctx: Ctx): void {
+		if (this.host.failed !== undefined) {
+			throw new ChordError("unavailable", `${this.host.name} failed and admits no work`, { reason: "host_failed" });
+		}
+		if (!this.host.hasCodeVersion(ctx.codeVersion))
+			throw new ChordError("superseded", `code version ${ctx.codeVersion} is retired`);
+		if (ctx.codeVersion < this.minCodeVersion) {
+			throw new ChordError(
+				"upgrade_conflict",
+				`${this.address} was upgraded in code version ${this.minCodeVersion}`,
+			);
+		}
+		if (this.gate !== undefined && !this.gate.grandfathered.has(ctx.rootId)) {
+			throw new ChordError("upgrade_conflict", `${this.address} is being upgraded`);
+		}
+	}
+```
+
+```ts title="packages/chord/src/object.ts:1555-1567"
+	async call(ref: RefImpl, name: string, args: unknown, ctx: CtxImpl): Promise<unknown> {
+		ctx.check(this.host);
+		if (ref.status === "released" || ref.status === "gone") throw ref.terminalError();
+		if (ref.status === "loading") await raceSignal(ref.ready, ctx.signal);
+		if (ref.status !== "live" || this.status !== "live") {
+			throw ref.status === "live"
+				? new ChordError("gone", `${this.address} is ${this.status}`)
+				: ref.terminalError();
+		}
+		this.admit(ctx);
+		const installed = this.implementations.get(ctx.codeVersion);
+		if (installed === undefined)
+			throw new ChordError(
+```
+
+`this.implementations` 是一个“代码版本 → 实现”的表。热重载之后，一棵在旧代码下开始的 root 继续调用旧实现，新 root 调用新实现，这就是 README 里“进行中的工作在它开始时的代码上跑完”的实现方式。之后 `call` 再按 provider 的 schema 校验参数、执行方法、校验返回值，结果经 `result` 帧回到第 3 步挂起的 Promise。
+
+整条链路可以压成一行：
+
+```text
+clicks.increment(args, ctx)
+  → RemoteRef#caller（必要时开 root）→ RemoteBinding.call（等 live，裁剪参数）
+  → Connection.call ──call 帧──▶ Connection.#onCall（校验，root / joinRoot）
+  → ObjectImpl.call（admit，按 codeVersion 取实现，校验 args / result）
+  ◀──result 帧── resolve
+```
+
+## 3. chord：可复制状态
+
+### 3.1 问题：浏览器怎么看一个不断变化的对象
+
+会话状态里有一段不断增长的模型输出文本。每次增长都把整段文本发给每个观察者，代价和文本长度成正比；只发“末尾追加了什么”，代价才和增量成正比。chord 的做法是：状态是普通 JSON，第一次发**快照**，之后只发**操作**（op）。
+
+### 3.2 增量操作语言
+
+op 定义在 `@earendil-works/chord/delta`，一共七种，全部是元组：
+
+```ts title="packages/chord/src/delta/index.ts:32-40"
+export type Op =
+	| readonly ["r", JsonValue]
+	| readonly ["s", NonEmptyPath, JsonValue]
+	| readonly ["d", NonEmptyPath]
+	| readonly ["a", NonEmptyPath, string]
+	| readonly ["t", NonEmptyPath, number]
+	| readonly ["p", Path, number, number, JsonValue[]]
+	/** Reorder an array in place: `new[i] = old[permutation[i]]`. */
+	| readonly ["m", Path, number[]];
+```
+
+| op | 含义 |
+| --- | --- |
+| `r` | 替换整个值，唯一能作用于根的替换 |
+| `s` / `d` | 设置 / 删除某个路径 |
+| `a` / `t` | 字符串末尾追加 / 从前面截断（流式输出和滚动日志的主力） |
+| `p` | 数组 splice |
+| `m` | 数组原地重排 |
+
+上线前还要编码：同一个路径第二次出现时才定义一个数字 id，后面用 id 引用；连续 op 路径相同时直接省略路径。`r` 是恢复点，编码器遇到它会清空路径字典，读者可以从最近一个 `r` 开始用新解码器重放。注释特别强调“每个独立状态流一对编码器/解码器”，共用一条连接不等于共用一个流。
+
+### 3.3 写入：cell.change 产生 op
+
+对象里的状态单元是 `Cell`。`change` 给回调一个草稿（draft），回调同步修改草稿，tracker 记录被改动的路径，`prepare()` 得到新的不可变值和 op 列表：
+
+```ts title="packages/chord/src/cell.ts:200-219"
+	change(ctx: Ctx, fn: (draft: Draft<T>) => unknown): void {
+		this.#guard(ctx);
+		if (!this.#initialized) throw notReady(`state ${this.key} (its init has not run)`);
+		const change = this.#tracker.beginChange();
+		let prepared: ReturnType<typeof change.prepare>;
+		try {
+			const draft = change.state as Draft<Box<T>>;
+			const result: unknown = fn(draft.v as Draft<T>);
+			if (result instanceof Promise) throw new TypeError("cell.change callbacks must be synchronous");
+			if (result !== undefined) {
+				if (result !== draft.v) assertValid("state", `state ${this.key}`, this.schema, result);
+				draft.v = result as Draft<T>;
+			}
+			prepared = change.prepare();
+		} catch (error) {
+			change.abort();
+			throw error;
+		}
+		this.#publish(prepared, "ops");
+	}
+```
+
+`#guard(ctx)` 就是前面的准入检查，所以写状态和调用方法一样受代码版本约束。回调抛错时 `change.abort()`，原值和序号都不变。`#publish` 先校验新值、重算依赖它的派生值（`derive`），再在同一步里 `adopt` 并把 `{ type: "ops", ops, value }` 广播给订阅者。
+
+tracker 的设计依赖“不可变所有权”约定：传进 `track()` 的根和发布出去的值都不能再被修改，没有冻结也没有防御性拷贝，未变化的子树在新旧版本之间共享。违反约定不会报错，只会悄悄破坏状态，[delta/README.md](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/src/delta/README.md) 用一张“谁可以改什么”的表把规则列全了。
+
+### 3.4 同步：hold → shape + snap → ops
+
+接着第 2 节的例子，看 `clicks.count` 这个状态成员怎么同步到 worker。
+
+**提供端：第一次发一个“单元”（unit）。** provider 收到 `hold` 并激活对象后，发一个 `shape` 帧，后面紧跟每个状态成员的 `snap` 帧：
+
+```ts title="packages/chord/src/connection.ts:957-983"
+	#sendUnit(served: ServedLocal): void {
+		this.#pending.delete(unitKey(served.id));
+		if (this.served.get(served.id) !== served) return;
+		const shape = served.ref.shape;
+		if (shape === undefined) return;
+		served.unitSent = true;
+		const members = served.wantsState ? this.#stateMembers(served.ref, shape) : [];
+		const listed = members.filter((name) => !served.feeds.has(name));
+		const snaps: StateFrame[] = [];
+		const attached: (readonly [string, Feed])[] = [];
+		for (const name of listed) {
+			const attachment = this.#attach(served, name);
+			if (attachment === undefined) continue;
+			snaps.push(attachment.frame);
+			attached.push([name, attachment.feed]);
+		}
+		this.send({
+			t: "shape",
+			id: served.id,
+			...(shape.variant === undefined ? {} : { variant: shape.variant }),
+			members: shape.members,
+			contract: shape.contract,
+			state: snaps.map((frame) => frame.m),
+		});
+		for (const frame of snaps) this.send(frame);
+		for (const [name, feed] of attached) this.#replay(served, name, feed);
+	}
+```
+
+`#attach` 订阅该成员的事件流：第一个事件是当前值，作为快照；快照发出之前到达的后续事件先放进 `feed.buffer`，快照发完后由 `#replay` 按顺序补发。这样“快照 + 后续增量”之间不会漏也不会重。
+
+**提供端：之后只发 op。** 每个成员有自己的编码器；遇到 `reset`（例如热重载迁移了值）就换一个新编码器重新开始：
+
+```ts title="packages/chord/src/connection.ts:1025-1037"
+	#feedEvent(served: ServedLocal, name: string, feed: Feed, event: StateEvent<unknown>): void {
+		if (served.feeds.get(name) !== feed) return;
+		const overflow = { resend: () => this.#resend(served, name) };
+		if (event.type === "ops") {
+			this.sendState(
+				{ t: "state", hold: served.id, m: name, as: "ops", ops: feed.encoder.encode(event.ops) },
+				overflow,
+			);
+			return;
+		}
+		feed.encoder = encoder();
+		this.sendState(this.#snapshot(served, name, "reset", event.value), overflow);
+	}
+```
+
+**消费端：解码并不可变地应用。**
+
+```ts title="packages/chord/src/remote.ts:258-282"
+	state(name: string, frame: StateIn): void {
+		if (this.ended) return;
+		if (frame.as === "error") {
+			// ...
+			return;
+		}
+		const pending = this.#pending;
+		if (frame.as === "ops") {
+			const target = pending?.values.get(name) ?? this.members.get(name);
+			if (target === undefined) return;
+			const ops = target.decoder.decode(frame.ops ?? []);
+			target.value = applyImmutable(target.value, ops);
+			if (target === this.members.get(name)) this.#deliver(name, { type: "ops", ops, value: target.value });
+			return;
+		}
+		const fresh: MemberState = { value: frame.value, decoder: decoder() };
+		if (pending !== undefined && (pending.missing.has(name) || pending.values.has(name))) {
+			pending.values.set(name, fresh);
+			pending.missing.delete(name);
+			if (pending.missing.size === 0) this.#apply();
+			return;
+		}
+		// ...
+	}
+```
+
+`pending` 对应一个尚未凑齐的单元：`shape` 声明了哪些成员的快照会跟来，全部到齐（`missing.size === 0`）才一次性应用，消费者不会看到半新半旧的形状。
+
+整个流程用帧序列表示：
+
+```text
+worker → server   hold { id: 7, at: "server", token, input: { name: "clicks" } }
+server → worker   shape { id: 7, variant: "default", state: ["count"] }
+server → worker   state { hold: 7, m: "count", as: "snap", value: 0 }
+worker → server   call  { id: 12, hold: 7, member: "increment", args: { by: 2 }, root }
+server → worker   state { hold: 7, m: "count", as: "ops", ops: [["r", 2]] }
+server → worker   result { id: 12 }
+```
+
+（`count` 是数字，换值只能用 `r`；如果状态是对象，这里会是 `s`、`a` 之类针对路径的 op。）
+
+### 3.5 流量控制
+
+只靠 TCP 背压不够，因为中间可能隔着中继（例如 Cloudflare 到浏览器），慢读者会被中继掩盖。chord 用端到端的 `ack`：双方在 `hello` 里声明 `acks`，收到帧后回累计计数；未确认的数据超过窗口（默认 256 KiB JSON 文本）时，**只有状态帧**被拦在发送端，按成员合并：后来的 op 追加到同一个槽，快照或 reset 直接替换。合并的 op 超过上限（默认四个窗口）后，最老的流变成一次 reset。结果帧永远不排在状态后面，所以 `get` 和方法调用不会被慢流拖住。这部分在 [connection.ts:469-610](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/src/connection.ts#L469-L610)，规范第 9 节有完整描述。
+
+## 4. chord：热重载
+
+### 4.1 问题
+
+改了一个插件，希望不重启进程就换上新代码。难点有三个：正在执行的方法怎么办；对象里的状态怎么办；新代码如果改了状态结构，旧值怎么迁移。
+
+### 4.2 两版本规则与重载阶段
+
+chord 的回答是“两版本规则”：每个 host 同时最多保留 current 和 previous 两个代码版本。重载按阶段推进：
+
+| 阶段 | 做什么 |
+| --- | --- |
+| load | 导入新 facet 模块（带 cache-busting 查询的动态 `import()`） |
+| prepare | 对受影响类型的每个活对象，以“录制模式”运行新工厂：可读旧 cell，写入会抛错；新资源作为候选打开。任何失败都回滚 |
+| gate | 只针对状态版本升高或替换独占资源的对象：从此拒绝没碰过它的旧 root（`upgrade_conflict`，可重试），等已经进来的 root 跑完（默认 5 秒），运行 `migrate` |
+| commit | 一个同步步骤内安装迁移后的值、安装新实现为新代码版本、换注册表、重启 task、重新绑定 listener、向订阅者推 shape/reset |
+| retire | previous 版本的 root 都结束后丢掉它；下次重载前若超时就强制中止这些 root |
+
+源码的 `prepare` 几乎就是上表的前三行：
+
+```ts title="packages/chord/src/reload.ts:204-224"
+	/** Everything up to the commit. On failure the host is rolled back and the underlying error is thrown. */
+	async prepare(): Promise<void> {
+		try {
+			await this.waitForRetirement();
+			this.load();
+			this.checkProviders();
+			await this.prepareAll();
+			// From here new objects of changed types are rejected (upgrade_conflict, retryable) until commit or abort,
+			// so the candidate set is final once the activations already in flight have been prepared.
+			this.host.gating = this.changed;
+			await this.withDeadline(this.prepareAll(), "activations in flight did not finish");
+			this.checkRefs();
+			this.tables = this.host.buildTables(this.entries());
+			await this.gate();
+			this.#alive();
+			this.#stage();
+		} catch (error) {
+			await this.rollback();
+			throw reloadError(error);
+		}
+	}
+```
+
+`waitForRetirement()` 排在最前面，因为要装 current 的下一个版本，必须先把 previous 退休，才能保持“最多两个”。
+
+回到第 2.4 节的 `admit`：`superseded` 表示 root 的代码版本已经退休（重开一个 root 重试即可）；`minCodeVersion` 和 `gate` 两个判断就是 gate 阶段的“准入切断”。被 gate 的对象在提交后 `minCodeVersion` 变成新版本，旧 root 永久被拒，因为它的状态已经迁移成新结构，旧代码读不懂。
+
+跨 host 时，server 作为协调者给子 host 发 `prepare`，子 host 回 `vote`，再统一 `commit`。规范第 12 节坦白了几个未解决的问题：提交决定没有持久化，server 在自己提交后、子 host 提交前崩溃，子 host 会停在旧版本直到重连；Node 的模块加载器每次重载都导入新副本、从不回收。
+
+### 4.3 chord 里其他值得一看的部分
+
+- [host.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/src/host.ts) 的 `route`：server 根据 `at` 把 hold 中继给子 host，按需启动 worker，前后两次 `authorize`。
+- [manager.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/src/manager.ts)：`createHostManager` 管理 worker 子进程的启动、替换、进程树清理和存活报告。
+- [watch.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/src/watch.ts)：`WatchHandle`，durable 对外暴露状态的唯一方式，第 5.5 节会用到。
+- [output.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/src/output.ts)：有界输出缓冲和节流的 `Progress`，durable 的工具输出用它。
+
+## 5. pi-durable：先提交，再展示
+
+### 5.1 问题
+
+第 3 章的 coding-agent 把会话写进 JSONL，但写入发生在 `message_end` 之后。模型流式输出到一半、工具跑到一半时进程被杀，内存里的进度就没了，重启后也不知道该从哪里接着做。如果 agent 跑在会被回收的平台上（README 的例子是 Cloudflare Durable Object），这不是偶发事故，而是常态。
+
+pi-durable 的规范把核心规则写成一句话：
+
+> A Session atomically commits immutable entries, full task records, and Chord-tracked documents. Only committed state is observable.
+
+也就是：一次提交原子地写入不可变的条目、完整的任务记录和文档变更；**只有已提交的状态才能被看到**。
+
+### 5.2 数据模型
+
+| 概念 | 是什么 |
+| --- | --- |
+| Harness | 一个打开的存储加上运行 agent 的机制。`Harness.open(storage, options, context)` |
+| Session | Harness 的内核，拥有唯一一条“提交线”（mutation line），所有写入串行通过它 |
+| Conversation | 一个 transcript，可以 fork |
+| Entry | transcript 里一条不可变记录：`pi.user`、`pi.assistant`、`pi.tool-result`、`pi.system`、`pi.reset` 或自定义 |
+| Document | 存在 transcript 旁边的可变 JSON，用 chord 的 op 记录变化。内置的有 `pi.agent`、`pi.provider`、`pi.live`、`pi.inbox`、`pi.usage` |
+| Task | 持久化状态机，每一步存一个检查点。内置 `pi.generation`（调模型）和 `pi.tool`（执行工具） |
+| Submission | 交给会话的东西（用户输入或要写的条目），可以 `wait()` |
+
+README 给了一次问答在条目和任务上的样子：
+
+```text title="packages/durable/README.md:109-112"
+submit(input) → pi.user
+  pi.generation → pi.system (only if the prompt or tools changed), pi.assistant (tool calls)
+    pi.tool × n → pi.tool-result × n   (owned by the generation, which waits for them)
+  pi.generation → pi.assistant (answer) → submission done
+```
+
+### 5.3 存储契约：commit + adopt
+
+所有后端（Memory、SQLite、JSONL、IndexedDB、Cloudflare Durable Object 的 SQLite）实现同一个 `Storage` 接口。最关键的是 `commit`：
+
+```ts title="packages/durable/src/types.ts:1278-1286"
+export interface Storage {
+	/**
+	 * Atomically persist one batch and return its sequence. Once the batch is durable, call `adopt(seq)` exactly once,
+	 * synchronously and before this storage's next commit starts, then resolve with `seq`; a commit that fails before it
+	 * is durable never calls `adopt`. `adopt` is the caller's in-memory adoption and publication of the batch, so memory
+	 * and the Session's views always show a complete prefix of the log; it runs the Session's own observers, which call
+	 * no Storage method, and never throws. Once resolved, later reads through this storage observe the batch.
+	 */
+	commit(writes: readonly StorageWrite[], adopt: (seq: Seq) => void, context: Context): Promise<Seq>;
+```
+
+`adopt` 回调是“先写入再展示”在接口层的落点：存储确认数据已经持久后，**同步**调用 `adopt`，Session 在里面把这批写入应用到内存并发布给观察者。之所以要同步、并且在下一次 commit 之前，是为了保证内存和所有视图看到的永远是日志的一个完整前缀。
+
+一批写入由下面几种记录组成：
+
+```ts title="packages/durable/src/types.ts:872-888"
+export type StorageWrite =
+	| { readonly type: "conversation"; readonly value: ConversationRecord }
+	| { readonly type: "entry"; readonly value: EntryRecord }
+	| { readonly type: "task"; readonly value: TaskRecord<JsonValue, JsonValue, JsonValue> }
+	| { readonly type: "submission"; readonly value: SubmissionRecord }
+	| {
+			readonly type: "document.create";
+			readonly record: DocumentCreate;
+			readonly content: Extract<DocumentContent, { readonly kind: "base" }>;
+	  }
+	| { readonly type: "document.copy"; readonly record: DocumentCreate; readonly source: DocumentCopySource }
+	| {
+			readonly type: "document.change";
+			readonly id: DocumentId;
+			readonly content: DocumentContent;
+	  }
+	| { readonly type: "document.retire"; readonly id: DocumentId };
+```
+
+文档内容要么是完整的 base，要么是一串 chord op：
+
+```ts title="packages/durable/src/types.ts:844-854"
+export type DocumentContent =
+	| {
+			readonly version: number;
+			readonly kind: "base";
+			readonly value: JsonObject;
+	  }
+	| {
+			readonly version: number;
+			readonly kind: "delta";
+			readonly ops: readonly Op[];
+	  };
+```
+
+这就是 durable 用 chord delta 的地方：文档在内存里由 chord 的 tracker 跟踪，提交时把 tracker 产生的 op 原样存下来；读取时从最近的 base 开始重放 delta（SQLite 后端 `import { apply } from "@earendil-works/chord/delta"`）。任务记录则每次整条替换，不存 delta。
+
+什么时候存 base、什么时候存 delta？每种文档定义里必须写 `checkpointWhen`。事务结算时，对每个“存 delta”的计划问一次：
+
+```ts title="packages/durable/src/session/transaction.ts:1159-1165"
+			// A version change stores a base even without operations; otherwise only a change stores a delta.
+			const content =
+				loaded.storedVersion < version
+					? ({ type: "document.change", id, content: { version, kind: "base", value: prepared.value } } as const)
+					: prepared.ops.length > 0
+						? ({ type: "document.change", id, content: { version, kind: "delta", ops: prepared.ops } } as const)
+						: undefined;
+```
+
+`pi.live`（正在进行的生成和工具输出）的策略很能说明设计意图：
+
+```ts title="packages/durable/src/harness/live.ts:184-205"
+	// REMINDER: a complete base whenever nothing runs (spec §8.2): no generation and no running tool slot. That holds
+	// while idle, in the commit handing a generation over to its tool round, and between tools, so the delta chain
+	// spans at most one generation or the overlapping execution of one round's tools. A slot holds output only while
+	// running, so every base is small; a nested call's result lives in its caller's task documents, never here. Do not
+	// add a delta-count bound; the tool output benchmark checks this rule.
+	checkpointWhen: (value) =>
+		value.generation === undefined &&
+		!(value.tools ?? []).some((slot) => slot.status === "running") &&
+		!(value.nestedTools ?? []).some((slot) => slot.status === "running"),
+});
+
+// ...
+
+/**
+ * How the progress throttles commit a partial answer and running tool output into `pi.live`: deferred, so storage gets
+ * them together, at the next commit that reads or writes `pi.live` or after `settings.progress.persistWithinMs`. Every
+ * commit that consumes or clears streamed fields reads `pi.live`, so it stores them with its own changes (spec §8.2).
+ */
+export const PROGRESS_COMMIT: CommitOptions = { persistence: { kind: "deferred" } };
+```
+
+只要没有东西在跑，`pi.live` 就存一个完整 base，而此时它很小；跑的时候只存 delta。于是 delta 链最多跨一次生成或一轮工具，重放代价有上界。
+
+### 5.4 Session 的提交线
+
+`Session.#runCommit` 是所有写入的必经之路。它先运行事务回调（读写都在 `tx` 上），结算出 `writes`，再交给存储：
+
+```ts title="packages/durable/src/session/session.ts:882-912"
+		if (withinMs !== undefined) {
+			const held = tx.holdable();
+			if (held !== undefined) {
+				this.#hold(tx, held, withinMs, context);
+				this.#sweepDocuments();
+				return result;
+			}
+		}
+		// The last step before Storage: held changes leave their queue only once nothing but Storage can fail.
+		const taken = this.#holds.size === 0 ? NO_HOLDS : tx.takeHeld((id) => this.#holds.get(id));
+		// Storage adopts the batch synchronously once it is durable, before its next commit, and the commit is published in
+		// the same step, so every view changes with memory. A throw here would reach Storage, so the callback keeps its own
+		// error, and the first error of an own observer.
+		let adoption:
+			| { readonly documents: AdoptedDocuments; readonly failure?: { readonly error: unknown } }
+			| { readonly error: unknown }
+			| undefined;
+		const adopt = (committed: Seq): void => {
+			let documents: AdoptedDocuments;
+			try {
+				documents = tx.adopt(committed);
+			} catch (error) {
+				adoption = { error };
+				return;
+			}
+			const failure = this.#publish(committed, writes, documents, context);
+			adoption = failure === undefined ? { documents } : { documents, failure };
+		};
+		try {
+			// Once admitted, caller cancellation does not interrupt Storage settlement.
+			await this.#storage.commit(writes, adopt, withoutAbortSignal(context));
+```
+
+按行读：
+
+- 第 882–889 行是**延迟提交**（deferred commit）。流式输出每 100 ms 提交一次 partial，如果每次都落盘，远程存储扛不住。所以调用方可以把提交标记为 deferred：只有当它只改动已存在的会话文档时才允许，内存先采纳、watch 先看到，真正落盘延后到下一次读写 `pi.live` 的提交，最迟 `persistWithinMs`（默认 1000 ms）。规范把这算作“先写后展示”的唯一例外，代价写得很明白：崩溃最多丢这一个窗口的流式文本。
+- 第 891 行：普通提交会把排队中的 deferred 变更一起带走，所以它们和这次提交一起落盘。
+- 第 899–909 行：`adopt` 回调。`tx.adopt` 把文档的新版本装进内存，`#publish` 通知观察者。它在存储内部、持久化完成之后同步调用。
+- 第 912 行：`withoutAbortSignal(context)`。一旦交给存储，调用方取消也不能中断它，否则会出现“存了一半”的状态。
+
+存储失败对 Session 是致命的（规范第 1 节不变式 8）：Session 进入失败状态，必须重新打开。这比“重试一下”保守，但换来一个简单的保证：内存永远不会领先于或落后于存储的某个已知状态。
+
+### 5.5 展示：watch 只看已提交的 op
+
+durable 对外暴露状态只有一种方式：chord 的 `WatchHandle`。`#publish` 之后，文档观察者收到的是提交时存下的同一批 op：
+
+```ts title="packages/durable/src/session/session.ts:1240-1256"
+				} else if (change.record.id !== incarnation || change.version !== version) {
+					// A new incarnation at the address, or a value of another definition version, whose shape the observer's
+					// value does not have: shown whole.
+					if (change.record.id !== incarnation) {
+						incarnation = change.record.id;
+						unpin();
+						unpin = this.#pinDocument(addressId, incarnation);
+					}
+					version = change.version;
+					value = change.value;
+					observer.advance({ kind: "value", value, ops: [["r", value]], retired: false }, context);
+				} else {
+					// A migration-only base changes nothing for an observer of the new version.
+					if (change.ops.length === 0) continue;
+					value = change.value;
+					observer.advance({ kind: "value", value, ops: change.ops, retired: false }, context);
+				}
+```
+
+一个 op 序列，同时用于三件事：存储里的 delta、内存视图的更新、发给 UI 的增量。应用如果要把会话推给浏览器，可以把这些 op 再交给 chord 的 cell 发出去，整条链路上不需要做 diff。watch 回调在运行时如果又来了多次提交，chord 的 `PendingOps` 会把它们折叠成一次调用（同一字符串的多次追加合并成一次），超过 10,000 个 op 就换成一次 `r`。
+
+## 6. pi-durable：任务与崩溃恢复
+
+### 6.1 任务就是持久化状态机
+
+durable 里所有“要花时间、可能被打断”的工作都是任务。任务记录的 `state` 是下面这个联合类型：
+
+```ts title="packages/durable/src/types.ts:618-662"
+export type TaskState<S, R> =
+	| {
+			/** Eligible for scheduling. */
+			readonly status: "pending";
+			/** Complete durable state from which execution resumes. */
+			readonly checkpoint: S;
+			readonly outcome?: never;
+	  }
+	| {
+			/** Reserved by one in-memory task invocation. */
+			readonly status: "running";
+			/** Complete durable state from which execution resumes. */
+			readonly checkpoint: S;
+			readonly outcome?: never;
+	  }
+	| {
+			/** Parked without an invocation until every task in `on` is terminal; then resumes at `checkpoint`. */
+			readonly status: "waiting";
+			readonly checkpoint: S;
+			readonly on: readonly TaskId[];
+			readonly policy: JoinPolicy;
+			readonly outcome?: never;
+	  }
+	| {
+			// ...
+			readonly status: "sleeping";
+			readonly checkpoint: S;
+			readonly until: number;
+			readonly outcome?: never;
+	  }
+	| {
+			/** Outcome decided; becomes terminal once no ordinary owned work below is live. Runs no more code. */
+			readonly status: "completing";
+			readonly checkpoint?: never;
+			readonly outcome: TaskOutcome<R>;
+	  }
+	| {
+			/** Permanently settled durable result receipt. */
+			readonly status: "terminal";
+			readonly checkpoint?: never;
+			readonly outcome: TaskOutcome<R>;
+	  };
+```
+
+注意 `waiting` 和 `sleeping`：等待子任务、等待重试退避，都是**存下来的状态**，不占用任何内存中的调用。进程重启后这些任务照样在等。
+
+定义一个任务要给出：名字、版本、初始检查点、按 `phase` 划分的处理函数、中止处理和可选的迁移：
+
+```ts title="packages/durable/src/types.ts:353-376"
+export type TaskDefinition<I, S extends { phase: string }, R, H extends object> = {
+	/** Registered task kind persisted in `TaskRecord.kind`. */
+	readonly name: string;
+	/** Definition version persisted with live input and checkpoints. */
+	readonly version: number;
+	/** First durable checkpoint for a newly created task. */
+	initial(input: I): S;
+	/** Exhaustive phase map; each handler receives the task narrowed to its phase. */
+	readonly phases: {
+		readonly [P in S["phase"]]: PhaseHandler<I, Extract<S, { phase: P }>, S, R, H>;
+	};
+	/** Runs in a fresh invocation after an abort mark and must commit a terminal outcome. */
+	abort(task: RunningTask<I, S, R>, runtime: TaskRuntime<I, S, R, H>, context: Context): Promise<void>;
+	/** Convert a record stored by any older supported version; runs at reservation. */
+	migrate?(
+		input: JsonValue,
+		checkpoint: JsonValue,
+		fromVersion: number,
+	): {
+		input: I;
+		checkpoint: S;
+	};
+	readonly hooks?: H;
+};
+```
+
+一个 phase 处理函数重启后会**从头**重跑，所以规范第 5.2 节规定了“副作用三明治”：
+
+```text title="packages/durable/docs/spec.md:2274-2276"
+commit intent phase
+perform external effect
+commit outcome or next phase
+```
+
+先提交“我要做这件事”的阶段，再做外部副作用，再提交结果或下一阶段。重开时如果停在 intent 阶段，就意味着副作用**可能**已经发生，处理函数必须能安全重试、轮询外部句柄，或者把它记成被打断。下面看内置的生成任务怎么遵守这条规则。
+
+### 6.2 生成任务：一次模型调用拆成几个阶段
+
+`pi.generation` 的检查点有五种 phase：`prepare`（渲染系统提示、决定要不要先压缩上下文）、`request`（调模型）、`retry`（退避等待）、`poll`（轮询延迟响应）、`tools`（等待本轮工具）。初始是 `prepare`：
+
+```ts title="packages/durable/src/harness/generation.ts:144-148"
+export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, GenerationResult, GenerationHooks>({
+	name: "pi.generation",
+	version: 1,
+	initial: () => ({ phase: "prepare", attempt: 1 }),
+	phases: {
+```
+
+`prepare` 的最后一次提交把 `cutoff`（本次请求包含的最新条目）、模型和 thinking 级别写进 `request` 检查点，这就是“intent”。`request` 阶段才真正调用模型：
+
+```ts title="packages/durable/src/harness/generation.ts:232-263"
+		request: async (task, runtime, context) => {
+			// Charging the attempt may itself be what keeps failing, such as converting a huge partial: the limit ends it.
+			if (cutOffTooOften(task, runtime)) return endCutOff(runtime, task, context);
+			// The host stopped while this request was in flight: a failed attempt, not a resend (spec §8.3).
+			if (task.restarts !== undefined) return interrupted(runtime, task.state.checkpoint, context);
+			const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
+			const conversationId = runtime.conversationId;
+			await runtime.commit(async (tx) => {
+				const live = await tx.doc(LiveDoc, conversationId);
+				await convertPartial(tx, live, conversationId);
+				live.generation = { attempt };
+				return undefined;
+			}, context);
+			const model = runtime.models.getModel(ref.provider, ref.modelId);
+			if (model === undefined) return failNoModel(runtime, ref, context);
+			const view = await runtime.context(conversationId, context, { at: cutoff });
+			let messages = view.messages;
+			await runtime.hooks.each("beforeRequest", async (hook) => {
+				const replaced = await hook({ messages }, runtime, context);
+				if (replaced !== undefined) messages = replaced.messages;
+			});
+			const options: SimpleStreamOptions = {
+				...streamOptions,
+				signal: runtime.signal,
+				telemetry: context.telemetry,
+				sessionId: await ensureProviderSessionId(runtime, context),
+				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
+			};
+			const message = await streamResponse(runtime, model, messages, options, attempt, context);
+			const request = { attempt, compacted, model: ref, thinkingLevel, cutoff, messages: view.messages };
+			await classify(runtime, request, message, context);
+		},
+```
+
+几处值得注意：
+
+- 第 236 行：`task.restarts !== undefined` 表示这个任务上次运行时进程死了。此时**不重发请求**，而是走 `interrupted`，把它算作一次失败的尝试。下一节细讲。
+- 第 247 行：上下文按 `cutoff` 取，而不是取“当前最新”。重试时得到的是同一份上下文。
+- 第 256 行：`sessionId` 来自 `pi.provider` 文档里持久化的 UUIDv7，跨重启、重试、压缩都不变，用于 provider 的 prompt cache 亲和。
+- 第 262 行：`classify` 在**一次提交**里清掉 partial、追加 `pi.assistant` 条目，然后决定是结束、重试，还是进入工具轮。
+
+`streamResponse` 消费 pi-ai 的事件流，把 partial 节流写进 `pi.live`：
+
+```ts title="packages/durable/src/harness/generation.ts:633-643"
+	try {
+		const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
+		for await (const event of events) {
+			// A partial without content, such as pi-ai's opening `start` event, shows nothing; a deferred response
+			// never gets past it, so it never leaves a partial.
+			if (event.type === "done" || event.type === "error" || event.partial.content.length === 0) continue;
+			changes.observe(event);
+			pending = event.partial;
+			if (timer === undefined && inFlight === undefined) timer = runtime.setTimer(flush, interval);
+		}
+		return await events.result();
+```
+
+`flush` 每 `partialIntervalMs`（默认 100 ms）最多提交一次，用的就是 `PROGRESS_COMMIT`（deferred）。`PartialChanges` 只提交“文本比上次多出来的部分”，所以每次提交的代价和新增文本成正比，落到 `pi.live` 里就是一个 `a` op。
+
+模型返回工具调用时，`startToolRound` 在一次提交里追加 assistant 条目、为每个调用创建一个 `pi.tool` 子任务，并把自己切到 `waiting`：
+
+```ts title="packages/durable/src/harness/generation.ts:820-828"
+			const taskId = await createToolTask(tx, runtime, entry.id, call.id);
+			tools.push(taskId);
+			slots.push({ callId: call.id, name: call.name, taskId, status: "pending" });
+		}
+		delete live.generation;
+		live.tools = slots;
+		const checkpoint = { phase: "tools", assistant: entry.id, tools, pending } as const;
+		return { status: "waiting", checkpoint, on: tools, policy: "allSettled" };
+	}, context);
+```
+
+“assistant 条目已写入”和“工具任务已创建”在同一个提交里，所以不存在“模型要求调用工具，但工具任务丢了”的中间态。生成任务等所有工具任务终结（`allSettled`）后，在 `tools` 阶段把运行交给下一个生成任务。这就是第 2 章双层循环的持久化版本：内层 turn 变成“生成任务 → 工具任务 → 新的生成任务”的链，外层 follow-up 变成 `pi.inbox` 文档里排队的提交。
+
+### 6.3 恢复：从 running 回到 pending
+
+`Harness.open()` 会调用调度器的 `open`。它扫描所有活着的任务，把状态还是 `running` 的（说明上一个进程在跑它时死了）改回 `pending`，并把 `restarts` 加一：
+
+```ts title="packages/durable/src/harness/scheduler.ts:382-411"
+	async open(context: Context): Promise<void> {
+		this.#session.followCommits((publication) => this.#observe(publication));
+		this.#session.subscribeClose(() => this.#seal());
+		this.#unsubscribeRegistry = this.#registry.subscribe(() => {
+			this.#notifyBlocked();
+			this.#kick();
+		});
+		await this.#session.commitWith(async (tx) => {
+			// Every table read before the first write.
+			const scans = [];
+			for (const status of LIVE_STATUSES) {
+				scans.push(await scanAll((cursor) => tx.scanTasks({ status }, SCAN_PAGE_SIZE, cursor)));
+			}
+			for (const records of scans) {
+				for (const record of records) {
+					this.#track(undefined, record);
+					this.#resumed.add(record.id);
+					if (this.#readOnly) continue;
+					if (record.abandonOnRestart === true) this.#abandoned.add(record.id);
+					if (record.state.status === "running") {
+						const restarts = (record.restarts ?? 0) + 1;
+						const pending = withState(record, { status: "pending", checkpoint: record.state.checkpoint });
+						tx.setTask({ ...pending, restarts } as AnyTaskRecord);
+					}
+					if (record.state.status === "waiting" && record.state.policy === "failFast") {
+						this.#failFastChecks.add(record.id);
+					}
+				}
+			}
+		}, context);
+```
+
+`open` 只做修正，不调度；`harness.resume()`（或任何 `submit`、`wait`）才启动调度。只读打开（`readOnly: true`）时什么都不改，因为那个 `running` 任务可能正被另一个进程执行。
+
+`restarts` 只在任务提交新状态时被清掉（[scheduler.ts:2478-2482](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/src/harness/scheduler.ts#L2478-L2482)），所以它表示“连续多少次没有进展就被打断”。这个计数用来防**崩溃循环**：如果某个任务每次运行都把进程搞崩（比如内存耗尽），没有它就会无限重启。调度器在预约任务时检查：
+
+```ts title="packages/durable/src/harness/scheduler.ts:1498-1512"
+					// Work cut off `restartLimit` times in a row would run forever: an abort handler, or a phase of a kind that
+					// does not end itself at the limit, ends the task `faulted` instead.
+					// The settings are read only for a task that was cut off at all.
+					const cutOff = record.restarts !== undefined && record.restarts >= this.#restartLimit();
+					if (cutOff && (mode === "abort" || !this.#limitsRestarts(record.kind))) {
+						const message =
+							mode === "abort"
+								? `Abort handler of task ${id} (${record.kind}) was cut off ${record.restarts} times`
+								: `Task ${id} (${record.kind}) was cut off ${record.restarts} times without progress`;
+						await this.#terminate(tx, record, {
+							status: "faulted",
+							error: { message, detail: { reason: "restart_limit" } },
+						});
+						faulted.push({ record, message });
+						continue;
+					}
+```
+
+默认上限是 5（[agent.ts:58](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/src/harness/agent.ts#L58)）。内置任务（`limitsRestarts` 为真的种类）自己处理上限，以便给出更具体的结果（工具调用得到一个错误结果、运行以 `restart_limit` 失败）；用户自定义的任务种类由调度器直接判为 `faulted`。
+
+### 6.4 一个具体场景：流式输出到一半被杀
+
+把上面几段串起来，看一个完整的时间线。用户问了一个问题，模型正在流式回答，进程在第 3 秒被 `kill -9`：
+
+1. `submit` 在一次提交里写入 `pi.user` 条目和 `pi.inbox` 变化，创建 `pi.generation` 任务。
+2. `prepare` 阶段提交，检查点变成 `{ phase: "request", attempt: 1, cutoff, ... }`。调度器预约任务时已把状态写成 `running`。
+3. `request` 阶段开始流式调用。每 100 ms 一次 deferred 提交把新文本追加到 `pi.live.generation`；watch 立即看到，存储每秒左右落一次盘。
+4. 第 3 秒进程被杀。存储里有：状态为 `running`、检查点为 `request` 的任务记录，以及到大约第 2 秒为止的 partial。
+5. 新进程 `Harness.open()`：调度器把任务改回 `pending`，`restarts: 1`。
+6. `resume()` 后任务重新进入 `request` 阶段，第 236 行发现 `restarts` 已设置，进入 `interrupted`：
+
+```ts title="packages/durable/src/harness/generation.ts:438-464"
+	await runtime.commit(async (tx): Promise<Next> => {
+		// Read before the first table write; only a failure uses it.
+		const failure = retry ? undefined : await prepareFailure(tx, runtime);
+		const live = await tx.doc(LiveDoc, runtime.conversationId);
+		await convertPartial(tx, live, runtime.conversationId);
+		if (failure === undefined) {
+			live.generation = { attempt, retry: { at: until, error: text } };
+			// ...
+			const next = { phase: "retry", attempt, ...(compacted === undefined ? {} : { compacted }), until, ...poll };
+			return { status: "sleeping", checkpoint: next as GenerationCheckpoint, until };
+		}
+		await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "interrupted", detail: text });
+		return {
+			status: "terminal",
+			outcome: { status: "failed", error: { message: text, detail: { reason: "interrupted" } } },
+		};
+	}, context);
+```
+
+7. `convertPartial` 把已提交的 partial 转成一条**中止的** assistant 条目保留下来（用户能看到被打断的半截回答），任务进入 `sleeping`，到退避时间后进入 `retry` 阶段，再回到 `prepare` 发起第 2 次尝试。重试次数用完则运行以 `interrupted` 结束，排队的输入按 `settings.afterFailedRun` 处理。
+
+为什么不直接重发请求？因为“进程死在模型请求期间”可能正是这个请求导致的（比如回答太长撑爆内存）。把它当作失败的一次尝试，交给重试策略计数，才能保证一个总把进程搞崩的请求最终会停下来。相对地，正常 `close()` 不算崩溃，被关闭打断的请求会直接重发。
+
+### 6.5 和 pi-ai、pi-agent-core 的关系
+
+| 方面 | pi-agent-core（第 2 章） | pi-durable |
+| --- | --- | --- |
+| 调模型 | `streamFn`，默认 pi-ai `streamSimple` | `runtime.models.streamSimple`，即 pi-ai `Models` |
+| 循环 | 内存中的 `runLoop` 双层 while | 生成任务与工具任务的链，状态在存储里 |
+| 中间状态 | 内存里的 `AgentMessage[]` | transcript 条目 + `pi.live` 文档 |
+| 对外通知 | `AgentEvent` 事件流 | chord `WatchHandle`，只推已提交的 op |
+| 插话 | `steer` / `followUp` 两个内存队列 | `submit` 的 `whenBusy: "steer"` 或默认 follow-up，排进 `pi.inbox` 文档 |
+| 工具 | `AgentTool.execute` | `defineTool`，在 `pi.tool` 任务里执行，文件和进程只经过 `ExecutionEnv` |
+| 崩溃 | 进度丢失 | 从检查点继续 |
+
+pi-ai 对 durable 来说是纯粹的模型访问层：`Models`、`streamSimple`、`fetchDeferred`/`cancelDeferred`（延迟响应），以及 `calculateContextTokens` 等估算函数。消息类型（`Message`、`AssistantMessage`、`ToolCall`）也直接用 pi-ai 的。Harness 还会用 `withClientIdentity` 给所有请求套上默认的 pi attribution（[harness.ts:188-199](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/src/harness/harness.ts#L188-L199)）。
+
+## 7. pi-env：远程执行环境
+
+### 7.1 问题与架构
+
+durable 的工具（`read`、`write`、`edit`、`bash`）只通过调用的 `ExecutionEnv` 碰文件和进程：
+
+```ts title="packages/durable/src/env/index.ts:362-377"
+export interface Shell {
+	/**
+	 * Run a command. A string runs through the environment's shell. An array runs `command[0]` directly with the rest
+	 * as its arguments, without a shell, so they reach the program unparsed. Aborting the context or a timeout kills
+	 * only this command's processes.
+	 */
+	exec(
+		command: string | readonly string[],
+		options: ShellExecOptions | undefined,
+		context: Context,
+	): Promise<Result<ShellExecResult, ExecutionError>>;
+	/** Kill every command this environment still runs; for its owner's shutdown, never for one request. */
+	cleanup(context: Context): Promise<void>;
+}
+
+export interface ExecutionEnv extends FileSystem, Shell {}
+```
+
+需求是：durable 的 worker、存储和凭据留在本机，工具却跑在另一台机器上（比如 GPU 服务器）。最直接的做法是每个操作开一次 `ssh host cmd`，但这样每次都要握手，流式输出、取消、文件句柄都不好做。
+
+pi-env 的做法分两半：
+
+- **远程**：一个 Rust 写的小 daemon（`daemon/`），`pi-env serve --token <hex>`，在 stdin/stdout 上说一种带长度前缀的二进制帧协议，执行文件操作和命令。
+- **本地**：`RemoteExecutionEnv` 实现 `ExecutionEnv`，内部持有一个 `Connection`。`Connection` 用 `ssh` 启动远程 daemon，然后把每个 `ExecutionEnv` 方法翻译成一个请求帧。
+
+一条 SSH 连接上可以并发多个请求，靠请求 id 区分，所以一个工具调用里的多次文件读写和一个长命令可以同时进行。
+
+### 7.2 部署：按 SHA-256 命名，启动前校验
+
+`connectSsh` 先探测远程系统，再部署对应平台的 daemon（包里在 `bin/` 下附带了 Linux、macOS、Android、Windows 的 x86-64 和 arm64 版本）：
+
+```ts title="packages/env/src/ssh.ts:405-416"
+export async function deployDaemon(
+	target: SshTarget,
+	remote: RemotePlatform,
+	binary = packagedDaemon(remote),
+): Promise<string> {
+	if (!existsSync(binary)) throw new Error(`No pi-env daemon for ${remote.platform}-${remote.arch} at ${binary}`);
+	const bytes = await readFile(binary);
+	const sha256 = createHash("sha256").update(bytes).digest("hex");
+	const file = daemonPath(remote, sha256);
+	const state = await checkDaemon(target, remote, file, sha256);
+	if (state === "present") return file;
+	if (state === "nohash") throw new Error(`${target.host} has no sha256sum, shasum or openssl to verify pi-env`);
+```
+
+远程文件名是 `pi-env-` 加哈希前 32 位，不同版本不会互相覆盖；上传先写临时文件，哈希对上了才改名到位。每次启动前都会再校验一次哈希，远程机器上的二进制被替换就不会被执行。
+
+ssh 的参数刻意收得很紧：
+
+```ts title="packages/env/src/ssh.ts:88-108"
+	const option = (setting: string) => ["-o", setting];
+	return [
+		...(target.configFile === undefined ? [] : ["-F", target.configFile]),
+		"-T",
+		"-a",
+		"-x",
+		...option("BatchMode=yes"),
+		...option("ClearAllForwardings=yes"),
+		...option("ForwardAgent=no"),
+		...option("ForwardX11=no"),
+		...option("ControlMaster=no"),
+		...option("ControlPath=none"),
+		...option("RemoteCommand=none"),
+		...option("PermitLocalCommand=no"),
+		...option("SendEnv=-*"),
+		...option("ServerAliveInterval=15"),
+		...option(`StrictHostKeyChecking=${strictHostKeys ? "yes" : "accept-new"}`),
+		...option(`UserKnownHostsFile=${configPath("known hosts file", knownHostsFile)}`),
+		...option("GlobalKnownHostsFile=none"),
+		...option("HashKnownHosts=no"),
+		...option(`HostKeyAlias=${target.hostKeyAlias}`),
+```
+
+`BatchMode` 禁止交互式提示；所有转发都关掉；不复用共享连接（`ControlMaster=no`），也不执行配置里的命令；主机密钥只认应用自己的 known_hosts 文件和固定别名。第一次连接前，应用要先用 `scanHostKey` 拿到指纹，让机器主人带外核对，再 `acceptHostKey` 写入。
+
+### 7.3 帧格式
+
+协议文档 [docs/protocol.md](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/env/docs/protocol.md) 定义了双向通用的帧：
+
+```text title="packages/env/docs/protocol.md:17-22"
+u32 length      bytes after this field
+u8  type
+u32 id          request id; 0 for frames that belong to no request
+u32 jsonLength
+json            UTF-8 JSON object, jsonLength bytes
+bytes           raw payload, the remaining length - 9 - jsonLength bytes
+```
+
+整数都是大端，一帧最大 16 MiB。和 chord 的纯 JSON 帧不同，这里每帧带一段**原始字节**：文件内容和命令输出不用 base64，直接放在 payload 里。帧类型有六种：
+
+| type | 名字 | 方向 | 含义 |
+| --- | --- | --- | --- |
+| 1 | request | client → daemon | `json.op` 指定操作 |
+| 2 | result | daemon → client | 请求成功，请求结束 |
+| 3 | error | daemon → client | 请求失败，请求结束 |
+| 4 | event | daemon → client | 进行中的进度（`exec`/`pty` 输出、`watch` 变化），不结束请求 |
+| 5 | cancel | client → daemon | 取消请求 `id` |
+| 6 | ping | 双向 | 存活检测，接收方忽略 |
+
+Rust 端读帧：
+
+```rust title="packages/env/daemon/src/frame.rs:49-82"
+/// Read one frame; `None` at a clean end of input.
+pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Frame>> {
+    let mut length = [0u8; 4];
+    match input.read_exact(&mut length) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let length = u32::from_be_bytes(length) as usize;
+    if !(9..=MAX_FRAME).contains(&length) {
+        return Err(invalid("frame length out of range"));
+    }
+    let mut body = vec![0u8; length];
+    input.read_exact(&mut body)?;
+    let kind = body[0];
+    let id = u32::from_be_bytes([body[1], body[2], body[3], body[4]]);
+    let json_length = u32::from_be_bytes([body[5], body[6], body[7], body[8]]) as usize;
+    if 9 + json_length > length {
+        return Err(invalid("JSON length out of range"));
+    }
+    // Unparseable JSON leaves the framing intact: the frame arrives with `Value::Null` and gets an error reply.
+    let json = if json_length == 0 {
+        Value::Object(Default::default())
+    } else {
+        serde_json::from_slice(&body[9..9 + json_length]).unwrap_or(Value::Null)
+    };
+    let payload = body[9 + json_length..].to_vec();
+    Ok(Some(Frame {
+        kind,
+        id,
+        json,
+        payload,
+    }))
+}
+```
+
+JSON 解析失败不破坏分帧：这一帧变成 `Value::Null`，回一个 `EINVAL` 错误，连接继续。长度字段越界才是不可恢复的错误。TS 端编码是镜像：
+
+```ts title="packages/env/src/connection.ts:114-122"
+function frame(type: number, id: number, json: Json, payload: Uint8Array = new Uint8Array(0)): Buffer {
+	const body = Buffer.from(JSON.stringify(json, wellFormed), "utf8");
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(9 + body.length + payload.length, 0);
+	header.writeUInt8(type, 4);
+	header.writeUInt32BE(id, 5);
+	header.writeUInt32BE(body.length, 9);
+	return Buffer.concat([header, body, payload]);
+}
+```
+
+### 7.4 同步行：跳过 shell 的噪音
+
+通过 ssh 启动程序时，远程 shell 的启动文件（`.bashrc` 之类）可能先往 stdout 打印东西，会把二进制帧流搞乱。解决办法是一个同步行：daemon 的第一行输出是 `PI-ENV <token>`，token 是客户端随机生成、放在命令行里传过去的 16 字节十六进制串。客户端丢弃这一行之前的一切：
+
+```ts title="packages/env/src/connection.ts:380-395"
+		if (!session.synced) {
+			// Shell startup files may print before the daemon runs; skip everything before its sync line.
+			const marker = Buffer.from(`PI-ENV ${session.token}\n`, "utf8");
+			const all = session.peek(session.buffered);
+			const index = all.indexOf(marker);
+			if (index === -1) {
+				if (session.buffered > 1024 * 1024) {
+					session.consume(session.buffered - marker.length);
+				}
+				return;
+			}
+			const noise = all.subarray(0, index).toString("utf8").trim();
+			if (noise !== "") this.#options.onLog?.(noise);
+			session.consume(index + marker.length);
+			session.synced = true;
+		}
+```
+
+用随机 token 而不是固定字符串，是为了防止启动文件恰好打印出同样的标记。同步之后的第一个请求固定是 `hello { protocol: 1 }`，daemon 回报版本、系统、架构、home、tmpdir、cwd 和 `features`（协议 1 发布后新增的操作，目前只有 `listFiles`；老 daemon 没有这个字段，客户端据此降级）。
+
+### 7.5 daemon 的调度
+
+`serve_frames` 是 daemon 的主循环。读到一帧就按类型和操作分派：
+
+```rust title="packages/env/daemon/src/main.rs:427-465"
+            REQUEST => {
+                let id = request.id;
+                // Registered before the request runs, so a cancel right behind it is not lost.
+                let control = Arc::new(Control::default());
+                server.controls.lock().unwrap().insert(id, control.clone());
+                // Commands and watchers last; they get their own threads (watchers recurse through trees).
+                if matches!(request.json["op"].as_str(), Some("exec" | "watch" | "pty")) {
+                    let worker = server.clone();
+                    let spawned = thread::Builder::new()
+                        .stack_size(16 * 1024 * 1024)
+                        .spawn(move || respond(&worker, id, request, control));
+                    // ...
+                } else {
+                    let worker = server.clone();
+                    let serial = match request.json["op"].as_str() {
+                        Some("writeChunk") => server.file(&request.json).ok(),
+                        _ => None,
+                    };
+                    let job: Job = Box::new(move || respond(&worker, id, request, control));
+                    match serial {
+                        Some(handle) => run_in_order(&jobs, handle, job),
+                        None => {
+                            let _ = jobs.send(job);
+                        }
+                    }
+                }
+            }
+            CANCEL => {
+                let control = server.controls.lock().unwrap().get(&request.id).cloned();
+                if let Some(control) = control {
+                    control.cancel(request.json["mode"].as_str() == Some("kill"));
+                }
+            }
+```
+
+三种调度策略对应三类操作：
+
+- 文件操作（`lstat`、`write`、`pread`……）都很短，进一个 16 线程的固定线程池（`WORKERS`）。
+- `exec`、`watch`、`pty` 会持续很久，各开一个线程。
+- 同一句柄的 `writeChunk` 要按到达顺序执行，否则大文件分块写会乱序，所以用 `run_in_order` 在句柄上排队。终端输入 `ptyWrite` 等则直接在读帧线程里同步处理（第 408–426 行），保证按键顺序不变。
+
+控制块在请求**运行之前**就登记好（第 430–431 行），所以紧跟在请求后面的 `cancel` 不会因为“请求还没开始”而丢失。
+
+### 7.6 输出：控制帧优先
+
+stdout 只有一个写线程，它维护两个队列：
+
+```rust title="packages/env/daemon/src/output.rs:71-85"
+    pub fn run(&self, writer: &mut impl Write) {
+        loop {
+            let (frame, unsent) = {
+                let mut queues = self.queues.lock().unwrap();
+                loop {
+                    if let Some(frame) = queues.control.pop_front() {
+                        break (frame, None);
+                    }
+                    if let Some((frame, unsent)) = queues.bulk.pop_front() {
+                        queues.bulk_bytes -= frame.payload.len();
+                        break (frame, unsent);
+                    }
+                    if queues.closed {
+                        return;
+                    }
+```
+
+控制队列（结果、错误、ping、watch 事件）永远先写；命令输出和大于 64 KiB 的结果进 bulk 队列。这样一个正在狂刷输出的 `npm install` 不会让 ping 超时，也不会让一个 `lstat` 的结果排在几兆字节输出后面。bulk 队列超过 4 MiB 未发送时，读命令管道的线程会等待（`wait_for_room`），效果相当于管道写满，命令自然减速。
+
+### 7.7 取消与存活：远程不留孤儿进程
+
+daemon 启动每个命令时都让它成为新会话的首进程：
+
+```rust title="packages/env/daemon/src/sys/unix.rs:266-271"
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            // A new session, so a kill reaches every descendant; default signal handling and an empty mask, as libuv sets.
+            libc::setsid();
+```
+
+取消时杀整个进程组：
+
+```rust title="packages/env/daemon/src/sys/unix.rs:286-295"
+/// Kill the command's process group, or the process if the group is gone.
+pub fn kill_tree(pid: u32) {
+    let pid = pid as i32;
+    // SAFETY: plain signal delivery.
+    unsafe {
+        if libc::kill(-pid, libc::SIGKILL) != 0 {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+```
+
+`kill(-pid, …)` 把信号发给整个进程组，所以 `bash -c "npm test"` 派生出来的所有子进程都会被杀掉。
+
+连接断了怎么办？双方每 5 秒发一次 ping；daemon 超过 30 秒收不到任何字节，或者 stdin 结束，就杀掉自己启动的所有进程组并退出：
+
+```rust title="packages/env/daemon/src/main.rs:499-509"
+        thread::spawn(move || {
+            loop {
+                thread::sleep(PING_INTERVAL);
+                output.control(Frame::new(PING, 0, json!({})));
+                // A client that went silent (a phone that lost its network) leaves nothing running.
+                if now_ms().saturating_sub(last_seen.load(Ordering::Relaxed)) > SILENCE_LIMIT_MS {
+                    kill_all(&groups);
+                    std::process::exit(0);
+                }
+            }
+        });
+```
+
+客户端这边，连接丢失时所有进行中的请求以 `{ code: "unknown", lost: true }` 失败，下一个请求会重新启动 daemon。句柄属于打开它的那个 daemon，所以旧句柄上的请求会失败，而不是被发给新 daemon。对“改文件”这类请求，丢连接意味着结果未知，这一点在 `Connection` 的注释里写明了。
+
+### 7.8 一次远程 exec 的完整路径
+
+durable 的 `bash` 工具调用 `env.exec("npm test", { timeout: 60, onOutput }, context)`，`env` 是 `RemoteExecutionEnv`：
+
+```ts title="packages/env/src/remote-env.ts:889-922"
+			const { json } = await this.connection.request(
+				"exec",
+				{
+					...(typeof command === "string" ? { command } : { argv: [...command] }),
+					cwd,
+					env,
+					inheritEnv,
+					...(this.#shellPath === undefined ? {} : { shellPath: this.#shellPath }),
+					...(timeout === undefined ? {} : { timeoutMs: timeout * 1000 }),
+					...(options?.spill === undefined ? {} : { spill: options.spill }),
+					...(options?.window === undefined ? {} : { window: options.window }),
+				},
+				{
+					signal: controller.signal,
+					onStart: (requestId, session) => {
+						running = requestId;
+						this.#running.set(requestId, session);
+					},
+					onEvent: (event, payload) => {
+						if (settled || callbackError !== undefined || event.kind !== "output") return;
+						const text = Buffer.from(payload.buffer, payload.byteOffset, payload.length).toString("utf8");
+						if (text === "" || options?.onOutput === undefined) return;
+						const info: ShellOutputInfo = { stream: event.stream === "stderr" ? "stderr" : "stdout" };
+						if (event.skipped !== undefined) info.skipped = event.skipped as ShellOutputSkip;
+						try {
+							options.onOutput(text, context, info);
+						} catch (error) {
+							// ...
+						}
+					},
+				},
+			);
+```
+
+对应的帧序列：
+
+```text
+client → daemon  [1 request id=42] { op: "exec", command: "npm test", cwd, env, timeoutMs: 60000, window }
+daemon           新线程：spawn（setsid），读 stdout/stderr
+daemon → client  [4 event id=42] { kind: "output", stream: "stdout" } + payload "> test\n"
+daemon → client  [4 event id=42] { kind: "output", stream: "stdout", skipped: {...} } + payload（超出窗口的部分被折叠）
+daemon → client  [2 result id=42] { exitCode: 0 }
+```
+
+如果 durable 中止了这个工具（用户按了中止，或任务收到 abort 标记），`context.abortSignal` 触发，`Connection` 发 `[5 cancel id=42]`，daemon 杀掉进程组，以 `aborted` 错误结束请求，`exec` 返回 `ExecutionError("aborted")`。`window` 参数让 daemon 按调用方的提交节奏合并和节流输出，超出窗口的部分只报告被跳过了多少字节和行，这和 durable 写 `pi.live` 的节流是配套的：远程不会把 durable 本来就要丢弃的输出传过来。
+
+这里能看到三层“节流”是一致的：daemon 按 `window` 合并输出，durable 按 `outputIntervalMs` 做 deferred 提交，chord 链路上按窗口合并状态帧。每一层都只保留“最终会被展示的”部分。
+
+## 小结
+
+- chord、pi-durable、pi-env 是独立的实验线，`pi` CLI 不依赖它们。pi-durable 不用 pi-agent-core，直接用 pi-ai；它只用 chord 的 `Context`、delta、`Watch` 和 SQLite 适配，不用 chord 的对象和 RPC。
+- chord 的核心抽象是“对象 + 引用”。远程引用就是一个 `hold`，方法调用是挂在 hold 上的 `call`/`result` 帧；对象放在哪个 host 由契约的 `hostNamed`/`hostFamily` 决定，调用方不写 host 名。
+- chord 的状态是 JSON：第一次发 `shape` + `snap`，之后只发编码后的 op（`r s d a t p m`）。快照前到达的事件先缓冲，保证不漏不重；流量控制只拦状态帧，结果帧永远优先。
+- chord 的热重载靠两版本规则：调用按 root 的代码版本分派实现；改了状态结构的对象经过 gate、迁移、提交，旧 root 拿到 `upgrade_conflict` 或 `superseded`。
+- pi-durable 的规则是先提交再展示。`Storage.commit` 持久化后同步调用 `adopt`，内存和视图只显示日志的完整前缀。唯一例外是流式进度的 deferred 提交，崩溃最多丢约 1 秒。
+- 文档存为 base + chord op 的 delta 链，`checkpointWhen` 决定何时写 base；同一批 op 同时用于存储、内存视图和 watch 推送。
+- 模型调用和工具调用都是带检查点的任务。打开存储时 `running` 改回 `pending` 并累计 `restarts`；正在请求模型时崩溃算一次失败的尝试，走重试退避；连续打断达到 `restartLimit`（默认 5）就终止，防止崩溃循环。
+- pi-env 用一条 SSH 连接上的二进制帧协议（长度前缀 + JSON + 原始字节）多路复用文件操作和命令。daemon 按 SHA-256 部署并校验，用随机 token 的同步行跳过 shell 噪音，控制帧优先于输出，命令在独立进程组里，断连 30 秒后全部杀掉。
+
+## 动手验证
+
+1. **跑 durable 的恢复示例。** 在 `packages/durable` 下执行 `node --conditions=source --experimental-strip-types test/examples/12-recovery.ts`。它定义一个每步存检查点的任务，中途关闭 Harness，再用同一个 SQLite 文件重新打开，看任务从哪一步继续。对照第 6.3 节的 `open`。
+2. **读生成任务的恢复测试。** [test/harness-generation-recovery.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/test/harness-generation-recovery.test.ts) 和 [test/harness-restart-failure.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/test/harness-restart-failure.test.ts) 覆盖了“请求中途崩溃算一次失败尝试”和 `restartLimit`。在 `packages/durable` 下运行 `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/harness-generation-recovery.test.ts`。
+3. **看 chord 的跨进程调用和状态同步。** [test/tutorial.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/test/tutorial.test.ts) 对应 `docs/tutorial.md` 的共享待办清单，每一节都可运行；[test/link.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/chord/test/link.test.ts) 用 `memoryLinkPair` 测帧级行为。可以在测试里给 link 的 `send` 包一层打印，亲眼看到第 3.4 节的帧序列。
+4. **在本机跑 pi-env daemon。** 在 `packages/env` 下执行 `cargo build --manifest-path daemon/Cargo.toml --locked`，然后跑 [test/connection.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/env/test/connection.test.ts)（它通过管道连 `daemon/target/debug/pi-env`，不需要 SSH）。[test/differential.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/env/test/differential.test.ts) 用随机操作序列对比 `RemoteExecutionEnv` 和 `NodeExecutionEnv` 的结果，是理解“语义对齐”的最好入口。

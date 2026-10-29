@@ -1,0 +1,2029 @@
+---
+title: 第 3 章　coding-agent：启动与装配
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 3 章　coding-agent：启动与装配
+
+## 导读
+
+<Diagram src="/diagrams/flow.html" title="一句输入的完整链路" />
+
+<Say id="k03-01">在终端敲下 pi，到输入框出现，中间要装配十几样东西。这一章把这条装配链走一遍。</Say>
+<Say id="k03-02" cue="user">入口很薄：cli.ts 只调用 main。main 解析参数，决定会话文件和运行模式。</Say>
+<Say id="k03-03">装配分两层：先按工作目录建服务，包括设置、模型运行时和资源，再用它们创建 AgentSession。</Say>
+<Say id="k03-04" cue="sessionPrompt">AgentSession 包住 Agent，把 prompt、排队、切模型、压缩和重试接到一起。</Say>
+<Say id="k03-05" cue="dispatch">每个 Agent 事件先交给扩展，再通知界面等订阅者。</Say>
+<Say id="k03-06" cue="persist">消息结束时，AgentSession 把它追加进会话的 JSONL 文件。</Say>
+<Say id="k03-07">新建、切换或 fork 会话时，AgentSessionRuntime 用同一个工厂重建整套运行时。</Say>
+<Say id="k03-08">读完你应该能回答：系统提示从哪来，自定义消息怎么变成模型消息，模型是怎么选出来的。</Say>
+
+上图是一句输入的完整链路。本章关心的是这条链路的“底座”：进程启动时，`AgentSession`、`Agent`、扩展运行器、模型运行时这些对象是谁创建的、按什么顺序创建、彼此怎么接线。第 2 章讲的 `Agent` 只是一个通用循环，它留下了 `convertToLlm`、`transformContext`、`streamFn`、`prepareRequest`、`beforeToolCall` 等钩子；coding-agent 的工作就是把这些钩子一个个填上。
+
+## 1. 启动链路
+
+### 1.1 全貌
+
+先看一次 `pi` 启动的调用顺序（只列主干）：
+
+```text
+cli.ts
+└─ setupCli()                         进程标题、环境变量、HTTP dispatcher
+└─ main(argv)
+   ├─ runAuthCommand / 包管理 / config / mcp 子命令   命中就直接返回
+   ├─ parseArgs(args)                 得到 Args
+   ├─ resolveAppMode(...)             rpc / json / print / interactive
+   ├─ createSessionManager(...)       决定写哪个 JSONL 文件（以及 cwd）
+   ├─ createAgentSessionRuntime(createRuntime, ...)
+   │   └─ createRuntime({ cwd, agentDir, sessionManager })
+   │       ├─ createAgentSessionServices()   ModelRuntime、SettingsManager、ResourceLoader
+   │       ├─ resolveModelScope / buildSessionOptions   --models、--model、--thinking
+   │       └─ createAgentSessionFromServices()
+   │           └─ createAgentSession()  (sdk.ts)
+   │               ├─ 恢复/选择模型和 thinking 级别
+   │               ├─ new Agent({ convertToLlm, streamFn, transformContext, ... })
+   │               └─ new AgentSession({ agent, sessionManager, ... })
+   └─ runRpcMode / new InteractiveMode(...).run() / runPrintMode
+```
+
+几个名词先说清楚：
+
+- **SessionManager**：管理一个会话的 JSONL 文件（第 5 章详讲）。会话是一棵 entry 树，当前位置叫 leaf。
+- **SettingsManager**：合并全局（`agentDir/settings.json`，默认 `~/.pi/agent`）和项目级（项目配置目录下的 `settings.json`）设置。
+- **ModelRuntime**：coding-agent 内部用的“模型 + 鉴权”运行时，持有所有 provider 和凭据。
+- **ResourceLoader**：加载扩展、skills、提示模板、主题、AGENTS.md 等上下文文件。
+- **AgentSession**：本章的主角，包装 `Agent`，提供会话级的一切操作。
+- **AgentSessionRuntime**：持有当前的 `AgentSession` 和它依赖的服务，负责整体替换。
+
+### 1.2 cli.ts：只有 6 行
+
+```ts title="packages/coding-agent/src/cli.ts:1-6"
+#!/usr/bin/env node
+import { setupCli } from "./cli/setup.ts";
+import { main } from "./main.ts";
+
+setupCli();
+main(process.argv.slice(2));
+```
+
+[`setupCli()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/cli/setup.ts#L4-L13) 设置 `process.title`、写入 `PI_CODING_AGENT=true` 和 `AI_AGENT=pi` 两个环境变量、屏蔽 Node 警告，并在任何 provider SDK 发请求之前配置好 undici 的 HTTP dispatcher。入口这么薄，是因为 `main()` 本身也被导出，供测试和嵌入方直接调用（它接受 `MainOptions.extensionFactories`，可以注入内联扩展）。
+
+### 1.3 main.ts：先处理“不需要会话”的命令
+
+[`main()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/main.ts#L574-L1001) 约 430 行，前半段都在处理不需要 AgentSession 的情况：
+
+```ts title="packages/coding-agent/src/main.ts:574-658"
+export async function main(args: string[], options?: MainOptions) {
+	resetTimings();
+	// Commands and startup selectors can load user-authored themes before runtime creation.
+	setThemeJsonValidator(validateThemeJson);
+	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
+	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
+	if (offlineMode) {
+		process.env.PI_OFFLINE = "1";
+		process.env.PI_SKIP_VERSION_CHECK = "1";
+	}
+
+	if (await runAuthCommand(args)) {
+		return;
+	}
+	// ...
+	const cwd = process.cwd();
+	const agentDir = getAgentDir();
+	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
+	configureHttpDispatcher();
+	// ...
+	const parsed = parseArgs(args);
+	// ...
+	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
+	if (shouldTakeOverStdout) {
+		takeOverStdout();
+	}
+```
+
+顺序是：
+
+1. `pi auth ...` 子命令（`runAuthCommand`），命中就返回。
+2. `pi install/update/...` 包管理命令和 `pi config`，命中就退出。
+3. `pi mcp ...`，用懒加载模块处理。
+4. 普通参数：`parseArgs()` 把 argv 解析成 `Args`。不认识的 `--xxx` 不会立刻报错，而是收进 `parsed.unknownFlags`，因为它们可能是扩展注册的 flag，要等扩展加载完才能判断。
+5. `--version`、`--export` 直接处理后退出。
+6. 决定运行模式。
+
+注意 `bootstrapSettingsManager` 用的是 `projectTrusted: false`：此时还不知道项目是否可信，所以只读全局设置里的代理配置。
+
+运行模式由 [`resolveAppMode()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/main.ts#L112-L123) 决定：
+
+```ts title="packages/coding-agent/src/main.ts:112-123"
+function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
+	if (parsed.mode === "rpc") {
+		return "rpc";
+	}
+	if (parsed.mode === "json") {
+		return "json";
+	}
+	if (parsed.print || !stdinIsTTY || !stdoutIsTTY) {
+		return "print";
+	}
+	return "interactive";
+}
+```
+
+| 条件 | 模式 | 输出 |
+| --- | --- | --- |
+| `--mode rpc` | rpc | stdin/stdout 上的 JSONL 协议 |
+| `--mode json` | json | 打印模式，但每个事件输出一行 JSON |
+| `-p`，或 stdin/stdout 不是 TTY | print | 跑完提示后打印最后一条回复 |
+| 其余 | interactive | TUI |
+
+还有一条容易忽略的规则：如果不是 rpc 模式，main 会读管道输入（`readPipedStdin`）；读到内容时，即使原来是 interactive 也改成 print（[main.ts:897-904](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/main.ts#L897-L904)）。所以 `echo "hi" | pi` 会一次性打印结果。非 interactive 模式还会调用 `takeOverStdout()`，防止扩展或依赖库的 `console.log` 污染输出协议。
+
+### 1.4 先定会话，再建服务
+
+问题：`pi --session <id>` 可能选中**另一个项目**的会话。那个会话的 cwd 不是 `process.cwd()`，而项目级设置、项目扩展、项目里的 `models.json` 覆盖都是按 cwd 解析的。如果先按启动目录建好服务再选会话，就会用错项目的配置。
+
+解决办法是把顺序倒过来：先用一个只看启动目录的 `startupSettingsManager` 选出会话，拿到会话的 cwd，再按这个 cwd 创建服务。源码注释把原因写得很清楚：
+
+```ts title="packages/coding-agent/src/main.ts:686-696"
+	// Decide the final runtime cwd before creating cwd-bound runtime services.
+	// --session and --resume may select a session from another project, so project-local
+	// settings, resources, provider registrations, and models must be resolved only after
+	// the target session cwd is known. The startup-cwd settings manager is used only for
+	// sessionDir lookup during session selection.
+	const envSessionDir = process.env[ENV_SESSION_DIR];
+	const sessionDir =
+		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
+		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
+		startupSettingsManager.getSessionDir();
+	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+```
+
+[`createSessionManager()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/main.ts#L358-L449) 按参数决定会话来源：
+
+| 参数 | 行为 |
+| --- | --- |
+| `--no-session`（或 `--help`、`--list-models`） | `SessionManager.inMemory()`，不落盘 |
+| `--fork <id/path>` | `SessionManager.forkFrom()`，复制到当前目录下的新文件 |
+| `--session <id/path>` | 打开；若在别的项目里找到，询问是否 fork 过来 |
+| `--resume` | 弹出会话选择器 |
+| `--continue` | `SessionManager.continueRecent()`，打开最近的会话 |
+| `--session-id <id>` | 找到就打开，找不到就用这个 id 新建 |
+| 默认 | `SessionManager.create()`，新建会话 |
+
+如果会话记录的 cwd 在磁盘上已经不存在，interactive 模式会让用户选择用当前目录继续，其他模式直接报错退出。
+
+### 1.5 运行时工厂 createRuntime
+
+main 接下来定义一个闭包 `createRuntime`。它是整个启动过程的核心：给定 `cwd`、`agentDir`、`sessionManager`，返回一整套运行时（服务 + AgentSession + 诊断信息）。
+
+```ts title="packages/coding-agent/src/main.ts:733-864"
+	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
+		cwd,
+		agentDir,
+		sessionManager,
+		sessionStartEvent,
+		projectTrustContext,
+	}) => {
+		const isInitialRuntime = sessionStartEvent === undefined;
+		// ...
+		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+		const services = await createAgentSessionServices({
+			cwd,
+			agentDir,
+			settingsManager: runtimeSettingsManager,
+			modelRuntimeSignal: AbortSignal.timeout(15_000),
+			extensionFlagValues: parsed.unknownFlags,
+		// ...
+		});
+		const { settingsManager, modelRuntime, resourceLoader } = services;
+		// ...
+		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
+		const scopedModels =
+			modelPatterns && modelPatterns.length > 0
+				? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
+				: [];
+		// ...
+		const created = await createAgentSessionFromServices({
+			services,
+			sessionManager,
+			sessionStartEvent,
+			model: sessionOptions.model,
+			thinkingLevel: sessionOptions.thinkingLevel,
+		// ...
+		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
+		if (created.session.model && cliThinkingOverride) {
+			created.session.setThinkingLevel(created.session.thinkingLevel);
+		}
+
+		return {
+			...created,
+			services,
+			diagnostics,
+		};
+	};
+```
+
+为什么要做成工厂，而不是直接写一串创建代码？因为同样的装配在运行中还会再做：`/new`、`/resume`、`/fork`、`/import` 都要换成另一个会话文件，而新会话的 cwd 可能不同。工厂闭包捕获了“进程级不变的输入”（命令行参数 `parsed`、CLI 指定的扩展路径、信任存储等），每次调用只换掉“随会话变化的输入”（cwd、sessionManager、`sessionStartEvent`）。第 3 节会看到 `AgentSessionRuntime` 正是保存这个工厂并反复调用它。
+
+工厂里依次做了这些事：
+
+1. **项目信任**：项目里有扩展等需要信任的资源时，决定是否加载项目级资源。结果按 cwd 缓存在 `projectTrustByCwd` 里。
+2. **建服务**：`createAgentSessionServices()`。
+3. **收集诊断**：服务诊断、设置诊断、扩展加载错误和警告。工厂只返回诊断，不打印也不退出，由调用方决定怎么处理。
+4. **模型范围**：`--models` 或设置里的 `enabledModels` 经 `resolveModelScope()` 解析成 `scopedModels`（Ctrl+P 循环切换的范围）。
+5. **会话选项**：[`buildSessionOptions()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/main.ts#L451-L554) 把 `--model`、`--provider`、`--thinking`、`--tools`、`--no-tools` 等转成 `CreateAgentSessionOptions`。
+6. **`--api-key`**：作为运行时覆盖写进 `modelRuntime.setRuntimeApiKey()`，不持久化。
+7. **创建会话**：`createAgentSessionFromServices()`。
+
+最后用这个工厂创建初始运行时：
+
+```ts title="packages/coding-agent/src/main.ts:866-876"
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: sessionManager.getCwd(),
+		agentDir,
+		sessionManager,
+	});
+	time("createAgentSessionRuntime");
+	const { services, session, modelFallbackMessage } = runtime;
+	const { settingsManager, modelRuntime, resourceLoader } = services;
+	setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides());
+	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+```
+
+初始调用不带 `sessionStartEvent`，所以 `isInitialRuntime` 为真；AgentSession 内部会把它默认成 `{ type: "session_start", reason: "startup" }`。之后的替换会显式传入 `reason: "new" | "resume" | "fork"`。
+
+### 1.6 createAgentSessionServices：按 cwd 建服务
+
+[agent-session-services.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session-services.ts#L135-L205) 把“基础设施”和“会话本身”分开：
+
+```ts title="packages/coding-agent/src/core/agent-session-services.ts:135-205"
+export async function createAgentSessionServices(
+	options: CreateAgentSessionServicesOptions,
+): Promise<AgentSessionServices> {
+	const cwd = resolvePath(options.cwd);
+	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
+	const modelRuntime =
+		options.modelRuntime ??
+		(await ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+			signal: options.modelRuntimeSignal,
+		}));
+	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const resourceLoader = new DefaultResourceLoader({
+		...(options.resourceLoaderOptions ?? {}),
+		cwd,
+		agentDir,
+		settingsManager,
+	});
+	await resourceLoader.reload(options.resourceLoaderReloadOptions);
+
+	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+	const extensionsResult = resourceLoader.getExtensions();
+	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+	// ...
+	await modelRuntime.refresh({ allowNetwork: false });
+	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+
+	return {
+		cwd,
+		agentDir,
+		modelRuntime,
+		settingsManager,
+		resourceLoader,
+		diagnostics,
+	};
+}
+```
+
+顺序有讲究：
+
+1. 创建 `ModelRuntime`，读 `agentDir/auth.json` 和 `agentDir/models.json`。
+2. 创建 `DefaultResourceLoader` 并 `reload()`。这一步会加载扩展。
+3. 扩展在加载期间调用 `pi.registerProvider()` 时，`ModelRuntime` 还没交给它们，所以注册请求先存进 `pendingProviderRegistrations`、`pendingNativeProviderRegistrations`、`pendingVirtualModelRegistrations` 三个队列。这里统一回放到 `modelRuntime`，然后清空队列。
+4. `modelRuntime.refresh({ allowNetwork: false })`：根据新注册的 provider 重算模型列表，不访问网络。
+5. 把 `parsed.unknownFlags` 和扩展注册的 flag 对上（[applyExtensionFlagValues](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session-services.ts#L82-L128)）。仍然不认识的 flag 这时才报 `Unknown option`。
+
+接口注释里说明了为什么分两步：先有服务，调用方才能“针对目标 cwd 的服务”解析模型、thinking 和工具选项，再创建会话。`createAgentSessionFromServices()` 本身只是把服务字段转给 `createAgentSession()`。
+
+### 1.7 sdk.ts：createAgentSession
+
+[`createAgentSession()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/sdk.ts#L191-L479) 是 SDK 的公开入口，CLI 也走它。所有参数都可以省略，省略时它自己创建默认的 `ModelRuntime`、`SettingsManager`、`SessionManager`、`ResourceLoader`。
+
+文件顶部有一行模块级副作用：
+
+```ts title="packages/coding-agent/src/core/sdk.ts:43-46"
+// Preserve the pre-0.81 fallback for extensions that construct Agent instances
+// or invoke low-level agent loops without supplying streamFn. Agent core remains
+// provider-agnostic and does not import pi-ai/compat itself.
+setDefaultStreamFn(streamSimple);
+```
+
+agent-core 不依赖 pi-ai 的具体实现，`streamFn` 必须由使用方提供。这一行给“自己 new Agent 但没传 streamFn 的扩展”一个兜底。
+
+**第一步：选模型。** 优先级是：显式传入的 `options.model` → 会话里记录的模型（要求该 provider 已配置鉴权）→ `findInitialModel()`。
+
+```ts title="packages/coding-agent/src/core/sdk.ts:209-251"
+	// Check if session has existing data to restore
+	const existingSession = sessionManager.buildSessionContext();
+	const hasExistingSession = existingSession.messages.length > 0;
+	// ...
+	let model = options.model;
+	let modelFallbackMessage: string | undefined;
+
+	// Assistant messages name the physical model that answered, so a virtual selection is only in
+	// model_change entries.
+	const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
+		modelRuntime.getModel(provider, modelId),
+	);
+
+	// If session has data, try to restore model from it
+	if (!model && hasExistingSession && sessionModel) {
+		const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
+		if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
+			model = restoredModel;
+		}
+		if (!model) {
+			modelFallbackMessage = `Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`;
+		}
+	}
+
+	// If still no model, use findInitialModel (checks settings default, then provider defaults)
+	if (!model) {
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: hasExistingSession,
+			defaultProvider: settingsManager.getDefaultProvider(),
+			defaultModelId: settingsManager.getDefaultModel(),
+			defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
+			modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
+			modelRuntime,
+		});
+		model = result.model;
+		if (!model) {
+			modelFallbackMessage = formatNoModelsAvailableMessage();
+		} else if (modelFallbackMessage) {
+			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+		}
+	}
+```
+
+注意恢复模型时读的是 `model_change` entry（`getBranchSelection`），而不是最后一条 assistant 消息上的模型字段。注释解释了原因：assistant 消息记录的是“实际回答的物理模型”，用户选的如果是虚拟模型（由路由器决定每次请求用哪个物理模型），只能从 `model_change` 里找到。恢复失败时生成 `modelFallbackMessage`，交互界面会把它显示出来。
+
+**第二步：选 thinking 级别。**
+
+```ts title="packages/coding-agent/src/core/sdk.ts:253-278"
+	let thinkingLevel = options.thinkingLevel;
+
+	// If session has data, restore thinking level from it
+	if (thinkingLevel === undefined && hasExistingSession) {
+		thinkingLevel = hasThinkingEntry
+			? (existingSession.thinkingLevel as ThinkingLevel)
+			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
+	}
+
+	// Fall back to per-model override, then global default
+	if (thinkingLevel === undefined && model) {
+		const perModel = settingsManager.getModelThinkingLevel(model.provider, model.id);
+		if (perModel) {
+			thinkingLevel = perModel;
+		}
+	}
+	if (thinkingLevel === undefined) {
+		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+	}
+
+	// Clamp to model capabilities
+	if (!model) {
+		thinkingLevel = "off";
+	} else {
+		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
+	}
+```
+
+优先级：显式传入 → 会话里的 `thinking_level_change`（老会话没有就用全局默认）→ 设置里针对这个模型的级别 → 全局默认 → `DEFAULT_THINKING_LEVEL`。最后按模型能力截断（`clampThinkingLevel`），没有模型时强制为 `"off"`。
+
+**第三步：工具选择**（[sdk.ts:280-294](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/sdk.ts#L280-L294)）。默认启用 `read`、`bash`、`edit`、`write`；`--tools` 只含 `+name`/`-name` 时表示在默认集上增删，否则是白名单。工具细节在第 4 章。
+
+**第四步：new Agent。** 这是本章最关键的一段，`Agent` 的每个钩子都在这里接上 coding-agent 的实现：
+
+```ts title="packages/coding-agent/src/core/sdk.ts:403-438"
+	const agent = new Agent({
+		initialState: {
+			systemPrompt: "",
+			model,
+			thinkingLevel,
+			tools: [],
+			messages: existingSession.messages,
+		},
+		convertToLlm: convertToLlmWithBlockImages,
+		streamFn: async (model, context, options) => {
+			const requestOptions = buildRequestOptions(options);
+			// Compaction and summaries use their own routing ids; only session requests
+			// replace the cache entry, so warming restarts from them. Keep warming while
+			// the current transcript still extends the request's prefix. Agent state may
+			// shallow-copy the messages array or refresh the model object without changing
+			// the provider request, so top-level object identity is not a valid cache key.
+			if (options?.sessionId === sessionManager.getSessionId()) {
+				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+			}
+			return modelRuntime.streamSimple(model, context, requestOptions);
+		},
+		onPayload: transformProviderPayload,
+		onResponse: handleProviderResponse,
+		onProviderStreamEvent: handleProviderStreamEvent,
+		sessionId: sessionManager.getSessionId(),
+		transformContext: async (messages) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner) return messages;
+			return runner.emitContext(messages);
+		},
+		steeringMode: settingsManager.getSteeringMode(),
+		followUpMode: settingsManager.getFollowUpMode(),
+		transport: settingsManager.getTransport(),
+		thinkingBudgets: settingsManager.getThinkingBudgets(),
+		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+	});
+```
+
+逐项看：
+
+| Agent 选项 | coding-agent 的实现 | 作用 |
+| --- | --- | --- |
+| `initialState.messages` | `sessionManager.buildSessionContext().messages` | 从会话文件恢复上下文 |
+| `initialState.systemPrompt` | `""` | 系统提示不走这个字段，见第 5 节 |
+| `convertToLlm` | `convertToLlmWithBlockImages` | `AgentMessage[]` 转 `Message[]`，可选地屏蔽图片 |
+| `streamFn` | 包一层后调 `modelRuntime.streamSimple` | 注入超时、重试、请求头钩子，并启动缓存预热 |
+| `transformContext` | `extensionRunner.emitContext` | 扩展的 `context` 事件可以改写上下文 |
+| `onPayload` / `onResponse` / `onProviderStreamEvent` | 转发给扩展 | `before_provider_request`、`after_provider_response`、`provider_stream_event` |
+| `steeringMode` / `followUpMode` 等 | 读设置 | 队列一次取一条还是全部 |
+
+这里有个先有鸡还是先有蛋的问题：这些钩子要调用扩展运行器，但扩展运行器是 `AgentSession` 构造时才创建的，而 `AgentSession` 又需要先有 `Agent`。解决办法是一个可变引用 `extensionRunnerRef`：钩子在**调用时**才读 `extensionRunnerRef.current`，`AgentSession` 创建好运行器后把它填进去（见 2.9 节）。
+
+`convertToLlmWithBlockImages` 是另一个“调用时再读设置”的例子：
+
+```ts title="packages/coding-agent/src/core/sdk.ts:297-331"
+	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
+		const converted = convertToLlm(messages);
+		// Check setting dynamically so mid-session changes take effect
+		if (!settingsManager.getBlockImages()) {
+			return converted;
+		}
+		// Filter out ImageContent from all messages, replacing with text placeholder
+		return converted.map((msg) => {
+			if (msg.role === "user" || msg.role === "toolResult") {
+						// ...
+						return { ...msg, content: filteredContent };
+					}
+				}
+			}
+			return msg;
+		});
+	};
+```
+
+`blockImages` 设置在每次转换时读取，所以会话中途打开也能立刻生效。图片被替换成文字 `Image reading is disabled.`，连续的重复占位会去重。
+
+`streamFn` 包装里调用的 `buildRequestOptions`（[sdk.ts:340-358](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/sdk.ts#L340-L358)）同样每次请求都重新读设置：超时、最大重试次数、WebSocket 连接超时、客户端标识，以及 `before_provider_headers` 扩展钩子。
+
+**第五步：补写元数据，创建 AgentSession。**
+
+```ts title="packages/coding-agent/src/core/sdk.ts:440-470"
+	// Restore missing settings metadata for older sessions.
+	if (hasExistingSession) {
+		if (!hasThinkingEntry) {
+			sessionManager.appendThinkingLevelChange(thinkingLevel);
+		}
+	} else {
+		// Save initial model and thinking level for new sessions so they can be restored on resume
+		if (model) {
+			sessionManager.appendModelChange(model.provider, model.id);
+		}
+		sessionManager.appendThinkingLevelChange(thinkingLevel);
+	}
+
+	const session = new AgentSession({
+		agent,
+		sessionManager,
+		settingsManager,
+		cwd,
+		scopedModels: options.scopedModels,
+		resourceLoader,
+		customTools: options.customTools,
+		modelRuntime,
+		cacheWarmer,
+		initialActiveToolNames,
+		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
+		defaultToolModifiers: toolModifiers,
+		allowedToolNames,
+		excludedToolNames,
+		extensionRunnerRef,
+		sessionStartEvent: options.sessionStartEvent,
+	});
+```
+
+新会话会立刻写入一条 `model_change` 和一条 `thinking_level_change`，这样下次 `--continue` 能恢复同样的模型和级别。老会话缺少 thinking 记录时也补一条。
+
+### 1.8 进入三种模式
+
+回到 main。运行时建好后，main 应用终端能力和 HTTP 设置，处理 `--help`、`--list-models`，读管道输入，初始化主题，报告诊断（有 error 就退出），然后分派：
+
+```ts title="packages/coding-agent/src/main.ts:950-993"
+	if (appMode === "rpc") {
+		printTimings();
+		await runRpcMode(runtime);
+	} else if (appMode === "interactive") {
+		const interactiveMode = new InteractiveMode(runtime, {
+			migratedProviders,
+		// ...
+		printTimings();
+		await interactiveMode.run();
+	} else {
+		printTimings();
+		const exitCode = await runPrintMode(runtime, {
+			mode: toPrintOutputMode(appMode),
+			messages: parsed.messages,
+			initialMessage,
+			initialImages,
+		});
+```
+
+三种模式拿到的都是同一个 `AgentSessionRuntime`，区别只在“怎么订阅事件、怎么提交输入”。它们都做同一件事：调用 `runtimeHost.setRebindSession()` 注册一个回调，每当运行时换了新的 AgentSession，就重新绑定扩展、重新订阅事件。以打印模式为例：
+
+```ts title="packages/coding-agent/src/modes/print-mode.ts:70-112"
+	runtimeHost.setRebindSession(async () => {
+		await rebindSession();
+	});
+
+	const rebindSession = async (): Promise<void> => {
+		session = runtimeHost.session;
+		await session.bindExtensions({
+			mode: mode === "json" ? "json" : "print",
+			commandContextActions: {
+				waitForIdle: () => session.waitForIdle(),
+				newSession: async (newSessionOptions) => runtimeHost.newSession(newSessionOptions),
+		// ...
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		unsubscribe = session.subscribe((event) => {
+			if (mode === "json") {
+				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+			}
+		});
+```
+
+关键在于 `session = runtimeHost.session` 这一行：模式代码不能长期持有某个 AgentSession 的引用，因为它随时可能被替换。交互模式干脆不存，用 getter 每次从 `runtimeHost` 取：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:597-622"
+	private get session(): AgentSession {
+		return this.runtimeHost.session;
+	}
+		// ...
+		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.resetExtensionUI();
+		});
+		this.runtimeHost.setRebindSession(async () => {
+			await this.rebindCurrentSession({ renderBeforeBind: true });
+			this.themeController.applyFromSettings();
+		});
+```
+
+| 模式 | `bindExtensions` 的 mode | 事件去向 | 输入来源 |
+| --- | --- | --- | --- |
+| interactive | `"tui"`（[interactive-mode.ts:1975](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L1975)） | 渲染成 TUI 组件 | 编辑器提交 |
+| print / json | `"print"` / `"json"` | json 模式逐行输出 `toJsonEvent(event)` | 命令行参数和管道 |
+| rpc | `"rpc"` | 逐行输出 JSON | stdin 上的 JSONL 命令 |
+
+## 2. AgentSession：会话的总线
+
+[agent-session.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts) 有 4458 行。它不是一个循环，而是一块“接线板”：一侧是 agent-core 的 `Agent`，一侧是 SessionManager、SettingsManager、ModelRuntime、扩展运行器、ResourceLoader，再一侧是 UI/RPC/SDK 调用方。
+
+### 2.1 构造：订阅 Agent，安装钩子
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:485-526"
+	constructor(config: AgentSessionConfig) {
+		this.agent = config.agent;
+		this.sessionManager = config.sessionManager;
+		// ...
+		// Always subscribe to agent events for internal handling
+		// (session persistence, extensions, auto-compaction, retry logic)
+		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this._installAgentToolHooks();
+		this._installAgentNextTurnRefresh();
+		this._installAgentRequestProjection();
+		this._installAgentBoundaryHooks();
+		this._installHiddenDeclarationsProjection();
+		this._installAgentForcedPromptProjection();
+
+		this._buildRuntime({
+			activeToolNames: this._initialActiveToolNames,
+			includeAllExtensionTools: true,
+		});
+		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
+	}
+```
+
+构造函数做三件事：
+
+1. **订阅 Agent 事件**：`this.agent.subscribe(this._handleAgentEvent)`。所有持久化、扩展分发、重试判断都从这里进入（2.10 节）。
+2. **安装钩子**：在 `sdk.ts` 已经填好的钩子上再包一层。
+3. **`_buildRuntime()`**：创建扩展运行器、注册工具（2.9 节）。
+
+每个 `_installXxx` 方法都遵循同一个模式：先取出 Agent 上已有的钩子，再装一个新函数，新函数里先调用旧的再加自己的逻辑。这样 SDK 用户自己设置的钩子不会被覆盖。
+
+| agent-core 钩子 | 安装方法 | AgentSession 的用途 |
+| --- | --- | --- |
+| `beforeToolCall` / `afterToolCall` | `_installAgentToolHooks` | 转成扩展的 `tool_call` / `tool_result` 事件；规范化工具结果里的图片 |
+| `prepareNextTurnWithContext` | `_installAgentNextTurnRefresh` | 每个 turn 前检查是否需要压缩；重算系统提示和工具集 |
+| `prepareRequest` | `_installAgentRequestProjection` | 从会话树重新投影上下文；虚拟模型路由 |
+| `finishTurn` | `_installAgentBoundaryHooks` | 派发扩展的 `turn_end` 边界事件，扩展可以要求继续 |
+| `transformContext` | `_installHiddenDeclarationsProjection`、`_installAgentForcedPromptProjection` | 隐藏部分工具声明；应用扩展强制指定的系统提示 |
+
+工具钩子是最直接的一个：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:652-655"
+	private _installAgentToolHooks(): void {
+		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
+		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+	}
+```
+
+`transformContext` 被包了三层，执行顺序是：sdk.ts 设的扩展 `context` 事件 → 隐藏声明过滤 → 强制系统提示投影。后安装的后执行，因为每层都先 `await previousTransformContext(...)`。
+
+### 2.2 prompt：一句输入的入口
+
+交互模式提交编辑器内容、打印模式发送命令行消息、RPC 收到 `prompt` 命令，最终都调用 [`AgentSession.prompt()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L2092-L2175)：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2092-2175"
+	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._isEmittingAgentSettled) {
+			this._deferredSettledActions.push(async () => await this.prompt(text, options));
+			return;
+		}
+		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const preflightResult = options?.preflightResult;
+		// Handle extension commands first (execute immediately, even during streaming)
+		// Extension commands manage their own LLM interaction via pi.sendMessage()
+		if (expandPromptTemplates && text.startsWith("/")) {
+			const handled = await this._tryExecuteExtensionCommand(text);
+			if (handled) {
+				// Extension command executed, no prompt to send
+				preflightResult?.("handled");
+				return;
+			}
+		}
+		// ...
+		// Emit input event for extension interception (before skill/template expansion)
+		const processedInput = await this._runInputHandlers(
+			text,
+			options?.images,
+			options?.source ?? "interactive",
+			this.isStreaming ? options?.streamingBehavior : undefined,
+		);
+		if (!processedInput) {
+			preflightResult?.("handled");
+			return;
+		}
+		const { text: currentText, images: currentImages } = processedInput;
+
+		// Expand skill commands (/skill:name args) and prompt templates (/template args)
+		let expandedText = currentText;
+		if (expandPromptTemplates) {
+			expandedText = this._expandSkillCommand(expandedText);
+			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		}
+
+		// If streaming, queue via steer() or followUp() based on option
+		if (this.isStreaming) {
+			if (!options?.streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
+			}
+			if (options.streamingBehavior === "followUp") {
+				await this._queueFollowUp(expandedText, currentImages);
+			} else {
+				await this._queueSteer(expandedText, currentImages);
+			}
+			preflightResult?.("queued");
+			return;
+		}
+		// ...
+		// Validate model
+		if (!this.model) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
+		// ...
+		await this._startRun({ messageType: "user", prompt: expandedText, images: currentImages }, () =>
+			preflightResult?.("started"),
+		);
+	}
+```
+
+按执行顺序：
+
+1. **正在派发 `agent_settled` 时**：推迟到派发结束再执行，避免在“即将空闲”的瞬间开启新一轮。
+2. **扩展命令**：以 `/` 开头且匹配到 `pi.registerCommand` 注册的命令，直接执行处理函数，即使 agent 正在运行。命令自己通过 `pi.sendMessage()` 与模型交互。
+3. **压缩中**：手动压缩进行时拒绝输入。
+4. **`input` 事件**：扩展可以拦截（`handled`）或改写（`transform`）输入。这一步在模板展开之前。
+5. **展开**：`/skill:name` 展开成 `<skill>` 块（[`_expandSkillCommand`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L2211-L2235)），`/模板名 参数` 展开成提示模板内容。
+6. **正在运行**：必须指定 `streamingBehavior`，按 `"steer"` 或 `"followUp"` 入队；不指定就抛错。
+7. **空闲**：检查模型和鉴权，然后 `_startRun()`。
+
+`preflightResult` 是给 RPC 用的：RPC 要在“确定已经被接受”时立刻回复客户端，而不是等整轮跑完。它会收到 `"handled"`、`"queued"` 或 `"started"` 三种结果。
+
+### 2.3 steer 和 followUp
+
+正在运行时进来的输入分两种（第 2 章讲过底层语义）：
+
+- **steer**：当前 assistant 回复的工具调用执行完后、下一次请求模型前注入。
+- **followUp**：等 agent 完全做完（没有工具调用、没有 steering 消息）再处理。
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2302-2327"
+	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		this._steeringMessages.push(text);
+		this._emitQueueUpdate();
+		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		if (images) {
+			content.push(...images);
+		}
+		this.agent.steer({
+			role: "user",
+			content,
+			timestamp: Date.now(),
+		});
+	}
+
+	/**
+	 * Internal: Queue a follow-up message (already expanded, no extension command check).
+	 */
+	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		this._followUpMessages.push(text);
+		this._emitQueueUpdate();
+		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		if (images) {
+			content.push(...images);
+		}
+		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+	}
+```
+
+AgentSession 在交给 `agent.steer()` / `agent.followUp()` 的同时，还在自己的 `_steeringMessages` / `_followUpMessages` 里存一份纯文本，并发出 `queue_update` 事件，供 UI 显示“待发送”列表。消息真正开始处理时（`message_start` 且 role 为 user），`_handleAgentEvent` 再按文本把它从列表里删掉（2.10 节）。
+
+公开的 `steer()` / `followUp()` 方法（[agent-session.ts:2275-2297](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L2275-L2297)）走 `_queueUserInput`：同样经过 `input` 事件和模板展开，但扩展命令不能排队，会直接抛错。交互模式在 agent 运行中按 Enter 时调用 `prompt(text, { streamingBehavior: "steer" })`，按 Alt+Enter 时用 `"followUp"`（[interactive-mode.ts:3343](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3343)、[4493](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L4493)）。
+
+### 2.4 _startRun：AgentSession 自己的外层循环
+
+Agent 内部已经有双层循环，为什么 AgentSession 还要一层？因为有些决定只能在 agent 本轮结束之后做：要不要重试、要不要压缩后继续、扩展在 `agent_before_settle` 里要不要再来一轮。
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1873-1918"
+	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		this._isAgentRunActive = true;
+		this._agentRunAbortRequested = false;
+		let messages: AgentMessage[];
+		try {
+			messages = await this._prepareRun(trigger);
+		} catch (error) {
+			this._isAgentRunActive = false;
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			this._resolveIdleWaitIfIdle();
+			throw error;
+		}
+		// Messages held while the run was starting go before its starting messages, as they would
+		// have while idle. No run exists yet, so they cannot split a tool call from its result.
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages();
+		onStarted?.();
+
+		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+		this._failedResponse = undefined;
+		this._recordSelection();
+		// The run records the loadout in the transcript; restored tools that did not register by now
+		// are dropped, so a tool that never registers does not stay pending.
+		this._pendingToolNames.clear();
+		try {
+			await this.agent.prompt(messages);
+			while (!this._agentRunAbortRequested) {
+				if (await this._handlePostAgentRun()) {
+					if (this._agentRunAbortRequested) break;
+					await this.agent.continue();
+					continue;
+				}
+				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+				if (this._agentRunAbortRequested) break;
+				await this.agent.continue();
+			}
+		} finally {
+			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._failedResponse = undefined;
+			this._runSystemPromptOptions = undefined;
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			await this._emitAgentSettled();
+		}
+	}
+```
+
+流程：
+
+1. `_isAgentRunActive = true`：从这一刻起会话算“忙”，期间进来的输入会排队，而不是另起一轮。
+2. `_prepareRun()` 构造起始消息。
+3. 把空闲时积压的 bash 消息和自定义消息先写进去（`_flushPending...`）。
+4. `agent.prompt(messages)` 跑一轮。
+5. 循环：`_handlePostAgentRun()` 返回真就 `agent.continue()`；否则问扩展 `agent_before_settle`，扩展要求继续也 `continue()`。
+6. 最后无论如何发出 `agent_settled`。
+
+`_prepareRun()` 决定这一轮的起始消息：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1926-1977"
+	private async _prepareRun(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[]> {
+		// Check if we need to compact before sending (catches aborted responses).
+		// The starting message is sent below, so do not call agent.continue() here.
+		const lastAssistant = this._findLastAssistantMessage();
+		if (lastAssistant) {
+			await this._checkCompaction(lastAssistant, false);
+		}
+
+		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
+		// ...
+		const messages: AgentMessage[] = [];
+		if (trigger.messageType === "custom") {
+			messages.push(trigger.message);
+		} else {
+			// Normalize images after before_agent_start so extension-driven model selection
+			// determines the resize profile used for the request and history.
+			const normalized = await this._normalizePromptImages(trigger.images);
+			const text =
+				normalized.hints.length > 0 ? `${trigger.prompt}\n\n${normalized.hints.join("\n")}` : trigger.prompt;
+			messages.push({
+				role: "user",
+				content: [{ type: "text", text }, ...normalized.images],
+				timestamp: Date.now(),
+			});
+		}
+		// Inject any pending "nextTurn" messages as context alongside the starting message
+		messages.push(...this._pendingNextTurnMessages);
+		this._pendingNextTurnMessages = [];
+		// ...
+		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+		this._runSystemPromptOptions = result.systemPromptOptions;
+		if (updateMessage) messages.unshift(updateMessage);
+		return messages;
+	}
+```
+
+起始消息的顺序是：系统提示补丁（如果系统提示变了）→ 用户消息 → 积压的 `nextTurn` 消息 → `before_agent_start` 扩展返回的自定义消息。注意图片是在 `before_agent_start` **之后**才规范化的：扩展可能在这个事件里换模型，而图片缩放的尺寸取决于模型。
+
+`_handlePostAgentRun()` 是重试和压缩的接线点：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1979-2015"
+	private async _handlePostAgentRun(): Promise<boolean> {
+		const message = this._lastAssistantMessage;
+		this._lastAssistantMessage = undefined;
+		if (this._agentRunAbortRequested) {
+			this._finishCancelledRetry();
+			return false;
+		}
+		if (!message) return this.agent.hasQueuedMessages();
+
+		if (this._isRetryableError(message) && (await this._prepareRetry(message))) {
+			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._failedResponse = message;
+			return !this._agentRunAbortRequested;
+		}
+		if (this._agentRunAbortRequested) {
+			this._finishCancelledRetry();
+			return false;
+		}
+
+		if (message.stopReason === "error" && this._retryAttempt > 0) {
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt,
+				finalError: message.errorMessage,
+			});
+			this._retryAttempt = 0;
+		}
+
+		if (await this._checkCompaction(message)) {
+			return !this._agentRunAbortRequested;
+		}
+
+		// The low-level loop drains both queues before agent_end. Messages queued by
+		// agent_end handlers require a fresh run before pre-settlement handlers fire.
+		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+	}
+```
+
+先判断可重试错误，再判断压缩，最后看队列里还有没有消息。
+
+### 2.5 模型和 thinking 切换
+
+切模型的三条路径 `setModel`、`_cycleScopedModel`、`_cycleAvailableModel` 结构相同。以 `setModel` 为例：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2541-2561"
+	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
+		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+
+		const previousModel = this.model;
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
+		this.agent.state.model = model;
+		this.sessionManager.appendModelChange(model.provider, model.id);
+		if (options.persist) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+			this._addPersistedDefaultToNonEmptyScope(model);
+		}
+
+		// Apply thinking level for the new model.
+		// Per-model thinking level overrides take priority over the global default.
+		// Model persistence does not implicitly rewrite the global thinking default.
+		this.setThinkingLevel(thinkingLevel);
+
+		await this._emitModelSelect(model, previousModel, "set");
+	}
+```
+
+切模型做的事：
+
+1. 检查新模型的 provider 有鉴权。
+2. 直接改 `agent.state.model`。Agent 下一次请求就用新模型，不需要重建任何对象。
+3. 向会话文件追加 `model_change` entry，这是恢复模型的依据。
+4. `persist: true` 时才写进全局默认设置。默认只影响当前会话。
+5. 重算 thinking 级别：设置里有针对新模型的级别就用它，否则用全局默认。
+6. 通知扩展 `model_select`。
+
+`cycleModel()`（Ctrl+P）有 `scopedModels` 时在范围内循环，否则在所有有鉴权的模型里循环。
+
+thinking 级别：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2676-2699"
+	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		const availableLevels = this.getAvailableThinkingLevels();
+		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+
+		// Only persist if actually changing
+		const previousLevel = this.agent.state.thinkingLevel;
+		const isChanging = effectiveLevel !== previousLevel;
+
+		this.agent.state.thinkingLevel = effectiveLevel;
+
+		if (options.persist) {
+			this.settingsManager.setDefaultThinkingLevel(level);
+		}
+
+		if (isChanging) {
+			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
+			void this._extensionRunner.emit({
+				type: "thinking_level_select",
+				level: effectiveLevel,
+				previousLevel,
+			});
+		}
+	}
+```
+
+请求的级别会先按当前模型支持的级别截断；只有截断后的级别真的变了，才追加 `thinking_level_change` entry 并发事件。`thinking_level_changed` 是给 UI 的会话事件，`thinking_level_select` 是给扩展的事件。
+
+### 2.6 自动压缩与重试的接线点
+
+压缩（compaction）和重试的算法细节放到第 5 章，这里只看它们从哪里被触发：
+
+| 触发点 | 位置 | 做什么 |
+| --- | --- | --- |
+| 每轮开始前 | `_prepareRun` → `_checkCompaction(lastAssistant, false)` | 上一轮被中止时也检查（`false` 表示不跳过 aborted） |
+| 每个 turn 请求前 | `prepareNextTurnWithContext` → `_compactBeforeNextAssistantResponse` | 投影上下文超过阈值就先压缩 |
+| 虚拟模型路由后 | `prepareRequest` | 按路由出的物理模型的窗口重新检查 |
+| 一轮结束后 | `_handlePostAgentRun` → `_isRetryableError` / `_checkCompaction` | 可重试错误先重试；上下文溢出则压缩后重试一次 |
+
+turn 前的检查：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:776-785"
+	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+		const projection = this.sessionManager.buildSessionProjection();
+		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
+		const model = this.model;
+		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
+			return { ...context, messages: projection.messages };
+		}
+		await this._runAutoCompaction("threshold", false);
+		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
+	}
+```
+
+重试的判定把“上下文溢出”排除在外，溢出交给压缩处理：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3769-3773"
+	private _isRetryableError(message: AssistantMessage): boolean {
+		// Context overflow is handled by compaction, not retry.
+		if (isContextOverflow(message, (this._modelForMessage(message) ?? this.model)?.contextWindow ?? 0)) return false;
+		return isRetryableAssistantError(message);
+	}
+```
+
+[`_prepareRetry()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L3822-L3862) 做指数退避：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3822-3862"
+	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
+		const settings = this.settingsManager.getRetrySettings();
+		if (!settings.enabled) {
+			return false;
+		}
+
+		this._retryAttempt++;
+
+		if (this._retryAttempt > settings.maxRetries) {
+			// Preserve the completed attempt count so post-run handling can emit the final failure.
+			this._retryAttempt--;
+			return false;
+		}
+
+		const delayMs = retryDelayMs(settings, this._retryAttempt);
+		// ...
+		// Keep the failed attempt in raw history while durably omitting it from model projection.
+		this._omitRecoveryAttempt(message);
+
+		// Wait with exponential backoff (abortable)
+		this._retryAbortController = new AbortController();
+		try {
+			await sleep(delayMs, this._retryAbortController.signal);
+		// ...
+		return true;
+	}
+```
+
+失败的那条 assistant 消息不会从文件里删除。`_omitRecoveryAttempt()` 追加一条 `context_edit` entry，把它（连同它的工具结果）从模型上下文的投影里去掉。原始历史保留，只是下次请求看不到它。这与第 5 章的“会话是只追加的树”一致。
+
+### 2.7 ! 命令
+
+在交互模式输入 `!ls`，命令由用户而不是模型执行，输出进入上下文；`!!ls` 执行但不进上下文。识别在交互模式里：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3308-3324"
+			// Handle bash command (! for normal, !! for excluded from context)
+			if (text.startsWith("!")) {
+				const isExcluded = text.startsWith("!!");
+				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+				if (command) {
+					if (this.session.isBashRunning) {
+						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
+						this.editor.setText(text);
+						return;
+					}
+					this.editor.addToHistory?.(text);
+					await this.handleBashCommand(command, isExcluded);
+					this.isBashMode = false;
+					this.updateEditorBorderColor();
+					return;
+				}
+			}
+```
+
+`handleBashCommand` 先发 `user_bash` 扩展事件（扩展可以接管执行，或提供远程执行的 `operations`），再调用 `session.executeBash()`。执行完由 `recordBashResult()` 记录：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3939-3960"
+	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		const bashMessage: BashExecutionMessage = {
+			role: "bashExecution",
+			command,
+			output: result.output,
+			exitCode: result.exitCode,
+			cancelled: result.cancelled,
+			truncated: result.truncated,
+			fullOutputPath: result.fullOutputPath,
+			timestamp: Date.now(),
+			excludeFromContext: options?.excludeFromContext,
+		};
+
+		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
+		if (this.isStreaming) {
+			// Queue for later - will be flushed on agent_end
+			this._pendingBashMessages.push(bashMessage);
+		} else {
+			this.sessionManager.appendMessage(bashMessage);
+			this._refreshFinalizedContext();
+		}
+	}
+```
+
+问题：模型正在运行时，消息序列里可能有一个 assistant 消息发出了工具调用、工具结果还没回来。如果这时插入一条 bash 消息，就变成“工具调用 → bash 消息 → 工具结果”，大多数 provider 会拒绝这种顺序。所以运行中的 bash 结果先放进 `_pendingBashMessages`，等 `_startRun` 的 `finally` 里调用 `_flushPendingBashMessages()` 再写入：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3985-3993"
+	private _flushPendingBashMessages(): void {
+		if (this._pendingBashMessages.length === 0) return;
+
+		for (const bashMessage of this._pendingBashMessages) {
+			this.sessionManager.appendMessage(bashMessage);
+		}
+		this._pendingBashMessages = [];
+		this._refreshFinalizedContext();
+	}
+```
+
+`bashExecution` 是自定义消息类型，它怎么变成模型能看懂的文本，见第 4 节。
+
+### 2.8 树导航入口
+
+`/tree` 选中树上的另一个节点时调用 [`navigateTree()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L4024-L4216)。和 fork 不同，它不创建新文件，只在同一个文件里移动 leaf：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:4024-4198"
+	async navigateTree(
+		targetId: string,
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (this.isStreaming) {
+			throw new Error("Wait for the current response to finish before navigating the session tree.");
+		}
+		if (this.isCompacting) {
+			throw new Error(
+				"Wait for the current compaction or tree navigation to finish before navigating the session tree.",
+			);
+		}
+
+		const oldLeafId = this.sessionManager.getLeafId();
+			// ...
+			// Determine the new leaf position based on target type
+			let newLeafId: string | null;
+			let editorText: string | undefined;
+
+			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+				// User message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.message.content, "");
+			} else if (targetEntry.type === "custom_message") {
+				// Custom message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.content, "");
+			} else {
+				// Non-user message: leaf = selected node
+				newLeafId = targetId;
+			}
+			// ...
+			// Update finalized context from the canonical session projection.
+			this._refreshFinalizedContext();
+			this._restoreToolsFromTranscript();
+```
+
+要点：
+
+- 运行中或压缩中禁止导航。
+- 选中用户消息时，leaf 移到它的**父节点**，消息文本放回编辑器，相当于“重新编辑这句话”。选中其他节点时，leaf 就是该节点。
+- 用户选择“总结离开的分支”时，先发 `session_before_tree`（扩展可以取消或自己提供摘要），再调用 `generateBranchSummary()`，用 `branchWithSummary()` 在新位置追加一条 `branch_summary` entry。
+- 移动 leaf 后调用 `_refreshFinalizedContext()`，从会话树重新投影出 `agent.state.messages`，并按新分支记录的工具集恢复工具。
+
+### 2.9 扩展绑定
+
+扩展运行器在 `_buildRuntime()` 里创建：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3697-3708"
+		this._extensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			this._cwd,
+			this.sessionManager,
+			new ModelRegistry(this._modelRuntime),
+		);
+		if (this._extensionRunnerRef) {
+			this._extensionRunnerRef.current = this._extensionRunner;
+		}
+		this._bindExtensionCore(this._extensionRunner);
+		this._applyExtensionBindings(this._extensionRunner);
+```
+
+这里填上了 `extensionRunnerRef.current`，sdk.ts 里那些钩子从此能找到运行器。扩展看到的 `ModelRegistry` 是对 `ModelRuntime` 的同步包装（第 6 节）。
+
+`_bindExtensionCore()` 把 AgentSession 的能力暴露给扩展 API，例如：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3446-3494"
+		runner.bindCore(
+			{
+				// ...
+				appendEntry: (customType, data) => {
+					const entryId = this.sessionManager.appendCustomEntry(customType, data);
+					const entry = this.sessionManager.getEntry(entryId);
+					if (entry) {
+						this._emit({ type: "entry_appended", entry });
+					}
+				},
+				// ...
+				setModel: async (model) => {
+					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
+					await this.setModel(model);
+					return true;
+				},
+				getThinkingLevel: () => this.thinkingLevel,
+				setThinkingLevel: (level) => this.setThinkingLevel(level),
+```
+
+但运行器创建时还不能发 `session_start`：扩展的 UI 上下文、命令上下文里的 `newSession`、`fork` 等动作要由**模式**提供，而模式这时还没准备好。所以拆成第二步 `bindExtensions()`，由模式调用：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3318-3342"
+	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		if (bindings.uiContext !== undefined) {
+			this._extensionUIContext = bindings.uiContext;
+		}
+		if (bindings.mode !== undefined) {
+			this._extensionMode = bindings.mode;
+		}
+		if (bindings.commandContextActions !== undefined) {
+			this._extensionCommandContextActions = bindings.commandContextActions;
+		}
+		if (bindings.abortHandler !== undefined) {
+			this._extensionAbortHandler = bindings.abortHandler;
+		}
+		if (bindings.shutdownHandler !== undefined) {
+			this._extensionShutdownHandler = bindings.shutdownHandler;
+		}
+		if (bindings.onError !== undefined) {
+			this._extensionErrorListener = bindings.onError;
+		}
+
+		this._applyExtensionBindings(this._extensionRunner);
+		await this._extensionRunner.emit(this._sessionStartEvent);
+		this._extensionRunner.reportUnhandledMcpServers();
+		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+	}
+```
+
+这就是为什么 1.8 节里每个模式都在 `rebindSession` 中调用 `bindExtensions()`：绑定完 UI 和命令动作后，扩展才收到 `session_start`，此时它在 handler 里调用 `ctx.ui.*` 或 `ctx.newSession()` 都是可用的。
+
+`/reload` 走 [`reload()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L3720-L3759)：给旧运行器发 `session_shutdown`、使其失效，重新加载设置和资源，再 `_buildRuntime()` 建一个新运行器，最后发 `session_start`（reason 为 `"reload"`）。AgentSession 本身不换。
+
+### 2.10 _handleAgentEvent：事件分发顺序
+
+`Agent` 每发一个事件，都会先更新自己的 state，再依次 `await` 每个订阅者（[agent.ts:575-620](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/src/agent.ts#L575-L620)）。AgentSession 是第一个订阅者，它的处理函数：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1103-1198"
+	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		// ...
+		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
+		// This ensures the UI sees the updated queue state
+		if (event.type === "message_start" && event.message.role === "user") {
+		// ...
+		// Emit to extensions first, then notify public listeners.
+		await this._emitExtensionEvent(event);
+		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+
+		// Handle session persistence
+		if (event.type === "message_end") {
+			let entryId: string | undefined;
+			// Check if this is a custom message from extensions
+			if (event.message.role === "custom") {
+				// Persist as CustomMessageEntry
+				entryId = this.sessionManager.appendCustomMessageEntry(
+					event.message.customType,
+					event.message.content,
+					event.message.display,
+					event.message.details,
+				);
+			} else if (
+				event.message.role === "system" ||
+				event.message.role === "user" ||
+				event.message.role === "assistant" ||
+				event.message.role === "toolResult"
+			) {
+				// Regular LLM message - persist as SessionMessageEntry
+				entryId = this.sessionManager.appendMessage(event.message);
+			}
+			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
+		// ...
+		if (event.type === "turn_end") {
+			this._flushPendingCustomMessages();
+		}
+	};
+```
+
+一个事件经过的顺序：
+
+| 步骤 | 做什么 | 为什么在这个位置 |
+| --- | --- | --- |
+| 1 | user 消息开始时，从 steering/follow-up 显示队列里移除 | 让 UI 收到事件时队列已经是最新状态 |
+| 2 | `await _emitExtensionEvent(event)` | 扩展先处理，可能修改消息 |
+| 3 | `_emit(event)` 通知所有监听者（UI、RPC、SDK） | 监听者看到的是扩展处理后的版本 |
+| 4 | `message_end` 时写入会话文件 | 写入的也是扩展处理后的版本 |
+| 5 | `turn_end` 时写入积压的自定义消息 | 此时工具结果都已写入，不会夹在工具调用和结果之间 |
+
+第 2 步“扩展可能修改消息”具体是 `message_end` 事件：扩展可以返回一条替换消息。
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1334-1352"
+		} else if (event.type === "message_end") {
+			const extensionEvent: MessageEndEvent = {
+				type: "message_end",
+				message: event.message,
+			};
+			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
+			if (replacement) {
+				// Untyped extension handlers can return messages with null/missing content;
+				// normalize so it never enters agent state or session history.
+				const normalized =
+					(replacement.role === "user" ||
+						replacement.role === "assistant" ||
+						replacement.role === "toolResult" ||
+						replacement.role === "custom") &&
+					replacement.content == null
+						? ({ ...replacement, content: [] } as AgentMessage)
+						: replacement;
+				this._replaceMessageInPlace(event.message, normalized);
+			}
+```
+
+替换方式很特别：不是换一个对象，而是**原地**清空目标对象的字段再 `Object.assign`（[`_replaceMessageInPlace`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L1286-L1300)）。原因在注释里：agent-core 在发 `message_end` 之前已经把这个消息对象放进了自己的 state。原地修改能让 agent state、后续事件、监听者和随后 `appendMessage(event.message)` 写入的内容保持一致。
+
+第 3 步的 `_emit` 是同步的：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1039-1043"
+	private _emit(event: AgentSessionEvent): void {
+		for (const l of this._eventListeners) {
+			l(event);
+		}
+	}
+```
+
+扩展的处理函数会被 `await`，监听者不会。这正是“先扩展、后监听者”的含义：扩展可以阻塞并改写，UI 只是观察。
+
+第 4 步的持久化按 role 区分：`custom` 消息写成 `custom_message` entry；`system`、`user`、`assistant`、`toolResult` 写成普通 `message` entry；`bashExecution`、`compactionSummary`、`branchSummary` 不在这里写，它们各有专门的写入路径（`recordBashResult`、压缩、`branchWithSummary`）。写入后记录“消息对象 → entry id”的映射（`_entryIdsByMessage`，一个 WeakMap），`turn_end` 边界事件和重试时的 `context_edit` 要靠它找到对应的 entry。
+
+`agent_end` 事件发给监听者前会补一个字段 `willRetry`，让 UI 知道这次失败后马上会自动重试，不必显示成最终错误。
+
+## 3. AgentSessionRuntime：整体替换会话
+
+### 3.1 为什么整体替换
+
+问题：用户在会话 A 里执行 `/resume` 打开会话 B。B 可能属于另一个项目，那个项目有自己的设置、扩展和 `models.json`。如果只把 `sessionManager` 换掉，扩展运行器、工具注册表、模型列表、系统提示里的 cwd 都还是 A 的。逐个修补这些状态很容易漏。
+
+[agent-session-runtime.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session-runtime.ts) 的做法是：拆掉旧的，用 main 传进来的工厂按新会话的 cwd 重建一整套。
+
+```ts title="packages/coding-agent/src/core/agent-session-runtime.ts:167-185"
+	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
+		// Settle any active response first so the aborted turn (including tool
+		// results) is persisted to the outgoing session before it is replaced.
+		await this.session.abort();
+		await emitSessionShutdownEvent(this.session.extensionRunner, {
+			type: "session_shutdown",
+			reason,
+			targetSessionFile,
+		});
+		this.beforeSessionInvalidate?.();
+		this.session.dispose();
+	}
+
+	private apply(result: CreateAgentSessionRuntimeResult): void {
+		this._session = result.session;
+		this._services = result.services;
+		this._diagnostics = result.diagnostics;
+		this._modelFallbackMessage = result.modelFallbackMessage;
+	}
+```
+
+拆除顺序：
+
+1. `session.abort()`：先结束正在进行的回复，让被中止的 turn（包括工具结果）写进**旧**会话文件。
+2. 给扩展发 `session_shutdown`。
+3. `beforeSessionInvalidate`：交互模式在这里同步拆掉扩展提供的 TUI 组件。
+4. `session.dispose()`：中止重试、压缩、分支摘要和 bash，让旧扩展上下文失效，断开 Agent 订阅。
+
+`dispose()` 让扩展上下文失效时会带一段说明（[agent-session.ts:1423-1425](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L1423-L1425)）：之后再用旧的 `pi` 或 `ctx` 会报错，提示扩展把替换后的逻辑放进 `withSession` 回调，使用回调传入的新 ctx。
+
+### 3.2 四种替换
+
+`switchSession` 最有代表性：
+
+```ts title="packages/coding-agent/src/core/agent-session-runtime.ts:196-224"
+	async switchSession(
+		sessionPath: string,
+		options?: {
+			cwdOverride?: string;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+			projectTrustContextFactory?: (cwd: string) => ProjectTrustContext;
+		},
+	): Promise<{ cancelled: boolean }> {
+		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
+		if (beforeResult.cancelled) {
+			return beforeResult;
+		}
+
+		const previousSessionFile = this.session.sessionFile;
+		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+		assertSessionCwdExists(sessionManager, this.cwd);
+		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		this.apply(
+			await this.createRuntime({
+				cwd: sessionManager.getCwd(),
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+			}),
+		);
+		await this.finishSessionReplacement(options?.withSession);
+		return { cancelled: false };
+	}
+```
+
+| 方法 | 触发 | 新 SessionManager | cwd | 扩展前置事件 |
+| --- | --- | --- | --- | --- |
+| `switchSession` | `/resume`、扩展 `ctx.switchSession` | `SessionManager.open(path)` | 目标会话的 cwd | `session_before_switch`（reason resume） |
+| `newSession` | `/new` | `create` 或 `inMemory`（跟随当前是否落盘） | 当前 cwd | `session_before_switch`（reason new） |
+| `fork` | `/fork`、`/clone` | `createBranchedSession(targetLeafId)` 或带 `parentSession` 的新会话 | 当前或源会话 cwd | `session_before_fork` |
+| `importFromJsonl` | `/import` | 复制文件到会话目录后 `open` | 文件记录的 cwd | `session_before_switch`（reason resume） |
+
+共同步骤是：发前置事件（扩展可取消）→ 准备新 SessionManager → `teardownCurrent()` → `apply(await this.createRuntime(...))` → `finishSessionReplacement()`。最后一步调用模式注册的 `rebindSession`，再执行调用方传入的 `withSession`。
+
+`fork(entryId)` 默认 `position: "before"`：要求选中的是用户消息，新会话的 leaf 是它的父节点，并返回这条消息的文本，界面把它放回编辑器。`position: "at"` 则保留选中的节点本身，`/clone` 就是对当前 leaf 调用 `fork(leafId, { position: "at" })`（[interactive-mode.ts:5547](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L5547)）。
+
+初始运行时也用同一个工厂：
+
+```ts title="packages/coding-agent/src/core/agent-session-runtime.ts:420-438"
+export async function createAgentSessionRuntime(
+	createRuntime: CreateAgentSessionRuntimeFactory,
+	options: {
+		cwd: string;
+		agentDir: string;
+		sessionManager: SessionManager;
+		sessionStartEvent?: SessionStartEvent;
+	},
+): Promise<AgentSessionRuntime> {
+	assertSessionCwdExists(options.sessionManager, options.cwd);
+	const result = await createRuntime(options);
+	return new AgentSessionRuntime(
+		result.session,
+		result.services,
+		createRuntime,
+		result.diagnostics,
+		result.modelFallbackMessage,
+	);
+}
+```
+
+所以“启动”和“切换”是同一条代码路径，区别只是 `sessionStartEvent` 的 reason。扩展在 `session_start` 里根据 reason 区分是首次启动、重载、新建、恢复还是 fork。
+
+## 4. messages.ts：自定义消息与 convertToLlm
+
+### 4.1 用声明合并扩展消息类型
+
+pi-ai 的 `Message` 只有 system、user、assistant、toolResult 四种 role。coding-agent 需要更多种类的消息，又不想改 agent-core 的类型定义。agent-core 留了一个空接口 `CustomAgentMessages`，coding-agent 用 TypeScript 的声明合并往里加：
+
+```ts title="packages/coding-agent/src/core/messages.ts:69-77"
+// Extend CustomAgentMessages via declaration merging
+declare module "@earendil-works/pi-agent-core" {
+	interface CustomAgentMessages {
+		bashExecution: BashExecutionMessage;
+		custom: CustomMessage;
+		branchSummary: BranchSummaryMessage;
+		compactionSummary: CompactionSummaryMessage;
+	}
+}
+```
+
+合并之后，`AgentMessage` 这个联合类型就包含了四种新 role。agent-core 本身不关心它们是什么，只在调用模型前通过 `convertToLlm` 转换。
+
+| role | 来源 | 字段 | 转换结果 |
+| --- | --- | --- | --- |
+| `bashExecution` | `!` / `!!` 命令 | `command`、`output`、`exitCode`、`excludeFromContext` 等 | user 文本消息；`!!` 的被丢弃 |
+| `custom` | 扩展 `pi.sendMessage()`、`before_agent_start` | `customType`、`content`、`display`、`details` | user 消息，内容原样 |
+| `branchSummary` | `/tree` 离开分支时的摘要 | `summary`、`fromId` | 带前缀的 user 文本 |
+| `compactionSummary` | 压缩生成的摘要 | `summary`、`tokensBefore` | 带前缀的 user 文本 |
+
+`custom` 消息的 `display` 决定 UI 是否显示它，`details` 是给渲染器用的结构化数据，二者都不进模型上下文。
+
+### 4.2 convertToLlm
+
+```ts title="packages/coding-agent/src/core/messages.ts:148-196"
+export function convertToLlm(messages: AgentMessage[]): Message[] {
+	return messages
+		.map((m): Message | undefined => {
+			switch (m.role) {
+				case "bashExecution":
+					// Skip messages excluded from context (!! prefix)
+					if (m.excludeFromContext) {
+						return undefined;
+					}
+					return {
+						role: "user",
+						content: [{ type: "text", text: bashExecutionToText(m) }],
+						timestamp: m.timestamp,
+					};
+				case "custom": {
+					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
+					return {
+						role: "user",
+						content,
+						timestamp: m.timestamp,
+					};
+				}
+				case "branchSummary":
+					return {
+						role: "user",
+						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
+						timestamp: m.timestamp,
+					};
+				case "compactionSummary":
+					return {
+						role: "user",
+						content: [
+							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+						],
+						timestamp: m.timestamp,
+					};
+				case "system":
+				case "user":
+				case "assistant":
+				case "toolResult":
+					return m;
+				default:
+					// biome-ignore lint/correctness/noSwitchDeclarations: fine
+					const _exhaustiveCheck: never = m;
+					return undefined;
+			}
+		})
+		.filter((m) => m !== undefined);
+}
+```
+
+所有自定义消息都变成 **user** 消息。这是最稳妥的选择：每家 provider 都支持 user 消息，而不是每家都支持中途的 system 消息。`default` 分支里的 `never` 赋值是穷举检查：以后有人往 `CustomAgentMessages` 里加了新 role 却忘了在这里处理，类型检查会报错。
+
+bash 消息的文本格式：
+
+```ts title="packages/coding-agent/src/core/messages.ts:82-98"
+export function bashExecutionToText(msg: BashExecutionMessage): string {
+	let text = `Ran \`${msg.command}\`\n`;
+	if (msg.output) {
+		text += `\`\`\`\n${msg.output}\n\`\`\``;
+	} else {
+		text += "(no output)";
+	}
+	if (msg.cancelled) {
+		text += "\n\n(command cancelled)";
+	} else if (msg.exitCode !== null && msg.exitCode !== undefined && msg.exitCode !== 0) {
+		text += `\n\nCommand exited with code ${msg.exitCode}`;
+	}
+	if (msg.truncated && msg.fullOutputPath) {
+		text += `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`;
+	}
+	return text;
+}
+```
+
+模型看到的是“Ran `ls`”加代码块输出，还包括非零退出码、取消、截断等状态。摘要消息分别用 `COMPACTION_SUMMARY_PREFIX` 和 `BRANCH_SUMMARY_PREFIX` 包起来（[messages.ts:11-24](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/messages.ts#L11-L24)），用 `<summary>` 标签告诉模型“这之前的对话被压缩成了下面的摘要”。
+
+`convertToLlm` 有三个调用方（见函数注释）：Agent 的 `convertToLlm` 选项（经 sdk.ts 的 `blockImages` 包装）、压缩生成摘要时、以及扩展和工具。虚拟模型路由（`prepareRequest` 里的 `resolveModel`）也直接调用它。
+
+## 5. system-prompt.ts：分段拼系统提示
+
+### 5.1 系统提示是 transcript 里的消息
+
+前面看到 `new Agent` 时 `systemPrompt` 是空字符串。系统提示实际上以 role 为 `system` 的消息存在于消息列表里，并且是**分段**的：每段有名字，变化时只发变化的段。
+
+为什么这么做？系统提示会在会话中途变化：工具集变了、扩展改了规则、skills 重新加载了。如果每次都整体替换系统提示，provider 的前缀缓存（prompt cache）就会失效；而且会话文件里也看不出系统提示在什么时候变成了什么。把它做成 transcript 里的消息，变化就是一条追加的补丁，既能回放，也只影响补丁之后的缓存。
+
+### 5.2 分段
+
+[`buildSystemPromptSections()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/system-prompt.ts#L128-L193) 产出有序的段：
+
+```ts title="packages/coding-agent/src/core/system-prompt.ts:128-193"
+export function buildSystemPromptSections(input: BuildSystemPromptOptions): SystemPromptSections {
+	// ...
+	const declaredTools = selectedTools.filter((name) => !hiddenTools.includes(name));
+	const promptSections: Record<string, string> = {};
+	if (customPrompt) {
+		promptSections.preamble = customPrompt;
+	} else {
+		promptSections.preamble =
+			"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+		const visibleTools = declaredTools.filter((name) => !!toolSnippets[name]);
+		const tools =
+			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
+		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
+		promptSections.rules = buildRules(declaredTools, toolGuidelines, promptGuidelines);
+		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
+- Main documentation: ${getReadmePath()}
+- Additional docs: ${getDocsPath()}
+- Examples: ${getExamplesPath()} (extensions, custom tools, SDK)
+- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
+- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)
+- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing
+- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)`;
+	}
+
+	if (appendSystemPrompt) promptSections.addendum = appendSystemPrompt;
+	if (contextFiles.length > 0) promptSections.project_context = renderProjectContext(contextFiles);
+	// A hidden reader is still reachable through another tool, so skills stay but the hint names no tool.
+	const readers = ["read", "bash"] as const;
+	const skillFileReadTool =
+		readers.find((tool) => declaredTools.includes(tool)) ??
+		(readers.some((tool) => selectedTools.includes(tool)) ? "indirect" : undefined);
+	if (skillFileReadTool && skills.length > 0) {
+		const skillsPrompt = formatSkillsForPrompt(skills, skillFileReadTool).trim();
+		if (skillsPrompt) promptSections.skills = skillsPrompt;
+	}
+	promptSections.cwd = cwd.replace(/\\/g, "/");
+	for (const [name, content] of Object.entries(customSections)) {
+		if (content) promptSections[name] = content;
+	}
+
+	const sections: SystemPromptSections = { preamble: promptSections.preamble };
+	for (const [name, content] of Object.entries(promptSections)) {
+		if (name !== "preamble") sections[name] = `<${name}>\n${content}\n</${name}>`;
+	}
+	return sections;
+}
+```
+
+| 段名 | 内容 | 条件 |
+| --- | --- | --- |
+| `preamble` | 默认身份说明，或 `--system-prompt` / `SYSTEM.md` 的自定义内容 | 总有；不加标签 |
+| `tools` | 工具列表，每个工具一行 snippet | 无自定义提示时 |
+| `rules` | 由工具集推出的规则、工具贡献的 guideline、固定规则 | 无自定义提示时 |
+| `docs` | pi 自身文档的路径 | 无自定义提示时 |
+| `addendum` | `--append-system-prompt` / `APPEND_SYSTEM.md` | 有内容时 |
+| `project_context` | AGENTS.md 等上下文文件，每个包在 `<project_instructions>` 里 | 有文件时 |
+| `skills` | 可用 skills 列表 | 有 skills 且有 read 或 bash 可以读文件时 |
+| `cwd` | 工作目录（反斜杠转成正斜杠） | 总有 |
+| 扩展自定义段 | `before_agent_start` 里写入 `sections` | 有内容时 |
+
+除 `preamble` 外，每段都包成 `<段名>…</段名>`。注释说明了用意：模型能把后来的更新和之前的同名段对应起来。
+
+`rules` 段由 [`buildRules()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/system-prompt.ts#L88-L125) 生成：只有 bash 而没有 grep/find/ls 时，加一条“用 bash 做文件查找”；然后依次加入每个启用工具贡献的 guideline、扩展的 `promptGuidelines`，最后两条固定规则是简洁回答和清楚标出文件路径。重复的规则去重。
+
+### 5.3 输入从哪来
+
+AgentSession 在 [`_rebuildSystemPrompt()`](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L1720-L1746) 里从 ResourceLoader 收集输入：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1729-1745"
+		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
+		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
+		const appendSystemPrompt = loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : "";
+		const loadedSkills = this._resourceLoader.getSkills().skills;
+		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
+
+		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
+			cwd: this._cwd,
+			skills: loadedSkills,
+			contextFiles: loadedContextFiles,
+			customPrompt: loaderSystemPrompt,
+			appendSystemPrompt,
+			selectedTools: validToolNames,
+			hiddenTools: [...this._hiddenDeclarations],
+			toolSnippets,
+			toolGuidelines: Object.fromEntries(this._toolPromptGuidelines),
+		});
+```
+
+这是“基础选项”。每轮开始时，`before_agent_start` 扩展事件拿到它的一份可变副本（`systemPromptOptions`），可以改段、改工具、加 guideline，结果作为这一轮的 `_runSystemPromptOptions`。
+
+### 5.4 补丁
+
+真正发给模型的是补丁：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1758-1770"
+	private _preparePromptAndToolLoadout(
+		options: NormalizedBuildSystemPromptOptions,
+		messages: AgentMessage[] = this.agent.state.messages,
+	): SystemMessage | undefined {
+		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
+		// The tool list and rules must match the declarations the request carries.
+		options.hiddenTools = [...this._hiddenDeclarations];
+		const sections = diffSystemPromptSections(
+			getCurrentSystemMessage(messages)?.sections ?? {},
+			buildSystemPromptSections(options),
+		);
+		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
+	}
+```
+
+```ts title="packages/coding-agent/src/core/system-prompt.ts:217-229"
+export function diffSystemPromptSections(
+	previous: Record<string, string | null>,
+	current: SystemPromptSections,
+): Record<string, string | null> | undefined {
+	const patch: Record<string, string | null> = {};
+	for (const [name, text] of Object.entries(current)) {
+		if (previous[name] !== text) patch[name] = text;
+	}
+	for (const name of Object.keys(previous)) {
+		if (current[name] === undefined) patch[name] = null;
+	}
+	return Object.keys(patch).length > 0 ? patch : undefined;
+}
+```
+
+`getCurrentSystemMessage(messages)` 把 transcript 里所有 system 消息回放成“模型当前看到的段”，与期望的段比较：变了的段写新内容，消失的段写 `null`，都没变就返回 `undefined`，不发补丁。补丁在 `_prepareRun` 里放到起始消息最前面，在 `prepareNextTurnWithContext` 里放到 turn 的追加消息中，并像普通消息一样在 `message_end` 时写入会话文件。
+
+一个具体例子：会话进行中，扩展通过 `setActiveTools()` 启用了 `grep`。下一个 turn 前 `_preparePromptAndToolLoadout` 重新生成段，`tools` 段多了一行 grep、`rules` 段少了“用 bash 查找文件”那条，于是补丁只包含 `tools` 和 `rules` 两段，`preamble`、`project_context` 等不重发。
+
+### 5.5 强制系统提示
+
+`before_agent_start` 处理函数也可以返回一整段 `systemPrompt` 文本，要求完全替换。这时结构化的段照样计算和持久化，但请求被投影：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1807-1822"
+	private _installAgentForcedPromptProjection(): void {
+		const previousTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			const forced = this._runSystemPromptOptions?.forceSystemPrompt;
+			if (forced === undefined) return transformed;
+			const current = getCurrentSystemMessage(transformed);
+			const head: SystemMessage = {
+				role: "system",
+				content: forced,
+				...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {}),
+				timestamp: current?.timestamp ?? Date.now(),
+			};
+			return [head, ...transformed.filter((message) => message.role !== "system")];
+		};
+	}
+```
+
+所有 system 消息被合并成一条头部消息，内容是强制文本，工具声明保留。会话文件里记录的仍是结构化的段，强制文本只影响这一轮的请求。
+
+## 6. 模型选择链
+
+模型相关的代码分四个文件，各管一层：
+
+| 文件 | 职责 | 使用者 |
+| --- | --- | --- |
+| [model-resolver.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/model-resolver.ts) | 把字符串（`--model`、`--models`、设置）解析成 `Model`；选初始模型 | main.ts、sdk.ts |
+| [model-runtime.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/model-runtime.ts) | 持有 provider 和凭据，提供模型列表、鉴权和 `streamSimple` | coding-agent 内部 |
+| [provider-composer.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/provider-composer.ts) | 把内置 provider、`models.json`、扩展注册的配置叠成一个 `Provider` | ModelRuntime |
+| [model-registry.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/model-registry.ts) | ModelRuntime 的同步兼容外观 | 扩展（`ctx.modelRegistry`） |
+
+### 6.1 model-resolver：从字符串到模型
+
+`--model` 走 `resolveCliModel()`：
+
+```ts title="packages/coding-agent/src/core/model-resolver.ts:486-491"
+	const result = resolveModelReference(
+		{ text: cliModel, provider, thinkingSuffix: "strict", fuzzy: true },
+		models,
+		// An inline key goes to whichever provider is selected, so stored credentials must not choose it
+		inlineApiKey ? () => false : (providerId) => modelRuntime.hasConfiguredAuth(providerId),
+	);
+```
+
+`resolveModelReference()` 先收集所有候选再选 provider（文件注释说明了原因：不让目录顺序决定 provider，有歧义就报出来）。它支持 `provider/id`、`id:thinking` 后缀、模糊匹配。一个细节：注释里提到 OpenRouter 的 id 本身就含冒号（如 `qwen/qwen3-coder:exacto`），所以只有整串匹配不到模型时才把最后的 `:xxx` 当成 thinking 级别。找不到模型但 provider 明确时，会用该 provider 的某个模型做模板构造一个自定义 id 的模型，并给出警告。
+
+没有显式指定模型时，sdk.ts 调用 `findInitialModel()`：
+
+```ts title="packages/coding-agent/src/core/model-resolver.ts:570-615"
+	// 1. Use first model from scoped models (skip if continuing/resuming)
+	if (scopedModels.length > 0 && !isContinuing) {
+		const scopedModel = scopedModels[0];
+		const perModel = modelThinkingLevels?.[`${scopedModel.model.provider}/${scopedModel.model.id}`];
+		return {
+			model: scopedModel.model,
+			thinkingLevel: scopedModel.thinkingLevel ?? perModel ?? defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL,
+			fallbackMessage: undefined,
+		};
+	}
+
+	// 2. Try saved default from settings if auth is configured.
+	if (defaultProvider && defaultModelId) {
+		const found = modelRuntime.getModel(defaultProvider, defaultModelId);
+		if (found && modelRuntime.hasConfiguredAuth(found.provider)) {
+			model = found;
+			const perModel = modelThinkingLevels?.[`${defaultProvider}/${defaultModelId}`];
+			if (perModel) {
+				thinkingLevel = perModel;
+			} else if (defaultThinkingLevel) {
+				thinkingLevel = defaultThinkingLevel;
+			}
+			return { model, thinkingLevel, fallbackMessage: undefined };
+		}
+	}
+
+	// 3. Try first available model with valid API key
+	const availableModels = [...modelRuntime.getAvailableSnapshot()];
+
+	if (availableModels.length > 0) {
+		// Try to find a default model from known providers
+		for (const provider of Object.keys(defaultModelPerProvider) as KnownProvider[]) {
+			const defaultId = defaultModelPerProvider[provider];
+			const match = availableModels.find((m) => m.provider === provider && m.id === defaultId);
+			if (match) {
+				return { model: match, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+			}
+		}
+
+		// If no default found, use first available
+		return { model: availableModels[0], thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+	}
+
+	// 4. No model found
+	return { model: undefined, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+}
+```
+
+优先级：`scopedModels` 的第一个（续接会话时跳过）→ 设置里的默认模型（要求已鉴权）→ 有鉴权的模型中，按 `defaultModelPerProvider` 表找各 provider 的推荐模型 → 第一个可用模型。sdk.ts 调用时传的 `scopedModels` 是空数组，因为 main 已经在 `buildSessionOptions` 里处理过 scoped 的情况。
+
+### 6.2 model-runtime：运行时
+
+`ModelRuntime.create()` 读 `auth.json` 和 `models.json`，取 pi-ai 的全部内置 provider（OpenRouter 包一层“按用户 key 个性化目录”，其余包一层远程目录），然后组合。每个 provider 的组合：
+
+```ts title="packages/coding-agent/src/core/model-runtime.ts:309-325"
+	private composeProvider(providerId: string): Provider | undefined {
+		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
+		const extension = this.extensionProviders.get(providerId);
+		if (!this.config.getProvider(providerId) && !extension) {
+			// No overlays: use the builtin untouched so its auth/login/stream behavior is exact.
+			this.compositionErrors.delete(providerId);
+			return base;
+		}
+		try {
+			const provider = composeModelProvider(providerId, base, this.config, extension);
+			this.compositionErrors.delete(providerId);
+			return provider;
+		} catch (error) {
+			this.compositionErrors.set(providerId, error instanceof Error ? error.message : String(error));
+			return base;
+		}
+	}
+```
+
+没有任何覆盖（`models.json` 和扩展都没提到这个 provider）时直接用内置 provider，保证其鉴权、登录和流式行为与 pi-ai 完全一致；有覆盖才交给 `composeModelProvider()`。组合失败不会让整个运行时崩溃，错误记在 `compositionErrors` 里，退回内置版本。
+
+AgentSession 的 `streamFn` 最终调到这里：
+
+```ts title="packages/coding-agent/src/core/model-runtime.ts:731-757"
+	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+		const transcript = normalizeContext(context);
+		if (isVirtualModel(model)) {
+			// Requests outside the agent loop are routed here. Callers sized them before routing, so
+			// cap the output budget to the routed model.
+			return lazyStream(model, async () => {
+				const route = await this.resolveModel(model, transcript.messages, {
+					reason: "direct",
+					thinkingLevel: options?.reasoning ?? "off",
+					signal: options?.signal,
+				});
+				const { maxTokens: limit } = route.model;
+				const maxTokens = options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
+				const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
+				// Caller credentials were resolved for the virtual model's provider. Another provider
+				// resolves its own, so they are not sent to the wrong vendor.
+				const { apiKey, headers, env, ...rest } = options ?? {};
+				const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
+				return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
+			});
+		}
+		return lazyStream(model, async () => {
+			assertChatModel(model);
+			const prepared = await this.prepareRequest(model, options);
+			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+		});
+	}
+```
+
+虚拟模型先路由到物理模型，再递归调用自己；普通模型经过 `prepareRequest` 解析鉴权后，交给 provider 的 `streamSimple`。`lazyStream` 让函数立刻返回一个流，异步的鉴权和准备工作在流里完成。
+
+`prepareRequest` 在请求时才取鉴权：
+
+```ts title="packages/coding-agent/src/core/model-runtime.ts:670-704"
+		const provider = this.models.getProvider(model.provider);
+		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
+		const resolution = await this.getAuth(model, {
+			apiKey: options?.apiKey,
+			env: options?.env,
+			signal: options?.signal,
+		});
+		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+
+		const { transformHeaders, ...rawProviderOptions } = options ?? {};
+		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
+		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		// ...
+		return {
+			provider,
+			model: requestModel,
+			options: {
+				...providerOptions,
+				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+				headers,
+				env,
+			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
+		};
+```
+
+请求时取鉴权意味着 OAuth token 过期可以在这里刷新；鉴权返回的 `baseUrl` 会覆盖模型的 `baseUrl`；请求头按“OpenCode 会话头 → 鉴权头 → 调用方传入的头”的顺序合并，再交给 `transformHeaders`（即扩展的 `before_provider_headers`）。
+
+### 6.3 provider-composer：叠加三层配置
+
+`composeModelProvider()` 的模型列表按固定顺序叠加：
+
+```ts title="packages/coding-agent/src/core/provider-composer.ts:556-580"
+	const currentExtension = (): ProviderConfigInput | undefined =>
+		extension && refreshedExtensionModels ? { ...extension, models: refreshedExtensionModels } : extension;
+	// models.json modelOverrides are the topmost user-config layer: they apply once,
+	// after custom-model upserts, extension model replacement, and legacy OAuth projection.
+	const getAllModels = (): AnyModel[] => {
+		let models = applyExtension(
+			providerId,
+			applyModelsJson(providerId, getAllProviderModels(base), config),
+			currentExtension(),
+		);
+		if (extensionOAuthCredential && extension?.oauth?.modifyModels) {
+			// The extension hook is chat-only; other model types pass through untouched.
+			models = [
+				...extension.oauth.modifyModels(
+					models.filter((model) => isModelType(model, "chat")),
+					extensionOAuthCredential,
+				),
+				...models.filter((model) => !isModelType(model, "chat")),
+			];
+		}
+		return models.map((model) => {
+			const override = config?.modelOverrides?.[model.id];
+			return override && isModelType(model, "chat") ? applyModelOverride(model, override) : model;
+		});
+	};
+```
+
+内置模型 → `models.json` 里的 provider 配置（改 `baseUrl`、合并 `compat`、追加或替换自定义模型）→ 扩展注册的配置（扩展给了 `models` 就整体替换）→ 扩展 OAuth 的 `modifyModels` → 最后是 `models.json` 的 `modelOverrides`。注释强调 `modelOverrides` 是用户配置的最顶层，最后应用。
+
+流式调用的分派：
+
+```ts title="packages/coding-agent/src/core/provider-composer.ts:587-608"
+	const supportsBaseApi = (model: Model<Api>) => base?.getModels().some((entry) => entry.api === model.api) ?? false;
+	const streamWith = (
+		model: Model<Api>,
+		context: TranscriptContext,
+		options: StreamOptions | undefined,
+		simple: boolean,
+	): AssistantMessageEventStream =>
+		lazyStream(model, async () => {
+			if (extension?.streamSimple && model.api === extension.api) {
+				return extension.streamSimple(model, context, options as SimpleStreamOptions);
+			}
+			if (base && supportsBaseApi(model)) {
+				return simple
+					? base.streamSimple(model, context, options as SimpleStreamOptions)
+					: base.stream(model, context, options);
+			}
+			const api = getApiProvider(model.api);
+			if (!api) throw new Error(`No API provider registered for api: ${model.api}`);
+			return simple
+				? api.streamSimple(model, context, options as SimpleStreamOptions)
+				: api.stream(model, context, options);
+		});
+```
+
+扩展提供了 `streamSimple` 且 api 匹配 → 用扩展的；内置 provider 支持这个 api → 用内置的；否则按 `model.api` 去 pi-ai 的 API 注册表里找实现。这就是第 1 章“provider 与 API 分开”在 coding-agent 层的体现：用户在 `models.json` 里加一个走 `openai-completions` 协议的自定义 provider，不需要写任何代码。
+
+### 6.4 model-registry：给扩展的外观
+
+```ts title="packages/coding-agent/src/core/model-registry.ts:44-53"
+/**
+ * Synchronous compatibility facade exposed to extensions.
+ * Coding-agent internals use ModelRuntime directly.
+ */
+export class ModelRegistry {
+	private readonly runtime: ModelRuntime;
+
+	constructor(runtime: ModelRuntime) {
+		this.runtime = runtime;
+	}
+```
+
+注释写得很直接：这是暴露给扩展的同步兼容外观，coding-agent 内部直接用 `ModelRuntime`。`ModelRegistry` 的每个方法几乎都是一行转发，例如 `find()` 转 `runtime.getModel()`，`getAvailable()` 转 `getAvailableSnapshot()`。它在 `_buildRuntime()` 里随扩展运行器一起创建（2.9 节）。
+
+把四层串起来，一次 `pi --model sonnet:high` 的模型从选择到发请求：
+
+```text
+main.buildSessionOptions
+  → model-resolver.resolveCliModel("sonnet:high")      模糊匹配出 anthropic/claude-sonnet-…，thinking=high
+sdk.createAgentSession
+  → clampThinkingLevel(model, "high")
+  → new Agent({ initialState: { model, thinkingLevel } })
+Agent 请求时
+  → streamFn → modelRuntime.streamSimple(model, ...)
+  → prepareRequest：getAuth → 合并 headers
+  → provider.streamSimple   （无覆盖时是 pi-ai 内置 provider；有覆盖时是 composeModelProvider 的结果）
+  → pi-ai API 实现（anthropic-messages）
+```
+
+## 小结
+
+- `cli.ts` 只调用 `main()`。main 先处理子命令和 `--version` 等，再解析参数、决定模式（rpc / json / print / interactive），管道输入会把 interactive 改成 print。
+- 先选会话再建服务：会话可能属于另一个项目，项目级设置、扩展和模型配置都要按会话的 cwd 解析。
+- `createRuntime` 是一个工厂闭包，捕获进程级输入，每次调用按 cwd 建服务（`createAgentSessionServices`）、解析模型和工具选项、创建会话（`createAgentSession`）。启动和后续的会话替换走同一条路径。
+- `sdk.ts` 用 `new Agent({ convertToLlm, streamFn, transformContext, ... })` 填上 agent-core 的钩子。钩子通过 `extensionRunnerRef` 在调用时才找到扩展运行器，设置也在调用时才读。
+- `AgentSession` 是接线板：订阅 Agent 事件，在已有钩子外再包一层；`prompt` 处理扩展命令、`input` 事件、模板展开、排队和鉴权检查；`_startRun` 在 Agent 之外再加一层循环处理重试、压缩和 `agent_before_settle`。
+- 事件分发顺序固定：先 `await` 扩展，再同步通知监听者，`message_end` 时写入会话文件。扩展对 `message_end` 的替换是原地修改，保证 agent state、监听者和文件一致。
+- `AgentSessionRuntime` 替换会话时先 abort、发 `session_shutdown`、dispose，再用工厂重建，最后让模式 `rebindSession`。模式代码必须每次从 `runtimeHost` 取当前会话。
+- 自定义消息通过声明合并加入 `AgentMessage`，`convertToLlm` 把它们一律转成 user 消息。
+- 系统提示是 transcript 里分段的 system 消息，变化时只追加变化的段。
+- 模型链：resolver 解析字符串，runtime 持有 provider 和凭据并在请求时取鉴权，composer 叠加内置 / `models.json` / 扩展三层配置，registry 是给扩展的外观。
+
+## 动手验证
+
+1. **看启动各阶段耗时**：在仓库根目录运行 `PI_TIMING=1 ./pi-test.sh -p "hi"`。`time()` 打点的标签（`parseArgs`、`createSessionManager`、`createAgentSessionRuntime` 等）就是本章 1.3–1.8 节的各个阶段（见 [timings.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/timings.ts)）。
+2. **看系统提示补丁**：用 `--mode json` 跑一句话，例如 `./pi-test.sh --mode json "hi" | head -5`，找 role 为 `system` 的 `message_end` 事件，观察 `sections` 字段里的段名。再打开对应会话的 JSONL 文件，确认同样的 system 消息被写成了一条 `message` entry。
+3. **读会话替换的测试**：`packages/coding-agent/test/suite/agent-session-runtime.test.ts` 用 faux provider 覆盖了 `newSession`、`switchSession`、`fork` 的行为；从 `packages/coding-agent` 目录运行 `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/suite/agent-session-runtime.test.ts`。
+4. **读系统提示和模型解析的测试**：`test/system-prompt.test.ts`、`test/system-prompt-updates.test.ts` 展示了分段和补丁的预期输出；`test/model-resolver.test.ts` 列出了 `provider/id`、`:thinking` 后缀、模糊匹配和歧义报错的各种情况。

@@ -1,0 +1,2301 @@
+---
+title: 第 2 章　pi-agent-core：Agent 循环
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 2 章　pi-agent-core：Agent 循环
+
+## 导读
+
+<Diagram src="/diagrams/loop.html" title="runLoop：Agent 的双层循环" />
+
+<Say id="k02-01">pi-ai 只负责一次请求、一条回复。反复调用模型、执行工具，是 agent-core 的工作。</Say>
+<Say id="k02-02" cue="input">用户输入先变成 AgentMessage。这是可扩展的内部消息，只在调用模型前才转成 pi-ai 的 Message。</Say>
+<Say id="k02-03" cue="model">每个 turn 先注入排队消息，经 transformContext、convertToLlm 交给 streamFn。</Say>
+<Say id="k02-04" cue="exec">回复里有工具调用，就走工具流水线：预处理、校验、beforeToolCall、执行、afterToolCall。</Say>
+<Say id="k02-05" cue="inject">一个 turn 结束后检查 steering 队列。插话在这里注入，下一次请求就能看到。</Say>
+<Say id="k02-06" cue="followup">没有工具调用也没有插话，内层循环结束。外层循环再看 follow-up 队列，有消息就再跑一轮。</Say>
+<Say id="k02-07" cue="done">两个队列都空了，发出 agent_end。Agent 类把这一切包成状态、队列、中止和事件订阅。</Say>
+<Say id="k02-08">读完这一章，你应该能说出每个钩子在循环的哪一步被调用，以及一次运行发出的完整事件序列。</Say>
+
+## 1. 这个包解决什么问题
+
+第 1 章的 pi-ai 提供的是“单次调用”：给它模型和消息列表，它流回一条 `AssistantMessage`。但一个能干活的 agent 需要的远不止一次调用：
+
+- 模型说“我要调用 `read` 工具”，得有人真的去执行，把结果作为 `toolResult` 消息塞回上下文，再请求一次模型。
+- 用户在模型干活时又敲了一句话，这句话要在合适的时机插进去，不能打断正在执行的工具。
+- 应用（比如 pi 的 coding-agent）想在上下文里放自己的消息类型：bash 执行记录、压缩摘要、UI 通知。这些不是 LLM 认识的消息。
+- UI 要实时显示进度：模型正在输出哪个字、哪个工具在跑、跑到哪了。
+
+`@earendil-works/pi-agent-core`（目录 `packages/agent`）就做这些事。它只有 6 个源文件，约 2.5k 行：
+
+| 文件 | 行数 | 内容 |
+| --- | --- | --- |
+| `agent-loop.ts` | 959 | 无状态的循环：`runLoop`、工具流水线、`streamAssistantResponse` |
+| `agent.ts` | 623 | 有状态的 `Agent` 类：状态、两个队列、abort、事件订阅 |
+| `types.ts` | 539 | `AgentMessage`、`AgentEvent`、`AgentLoopConfig`、`AgentTool` 等类型 |
+| `proxy.ts` | 395 | `streamProxy`：通过代理服务器调用模型的 `StreamFn` |
+| `stream-fn.ts` | 20 | 全局默认 `StreamFn` 的注册点 |
+| `index.ts` | 5 | 重新导出 |
+
+分层很清楚：`agent-loop.ts` 是纯函数式的循环，不持有任何状态，所有可变行为都通过 `AgentLoopConfig` 里的回调注入；`agent.ts` 在它外面包一层状态和队列。第 3 章的 `AgentSession` 再包一层 `Agent`。这就是大纲里说的“钩子分三层”：agent-core 留钩子，AgentSession 实现钩子，再暴露成扩展事件。
+
+## 2. 消息模型：AgentMessage 与消息边界
+
+### 2.1 可扩展的 AgentMessage
+
+问题：coding-agent 想在上下文里存 `bashExecution`、`compactionSummary` 这类消息，它们要进会话文件、要被 UI 渲染，但 LLM 不认识。如果循环内部只能用 pi-ai 的 `Message`，应用就得在外面另存一份平行列表，两份很容易对不上。
+
+解决办法是让循环内部一直使用 `AgentMessage`，它是 LLM 消息和应用自定义消息的并集：
+
+````ts title="packages/agent/src/types.ts:351-374"
+/**
+ * Extensible interface for custom app messages.
+ * Apps can extend via declaration merging:
+ *
+ * @example
+ * ```typescript
+ * declare module "@mariozechner/agent" {
+ *   interface CustomAgentMessages {
+ *     artifact: ArtifactMessage;
+ *     notification: NotificationMessage;
+ *   }
+ * }
+ * ```
+ */
+export interface CustomAgentMessages {
+	// Empty by default - apps extend via declaration merging
+}
+
+/**
+ * AgentMessage: Union of LLM messages + custom messages.
+ * This abstraction allows apps to add custom message types while maintaining
+ * type safety and compatibility with the base LLM messages.
+ */
+export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
+````
+
+`CustomAgentMessages` 是一个空接口，应用通过 TypeScript 的声明合并（declaration merging，在另一个文件里再写一次同名 interface，编译器会把字段合并起来）往里加类型。`CustomAgentMessages[keyof CustomAgentMessages]` 取出所有值类型组成联合。接口为空时 `keyof` 是 `never`，`AgentMessage` 就退化成 `Message`。注释里的模块名 `@mariozechner/agent` 是旧包名，现在的包名是 `@earendil-works/pi-agent-core`。
+
+循环的输入是一个很小的上下文快照：
+
+```ts title="packages/agent/src/types.ts:501-507"
+/** Context snapshot passed into the low-level agent loop. */
+export interface AgentContext {
+	/** Transcript visible to the model. */
+	messages: AgentMessage[];
+	/** Tools available for execution in this run. */
+	tools?: AgentTool<any>[];
+}
+```
+
+注意这里没有 `systemPrompt` 字段。系统提示和工具声明都放在 transcript（对话记录）里的 `system` 消息上，下文 4.2 节会讲为什么。
+
+### 2.2 只在边界转换
+
+[agent-loop.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/src/agent-loop.ts#L1-L4) 文件头的注释直接写明了原则：
+
+```ts title="packages/agent/src/agent-loop.ts:1-4"
+/**
+ * Agent loop that works with AgentMessage throughout.
+ * Transforms to Message[] only at the LLM call boundary.
+ */
+```
+
+转换只发生在 `streamAssistantResponse` 里，分两步：
+
+1. `transformContext`：`AgentMessage[]` → `AgentMessage[]`，在应用自己的消息层面做加工，比如裁剪旧消息、注入外部上下文。pi 的扩展系统通过它实现 `context` 事件。
+2. `convertToLlm`：`AgentMessage[]` → `Message[]`，把自定义消息转换或过滤掉。
+
+两个钩子的契约写在 `AgentLoopConfig` 上，都要求“不能抛异常”：
+
+````ts title="packages/agent/src/types.ts:193-244"
+export interface AgentLoopConfig extends SimpleStreamOptions {
+	model: Model<any>;
+
+	/**
+	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
+	 *
+	 * Each AgentMessage must be converted to a SystemMessage, UserMessage, AssistantMessage, or ToolResultMessage
+	 * that the LLM can understand. AgentMessages that cannot be converted (e.g., UI-only notifications,
+	 * status messages) should be filtered out.
+	 *
+	 * Contract: must not throw or reject. Return a safe fallback value instead.
+	 * Throwing interrupts the low-level agent loop without producing a normal event sequence.
+	 *
+	 * @example
+	 * ```typescript
+	 * convertToLlm: (messages) => messages.flatMap(m => {
+	 *   if (m.role === "custom") {
+	 *     // Convert custom message to user message
+	 *     return [{ role: "user", content: m.content, timestamp: m.timestamp }];
+	 *   }
+	 *   if (m.role === "notification") {
+	 *     // Filter out UI-only messages
+	 *     return [];
+	 *   }
+	 *   // Pass through standard LLM messages
+	 *   return [m];
+	 * })
+	 * ```
+	 */
+	convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+
+	/**
+	 * Optional transform applied to the context before `convertToLlm`.
+	 *
+	 * Use this for operations that work at the AgentMessage level:
+	 * - Context window management (pruning old messages)
+	 * - Injecting context from external sources
+	 *
+	 * Contract: must not throw or reject. Return the original messages or another
+	 * safe fallback value instead.
+	 *
+	 * @example
+	 * ```typescript
+	 * transformContext: async (messages) => {
+	 *   if (estimateTokens(messages) > MAX_TOKENS) {
+	 *     return pruneOldMessages(messages);
+	 *   }
+	 *   return messages;
+	 * }
+	 * ```
+	 */
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+````
+
+`Agent` 类在用户没传 `convertToLlm` 时给一个默认实现，只保留四种 LLM 角色：
+
+```ts title="packages/agent/src/agent.ts:39-47"
+function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
+	return messages.filter(
+		(message) =>
+			message.role === "system" ||
+			message.role === "user" ||
+			message.role === "assistant" ||
+			message.role === "toolResult",
+	);
+}
+```
+
+为什么要分成两步而不是一个函数？`transformContext` 的输入输出都是 `AgentMessage`，它可以基于自定义消息的语义做决定（比如“保留最近的 compaction 摘要之后的消息”），而且它是异步的、拿得到 abort 信号；`convertToLlm` 只管格式转换。coding-agent 正是这样分工的：[sdk.ts:411-432](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/sdk.ts#L411-L432) 用 `convertToLlmWithBlockImages` 做格式转换，用 `transformContext` 把消息交给扩展的 `context` 事件处理。
+
+## 3. 入口：agentLoop、runAgentLoop 与 continue
+
+`agent-loop.ts` 对外有两组入口：
+
+| 函数 | 返回 | 用途 |
+| --- | --- | --- |
+| `agentLoop(prompts, ...)` | `EventStream` | 带新消息启动，事件通过异步迭代器读取 |
+| `agentLoopContinue(...)` | `EventStream` | 不加新消息，从现有上下文继续 |
+| `runAgentLoop(prompts, ..., emit, ...)` | `Promise` | 同 `agentLoop`，事件通过回调 `emit` 推送 |
+| `runAgentLoopContinue(..., emit, ...)` | `Promise` | 同 `agentLoopContinue`，回调形式 |
+
+`Agent` 类用的是回调形式的 `run*`。`agentLoop` 只是把回调接到一个 `EventStream`（第 1 章讲过的 push 式 AsyncIterable）上：
+
+```ts title="packages/agent/src/agent-loop.ts:47-167"
+export function agentLoop(
+	prompts: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): EventStream<AgentEvent, AgentMessage[]> {
+	const stream = createAgentStream();
+
+	void runAgentLoop(
+		prompts,
+		context,
+		config,
+		async (event) => {
+			stream.push(event);
+		},
+		signal,
+		streamFn,
+	).then((messages) => {
+		stream.end(messages);
+	});
+
+	return stream;
+}
+// ...
+function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
+	return new EventStream<AgentEvent, AgentMessage[]>(
+		(event: AgentEvent) => event.type === "agent_end",
+		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
+	);
+}
+```
+
+`createAgentStream` 告诉 `EventStream`：遇到 `agent_end` 就结束，`agent_end.messages` 就是 `result()` 的返回值。注意 `void runAgentLoop(...).then(...)` 没有 `.catch`：如果循环里某个钩子抛了异常，这个 stream 永远等不到结束。这就是为什么 `convertToLlm`、`getSteeringMessages` 等钩子的文档都强调“must not throw”。
+
+`runAgentLoop` 做三件事：把 prompt 交给 `declareToolChanges`（第 4.2 节）、发出开场事件、进入 `runLoop`：
+
+```ts title="packages/agent/src/agent-loop.ts:111-135"
+export async function runAgentLoop(
+	prompts: AgentMessage[],
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): Promise<AgentMessage[]> {
+	const initialMessages = declareToolChanges(context, prompts);
+	const newMessages: AgentMessage[] = [...initialMessages];
+	const currentContext: AgentContext = {
+		...context,
+		messages: [...context.messages, ...initialMessages],
+	};
+
+	await emit({ type: "agent_start" });
+	await emit({ type: "turn_start" });
+	for (const message of initialMessages) {
+		await emit({ type: "message_start", message });
+		await emit({ type: "message_end", message });
+	}
+
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	return newMessages;
+}
+```
+
+几个细节：
+
+- `currentContext` 是一个新对象，`messages` 是新数组。循环后面会往 `currentContext.messages` 里 push，但不会改调用方传入的数组。
+- `newMessages` 收集“这次运行新增的消息”，最后作为 `agent_end.messages` 和返回值。prompt 本身也算新消息。
+- 第一个 `turn_start` 在这里发出，而不是在 `runLoop` 里。`runLoop` 只在第二个及以后的 turn 才发 `turn_start`（见 4.3 节）。
+- prompt 消息没有流式过程，所以 `message_start` 和 `message_end` 紧挨着发出，没有 `message_update`。
+
+`runAgentLoopContinue` 用于重试等场景：上下文里已经有 user 或 toolResult 消息，只需要再请求一次模型。它会拒绝两种情况：
+
+```ts title="packages/agent/src/agent-loop.ts:137-160"
+export async function runAgentLoopContinue(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): Promise<AgentMessage[]> {
+	if (context.messages.length === 0) {
+		throw new Error("Cannot continue: no messages in context");
+	}
+
+	if (context.messages[context.messages.length - 1].role === "assistant") {
+		throw new Error("Cannot continue from message role: assistant");
+	}
+
+	const newMessages: AgentMessage[] = [];
+	const currentContext: AgentContext = { ...context };
+
+	await emit({ type: "agent_start" });
+	await emit({ type: "turn_start" });
+
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	return newMessages;
+}
+```
+
+最后一条消息是 `assistant` 时直接报错，因为大多数 provider 要求请求以 user 或 toolResult 结尾。continue 不发出任何 user 消息事件，`newMessages` 从空数组开始。
+
+## 4. runLoop：双层循环
+
+`runLoop`（[agent-loop.ts:172-330](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/src/agent-loop.ts#L172-L330)）是整个包的核心，约 160 行。先看骨架，再逐段拆。
+
+### 4.1 状态变量与两层 while
+
+```ts title="packages/agent/src/agent-loop.ts:172-192"
+async function runLoop(
+	initialContext: AgentContext,
+	newMessages: AgentMessage[],
+	initialConfig: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFunction: StreamFn,
+): Promise<void> {
+	let currentContext = initialContext;
+	let config = initialConfig;
+	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	let explicitContinuation = false;
+	// Check for steering messages at start (user may have typed while waiting)
+	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+	// Outer loop: continues when queued follow-up messages arrive after agent would stop
+	while (true) {
+		let hasMoreToolCalls = true;
+
+		// Inner loop: process tool calls and steering messages
+		while (hasMoreToolCalls || pendingMessages.length > 0) {
+```
+
+四个局部变量贯穿整个循环：
+
+| 变量 | 含义 |
+| --- | --- |
+| `currentContext` | 当前上下文。钩子可以整体替换它 |
+| `config` | 当前配置。钩子可以替换其中的 `model` 和 `reasoning` |
+| `lastCompletedTurn` | 上一个完成的 turn。为 `undefined` 表示这是本次运行的第一个 turn |
+| `explicitContinuation` | `finishTurn` 是否要求“至少再请求一次” |
+| `pendingMessages` | 下一次请求前要注入的消息（steering 或 follow-up） |
+
+两层循环的分工：
+
+- **内层**（`while (hasMoreToolCalls || pendingMessages.length > 0)`）：一次迭代就是一个 turn，即一次模型回复，加上执行这条回复里的全部工具调用。只要上一个 turn 有工具调用（模型还要看工具结果），或者有待注入的消息，就继续。
+- **外层**（`while (true)`）：内层本该结束时，检查 follow-up 队列。有就把它们设为 `pendingMessages`，回到内层。
+
+注意外层每次开头都把 `hasMoreToolCalls` 设为 `true`，所以内层至少跑一次。对 `runAgentLoopContinue` 来说，这保证了即使没有任何待注入消息，也会请求一次模型。
+
+函数一开头先 poll 一次 steering 队列（第 185 行）。注释说明了原因：用户可能在等待期间已经打了字。
+
+### 4.2 declareToolChanges：工具变化也是消息
+
+在看 turn 的主体之前，先看一个每个 turn 都会调用的函数。
+
+问题：工具集可以在运行中变化，比如扩展在某个 turn 后启用了新工具。看起来改 `context.tools` 就够了。但 pi 的会话要能回放、分支：如果工具定义只存在于运行时状态里，回放一份旧会话时就不知道某一时刻模型看到的是哪些工具。
+
+pi-ai 的做法是让 `system` 消息携带工具增量：
+
+```ts title="packages/ai/src/types.ts:561-576"
+export interface SystemMessage {
+	role: "system";
+	/** Instruction text. On the leading message this is the base prompt; later, additional instructions. */
+	content: string | TextContent[];
+	/**
+	 * Named, ordered prompt sections rendered verbatim after `content`. The leading message
+	 * declares them; later messages replace sections by name, and `null` removes one. Keep
+	 * each section self-delimiting (a tag, a heading) so the model can relate an update to
+	 * the original. Avoid integer-like names; JSON objects reorder those.
+	 */
+	sections?: Record<string, string | null>;
+	/** Complete definitions of tools that become available at this point. */
+	toolsAdded?: Tool[];
+	/** Tools that stop being available at this point. */
+	toolsRemoved?: ToolReference[];
+	timestamp: number; // Unix timestamp in milliseconds
+```
+
+按顺序回放所有 `system` 消息，就能得到任一时刻的系统提示和工具集。`getCurrentTools` 就是这个回放：
+
+```ts title="packages/ai/src/utils/transcript.ts:58-66"
+export function getCurrentTools(messages: TranscriptMessages): Tool[] {
+	const tools = new Map<string, Tool>();
+	for (const message of messages) {
+		if (!isSystemMessage(message)) continue;
+		for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+		for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+	}
+	return [...tools.values()];
+}
+```
+
+于是有两份工具集：`context.tools` 是运行时能执行的，transcript 里声明的是模型被告知可以调用的。`declareToolChanges` 负责在每次请求前让两者一致：
+
+```ts title="packages/agent/src/agent-loop.ts:332-372"
+/**
+ * Declare tool loadout changes to the model.
+ *
+ * `context.tools` is what the runtime can execute; the transcript's system messages declare
+ * what the model may call. Before each request the difference becomes `toolsAdded` and
+ * `toolsRemoved` on a system message. When a pending system message exists, its tool fields
+ * are treated as intent and replaced with the delta between the committed transcript and
+ * the executable set, so replay always yields exactly `context.tools`. Otherwise a new
+ * system message is inserted before the first non-system pending message.
+ */
+function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage[]): AgentMessage[] {
+	let systemIndex = -1;
+	for (let i = pendingMessages.length - 1; i >= 0; i--) {
+		if (pendingMessages[i].role === "system") {
+			systemIndex = i;
+			break;
+		}
+	}
+	const pending = pendingMessages[systemIndex] as SystemMessage | undefined;
+	const baseline = pending
+		? pendingMessages.map((message, index) =>
+				index === systemIndex ? withToolChanges(pending, NO_CHANGES) : message,
+			)
+		: pendingMessages;
+	const changes = getToolStateChanges(
+		getCurrentTools([...context.messages, ...baseline]),
+		(context.tools ?? []).map(toToolDeclaration),
+	);
+	const unchanged = changes.toolsAdded.length === 0 && changes.toolsRemoved.length === 0;
+
+	if (pending) {
+		// Keep the caller's message object when it already declares no tool changes.
+		if (unchanged && !pending.toolsAdded?.length && !pending.toolsRemoved?.length) return pendingMessages;
+		return baseline.map((message, index) => (index === systemIndex ? withToolChanges(pending, changes) : message));
+	}
+	if (unchanged) return pendingMessages;
+	const update = withToolChanges({ role: "system", content: "", timestamp: Date.now() }, changes);
+	const insertIndex = pendingMessages.findIndex((message) => message.role !== "system");
+	const index = insertIndex === -1 ? pendingMessages.length : insertIndex;
+	return [...pendingMessages.slice(0, index), update, ...pendingMessages.slice(index)];
+}
+```
+
+分两种情况：
+
+1. **待注入消息里已经有 `system` 消息**（比如调用方自己追加了一条修改提示的 system 消息）：把它的 `toolsAdded`/`toolsRemoved` 当作“意图”，先清空（`baseline`），再用“已提交 transcript + baseline”与 `context.tools` 的差值覆盖。这样无论调用方写了什么，回放结果都恰好等于 `context.tools`。
+2. **没有 system 消息**：如果有差异，就新建一条 `content` 为空的 system 消息，插在第一条非 system 消息之前。
+
+举个例子：transcript 里声明了 `read`、`bash`，现在 `context.tools` 是 `read`、`bash`、`edit`。用户发来一条 user 消息，`declareToolChanges` 返回 `[system(toolsAdded: [edit]), user]`。这条 system 消息和普通消息一样走 `message_start`/`message_end`，因此也会被 Agent 记入状态、被 coding-agent 写进会话文件。
+
+`getToolStateChanges` 把“定义改变”视为先删后加，比较前都经过 `toToolDeclaration` 去掉 `execute` 这类不可序列化的字段。
+
+### 4.3 turn 开头：prepareNextTurn 与 steering 补 poll
+
+```ts title="packages/agent/src/agent-loop.ts:193-217"
+			let preparedMessages: AgentMessage[] = [];
+			if (lastCompletedTurn) {
+				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+				if (nextTurnSnapshot) {
+					currentContext = nextTurnSnapshot.context ?? currentContext;
+					preparedMessages = nextTurnSnapshot.messages ?? [];
+					config = {
+						...config,
+						model: nextTurnSnapshot.model ?? config.model,
+						reasoning:
+							nextTurnSnapshot.thinkingLevel === undefined
+								? config.reasoning
+								: nextTurnSnapshot.thinkingLevel === "off"
+									? undefined
+									: nextTurnSnapshot.thinkingLevel,
+					};
+				}
+				// Preparation can be long-running (for example, compaction). Pick up steering
+				// queued while it ran. Only poll again if the earlier poll returned nothing;
+				// otherwise one-at-a-time mode would deliver two messages in this turn.
+				if (pendingMessages.length === 0) {
+					pendingMessages = (await config.getSteeringMessages?.()) || [];
+				}
+				await emit({ type: "turn_start" });
+			}
+```
+
+这一段只在 `lastCompletedTurn` 存在时执行，也就是从第二个 turn 开始：
+
+1. 调用 `prepareNextTurn(lastCompletedTurn)`。coding-agent 在这里做自动 compaction 并刷新系统提示（[agent-session.ts:900](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L900)）。它可以返回新的 `context`、要追加的 `messages`、新的 `model` 和 `thinkingLevel`。`thinkingLevel: "off"` 被翻译成 `reasoning: undefined`，因为 pi-ai 的 `SimpleStreamOptions.reasoning` 用“不设置”表示关闭。
+2. 如果 `pendingMessages` 为空，再 poll 一次 steering。注释解释了时机：`prepareNextTurn` 可能很慢（coding-agent 在这里做 compaction），期间用户可能又插了话。只在上次 poll 为空时才再 poll，因为 `one-at-a-time` 模式下每次 poll 都会取走一条，连续 poll 两次会让一个 turn 注入两条消息。
+3. 发出 `turn_start`。
+
+第一个 turn 的 `turn_start` 已经在 `runAgentLoop` 里发过了，所以这里不重复发。
+
+### 4.4 注入消息与 prepareRequest
+
+```ts title="packages/agent/src/agent-loop.ts:219-248"
+			// Process prepared and queued messages before the next assistant response.
+			for (const message of declareToolChanges(currentContext, [...preparedMessages, ...pendingMessages])) {
+				await emit({ type: "message_start", message });
+				await emit({ type: "message_end", message });
+				currentContext.messages.push(message);
+				newMessages.push(message);
+			}
+			pendingMessages = [];
+
+			const requestUpdate = await config.prepareRequest?.(
+				{
+					context: currentContext,
+					model: config.model,
+					thinkingLevel: config.reasoning ?? "off",
+				},
+				signal,
+			);
+			if (requestUpdate) {
+				currentContext = requestUpdate.context ?? currentContext;
+				config = {
+					...config,
+					model: requestUpdate.model ?? config.model,
+					reasoning:
+						requestUpdate.thinkingLevel === undefined
+							? config.reasoning
+							: requestUpdate.thinkingLevel === "off"
+								? undefined
+								: requestUpdate.thinkingLevel,
+				};
+			}
+```
+
+`preparedMessages`（来自 `prepareNextTurn`）在前，`pendingMessages`（steering 或 follow-up）在后，一起交给 `declareToolChanges`，然后逐条发出 `message_start`/`message_end`，并同时追加到 `currentContext.messages` 和 `newMessages`。这就是 steering 真正“进入上下文”的地方。
+
+接着调用 `prepareRequest`。它和 `prepareNextTurn` 的区别：
+
+| | `prepareNextTurn` | `prepareRequest` |
+| --- | --- | --- |
+| 何时调用 | 第二个及以后的 turn 开头，`turn_start` 之前 | 每次请求模型之前，包括第一次 |
+| 此时待注入消息 | 还没注入 | 已经注入并发出事件 |
+| 能返回 `messages` | 能 | 不能（类型是 `Omit<AgentLoopTurnUpdate, "messages">`） |
+| 之后是否 poll steering | 是（第 214 行） | 否 |
+
+返回的 `model`/`thinkingLevel` 会写回 `config`，因此对本次及之后所有请求都生效。coding-agent 用 `prepareRequest` 把上下文替换成会话树的投影（[agent-session.ts:789](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L789)）。
+
+对应的类型：
+
+```ts title="packages/agent/src/types.ts:160-191"
+/** Replacement runtime state used by the agent loop before starting another provider request. */
+export interface AgentLoopTurnUpdate {
+	/** Context for the next provider request. */
+	context?: AgentContext;
+	/** Messages to append before the next provider request, with normal lifecycle events. */
+	messages?: AgentMessage[];
+	/** Model for the next provider request. */
+	model?: Model<any>;
+	/** Thinking level for the next provider request. */
+	thinkingLevel?: ThinkingLevel;
+}
+
+/** Runtime state available immediately before a conversational provider request. */
+export interface PrepareRequestContext {
+	context: AgentContext;
+	model: Model<any>;
+	thinkingLevel: ThinkingLevel;
+}
+
+/** Replacement runtime state for the provider request being prepared. */
+export type AgentRequestUpdate = Omit<AgentLoopTurnUpdate, "messages">;
+
+/**
+ * Called immediately before every conversational provider request, including the first.
+ * Pending messages have already been appended and emitted when this callback runs.
+ */
+export type PrepareRequest = (
+	request: PrepareRequestContext,
+	signal?: AbortSignal,
+) => AgentRequestUpdate | void | Promise<AgentRequestUpdate | undefined> | Promise<void>;
+
+export interface PrepareNextTurnContext extends AgentTurnContext {}
+```
+
+### 4.5 请求模型与错误出口
+
+```ts title="packages/agent/src/agent-loop.ts:250-265"
+			// Stream assistant response
+			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			newMessages.push(message);
+
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				lastCompletedTurn = {
+					message,
+					toolResults: [],
+					context: currentContext,
+					newMessages,
+				};
+				await config.finishTurn?.(lastCompletedTurn, signal);
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+```
+
+`streamAssistantResponse` 返回最终的 `AssistantMessage`（第 5 节详解）。如果 `stopReason` 是 `error` 或 `aborted`，这是硬退出：
+
+- 仍然调用 `finishTurn`，但忽略它的返回值；
+- 发出 `turn_end`（`toolResults` 为空）和 `agent_end`；
+- 不 poll steering，也不 poll follow-up。队列里的消息原样留着，等下一次运行。
+
+源码没有写原因，可以这样理解：出错时继续自动请求，很可能再错一次，还会把用户排队的消息消费掉；让上层（比如 coding-agent 的重试逻辑）决定怎么处理更安全。
+
+### 4.6 执行工具与 length 截断
+
+```ts title="packages/agent/src/agent-loop.ts:267-287"
+			// Check for tool calls
+			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+
+			const toolResults: ToolResultMessage[] = [];
+			hasMoreToolCalls = false;
+			if (toolCalls.length > 0) {
+				// A "length" stop means the output was cut off by the token limit, so
+				// every tool call in the message may carry truncated arguments. Fail
+				// them all instead of executing potentially borked calls.
+				const executedToolBatch =
+					message.stopReason === "length"
+						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+						: await executeToolCalls(currentContext, message, config, signal, emit);
+				toolResults.push(...executedToolBatch.messages);
+				hasMoreToolCalls = !executedToolBatch.terminate;
+
+				for (const result of toolResults) {
+					currentContext.messages.push(result);
+					newMessages.push(result);
+				}
+			}
+```
+
+只要回复里有 `toolCall` 内容块，就执行。`stopReason` 为 `length` 时走另一条路径（第 6.8 节）。执行结果是一个 `ExecutedToolCallBatch`，包含 toolResult 消息和一个 `terminate` 标志：`hasMoreToolCalls = !executedToolBatch.terminate`，即正常情况下有工具调用就要再请求一次模型，让它看到结果；只有整批工具都要求终止时才不再请求。
+
+结果消息被同时 push 进 `currentContext.messages` 和 `newMessages`。
+
+### 4.7 finishTurn、turn_end 与 steering
+
+```ts title="packages/agent/src/agent-loop.ts:289-308"
+			lastCompletedTurn = {
+				message,
+				toolResults,
+				context: currentContext,
+				newMessages,
+			};
+			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
+			await emit({ type: "turn_end", message, toolResults });
+
+			if (decision?.action === "end") {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			explicitContinuation = decision?.action === "continue";
+			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (hasMoreToolCalls || pendingMessages.length > 0) {
+				explicitContinuation = false;
+			}
+		}
+```
+
+顺序是固定的：
+
+1. 组装 `lastCompletedTurn`（此时 `context` 已包含 assistant 消息和全部 toolResult）。
+2. 调用 `finishTurn`，它在 `turn_end` 之前。
+3. 发出 `turn_end`。
+4. 如果 `finishTurn` 返回 `{ action: "end" }`，立即发 `agent_end` 并返回，不 poll 任何队列。
+5. 否则 poll steering。这是 steering 最主要的注入点：当前 turn 的工具全部执行完之后，下一次请求之前。
+
+`finishTurn` 的语义在类型注释里写得很细：
+
+```ts title="packages/agent/src/types.ts:146-158"
+/** Decision returned by {@link FinishTurn}. Returning undefined preserves normal scheduling. */
+export type AgentTurnDecision = { action: "continue" } | { action: "end" };
+
+/**
+ * Called after a completed assistant turn and all of its tool-result messages, but before `turn_end`.
+ * On a normal turn, `{ action: "continue" }` ensures one next provider request. Tool-result, steering, or
+ * follow-up scheduling can satisfy that request and adds no extra request; otherwise the loop continues once
+ * with the current context. Error and aborted responses remain hard exits.
+ */
+export type FinishTurn = (
+	turn: AgentTurnContext,
+	signal?: AbortSignal,
+) => AgentTurnDecision | void | Promise<AgentTurnDecision | undefined> | Promise<void>;
+```
+
+`{ action: "continue" }` 的意思是“保证至少再有一次请求”，而不是“再加一次请求”。如果本来就要继续（有工具结果、有 steering、有 follow-up），这个要求已被满足，不会多发请求；第 305-307 行就是在这种情况下把 `explicitContinuation` 清掉。只有内层和 follow-up 都不打算继续时，外层才会用当前上下文再跑一个“纯上下文”的 turn。测试 `makes exactly one context-only request when no natural request satisfies continuation` 验证的正是这一点：第一次 `finishTurn` 返回 continue，模型总共被调用 2 次。
+
+为什么 steering 在工具执行完之后才注入，而不是中断工具？一条 assistant 消息里的工具调用和它们的 toolResult 必须成对出现，provider 才接受。如果中途插入 user 消息，或者跳过剩下的工具调用，transcript 就不合法了。`getSteeringMessages` 的注释也明确说“Tool calls from the current assistant message are not skipped”。
+
+### 4.8 外层：follow-up 与退出
+
+```ts title="packages/agent/src/agent-loop.ts:310-330"
+		// Agent would stop here. Check for follow-up messages.
+		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		if (followUpMessages.length > 0) {
+			// Set as pending so inner loop processes them
+			explicitContinuation = false;
+			pendingMessages = followUpMessages;
+			continue;
+		}
+
+		// No natural request was selected, so fulfill the continuation decision with one context-only turn.
+		if (explicitContinuation) {
+			explicitContinuation = false;
+			continue;
+		}
+
+		// No more messages, exit
+		break;
+	}
+
+	await emit({ type: "agent_end", messages: newMessages });
+}
+```
+
+内层退出意味着：最后一个 turn 没有工具调用（或整批 terminate），且 steering 队列为空。这时：
+
+1. poll follow-up。有消息就作为 `pendingMessages`，`continue` 外层，回到内层开头。由于 `lastCompletedTurn` 已存在，会先调用 `prepareNextTurn`、发 `turn_start`，再注入这些 follow-up。注意此时 `pendingMessages` 非空，所以第 214 行不会再 poll steering。
+2. 没有 follow-up，但 `explicitContinuation` 为真：再跑一个 turn，不注入任何消息。
+3. 都没有：跳出，发 `agent_end`。
+
+steering 和 follow-up 的区别就在 poll 的位置：
+
+| | steering | follow-up |
+| --- | --- | --- |
+| poll 位置 | 循环开头（185）、`prepareNextTurn` 之后（214）、每个 turn 结束（304） | 内层退出后（311） |
+| 语义 | 插话，下一次请求就能看到 | 排队，等 agent 本来要停下时再发 |
+| 典型用法 | “别改那个文件了，改另一个” | “做完之后再帮我写个测试” |
+
+### 4.9 钩子调用一览
+
+把上面散落的钩子按调用顺序排一遍（行号均为 `agent-loop.ts`）：
+
+| 钩子 | 调用位置 | 时机 | 能做什么 |
+| --- | --- | --- | --- |
+| `getSteeringMessages` | 185 | `runLoop` 开头 | 返回要在第一次请求前注入的消息 |
+| `prepareNextTurn` | 195 | 第 2 个及以后 turn 开头，`turn_start` 前 | 替换 context/model/thinking，追加消息 |
+| `getSteeringMessages` | 214 | `prepareNextTurn` 之后，仅当 pending 为空 | 补 poll |
+| `prepareRequest` | 228 | 每次请求前，消息已注入 | 替换 context/model/thinking |
+| `transformContext` | 400 | `streamAssistantResponse` 内 | 加工 `AgentMessage[]` |
+| `convertToLlm` | 404 | 同上 | 转成 `Message[]` |
+| `getApiKey` | 410 | 同上 | 每次请求动态取 key |
+| `streamFn` | 412 | 同上 | 真正发请求 |
+| `beforeToolCall` | 739 | 每个工具调用，校验之后 | 拦截，可带 terminate |
+| `afterToolCall` | 882 | 每个工具执行之后 | 改写结果 |
+| `finishTurn` | 261 / 295 | turn 结束，`turn_end` 前 | 返回 end 或 continue |
+| `getSteeringMessages` | 304 | `turn_end` 之后 | 主要的 steering 注入点 |
+| `getFollowUpMessages` | 311 | 内层退出后 | 返回 follow-up |
+
+## 5. streamAssistantResponse：一次模型调用
+
+### 5.1 转换与请求
+
+```ts title="packages/agent/src/agent-loop.ts:386-419"
+/**
+ * Stream an assistant response from the LLM.
+ * This is where AgentMessage[] gets transformed to Message[] for the LLM.
+ */
+async function streamAssistantResponse(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFunction: StreamFn,
+): Promise<AssistantMessage> {
+	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+	let messages = context.messages;
+	if (config.transformContext) {
+		messages = await config.transformContext(messages, signal);
+	}
+
+	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
+	const llmMessages = await config.convertToLlm(messages);
+
+	const llmContext = normalizeContext({ messages: llmMessages });
+
+	// Resolve API key (important for expiring tokens)
+	const resolvedApiKey =
+		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+
+	const response = await streamFunction(config.model, llmContext, {
+		...config,
+		apiKey: resolvedApiKey,
+		identity: mergeClientIdentity(DEFAULT_AGENT_IDENTITY, config.identity),
+		signal,
+	});
+	// Record the requested level, whichever stream function answered.
+	const result = async () => Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off" });
+```
+
+逐行看：
+
+- 第 399-401 行：`transformContext` 是可选的。
+- 第 404 行：`convertToLlm` 是必需的。
+- 第 406 行：`normalizeContext` 把 `Context` 规范化成 `TranscriptContext`。这里传入的对象没有 `systemPrompt` 和 `tools`，所以它只是给类型盖个章；系统提示和工具都已经在 `system` 消息里了。
+- 第 409-410 行：每次请求都调用 `getApiKey`。注释说明这对会过期的 token 很重要，比如 GitHub Copilot 的 OAuth token 可能在一段很长的工具执行后过期。
+- 第 412-417 行：`config` 整个展开传给 `streamFunction`。`AgentLoopConfig` 继承自 `SimpleStreamOptions`，所以 `reasoning`、`sessionId`、`transport` 等字段直接透传。`identity` 用 `mergeClientIdentity` 在默认值 `DEFAULT_AGENT_IDENTITY` 上逐字段合并，默认带上 pi 的 provider 归属标识。
+- 第 419 行：最终消息上记录 `thinkingLevel`，即循环请求的思考级别，不管用的是哪个 stream 函数。
+
+`StreamFn` 的契约在 `types.ts`：
+
+```ts title="packages/agent/src/types.ts:19-37"
+/**
+ * Stream function used by the agent loop. `Models.streamSimple` satisfies
+ * this shape.
+ *
+ * The loop passes a normalized transcript: the system prompt and tool
+ * declarations are carried by the transcript's system messages, never by
+ * `context.systemPrompt` or `context.tools`.
+ *
+ * Contract:
+ * - Must not throw or return a rejected promise for request/model/runtime failures.
+ * - Must return an AssistantMessageEventStream.
+ * - Failures must be encoded in the returned stream via protocol events and a
+ *   final AssistantMessage with stopReason "error" or "aborted" and errorMessage.
+ */
+export type StreamFn = (
+	model: Model<Api>,
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+```
+
+关键是“失败要编码在流里”：网络错误、限流、中止，都要表现为一条 `stopReason` 为 `error` 或 `aborted` 的最终消息，而不是抛异常。这样 4.5 节的错误出口才能统一处理，事件序列也始终完整。
+
+### 5.2 流式事件到 AgentEvent
+
+```ts title="packages/agent/src/agent-loop.ts:421-479"
+	let partialMessage: AssistantMessage | null = null;
+	let addedPartial = false;
+
+	for await (const event of response) {
+		switch (event.type) {
+			case "start":
+				partialMessage = event.partial;
+				context.messages.push(partialMessage);
+				addedPartial = true;
+				await emit({ type: "message_start", message: { ...partialMessage } });
+				break;
+
+			case "text_start":
+			case "text_delta":
+			case "text_end":
+			case "thinking_start":
+			case "thinking_delta":
+			case "thinking_end":
+			case "toolcall_start":
+			case "toolcall_delta":
+			case "toolcall_end":
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+
+			case "done":
+			case "error": {
+				const finalMessage = await result();
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = finalMessage;
+				} else {
+					context.messages.push(finalMessage);
+				}
+				if (!addedPartial) {
+					await emit({ type: "message_start", message: { ...finalMessage } });
+				}
+				await emit({ type: "message_end", message: finalMessage });
+				return finalMessage;
+			}
+		}
+	}
+
+	const finalMessage = await result();
+	if (addedPartial) {
+		context.messages[context.messages.length - 1] = finalMessage;
+	} else {
+		context.messages.push(finalMessage);
+		await emit({ type: "message_start", message: { ...finalMessage } });
+	}
+	await emit({ type: "message_end", message: finalMessage });
+	return finalMessage;
+}
+```
+
+这段把 pi-ai 的 `AssistantMessageEvent` 翻译成 `AgentEvent`：
+
+| pi-ai 事件 | 循环的动作 | 发出的 AgentEvent |
+| --- | --- | --- |
+| `start` | 把 partial 消息 push 进 `context.messages` | `message_start` |
+| `text_*`、`thinking_*`、`toolcall_*` | 用新的 partial 替换 `context.messages` 最后一条 | `message_update`（附带原始事件） |
+| `done` / `error` | 用最终消息替换最后一条 | `message_end`（若之前没发 start，先补发） |
+
+几点设计：
+
+- **partial 消息是先进上下文的。** 流式过程中 `context.messages` 的最后一条始终是最新的 partial，结束时被最终消息替换。这样任何在流式期间读取上下文的代码看到的都是一致的状态。
+- **事件里的 message 是浅拷贝**（`{ ...partialMessage }`）。pi-ai 的 provider 会原地修改 partial，浅拷贝让订阅者拿到一个顶层不再变化的快照。`message_end` 发的是最终消息本身，不拷贝。
+- **兜底**：某些 stream 实现可能不发 `start` 直接发 `done`，或者流结束了却没有 `done`/`error`（第 470-478 行）。两种情况下都会补发 `message_start`，保证每条消息都有成对的 start/end。
+- `message_update` 只对 assistant 消息发出，`types.ts` 里 `AgentEvent` 的注释也写了这一点。
+
+## 6. 工具流水线
+
+### 6.1 AgentTool
+
+先看工具的定义：
+
+```ts title="packages/agent/src/types.ts:423-499"
+/** Final or partial result produced by a tool. */
+export interface AgentToolResult<T = JsonValue | undefined> {
+	/** Text or image content returned to the model. */
+	content: (TextContent | ImageContent)[];
+	/** Arbitrary structured details for logs or UI rendering. */
+	details: T;
+	/**
+	 * Machine-readable result matching the tool's `outputSchema`, for programmatic callers. Not sent
+	 * to the model; `content` remains the model-facing result.
+	 */
+	structuredContent?: JsonValue;
+	/** Usage from the final tool execution itself, if available. Not used for main LLM context accounting. */
+	usage?: Usage;
+	/**
+	 * Report a failure without throwing. The model sees `content` as an error result, like a thrown
+	 * error, but `details` and `structuredContent` are kept for the UI and programmatic callers.
+	 */
+	isError?: boolean;
+	/**
+	 * Hint that the agent should stop after the current tool batch.
+	 * Early termination only happens when every finalized tool result in the batch sets this to true.
+	 */
+	terminate?: boolean;
+}
+
+/** Final outcome of a tool call after hooks ran. */
+export interface AgentToolCallOutcome {
+	toolCall: AgentToolCall;
+	result: AgentToolResult<any>;
+	isError: boolean;
+	/** Milliseconds `execute()` took, measured with a monotonic clock; absent when the tool did not run. */
+	durationMs?: number;
+}
+
+/**
+ * Callback used by tools to stream partial execution updates.
+ *
+ * The callback is scoped to the current `execute()` invocation. Calls made after
+ * the tool promise settles are ignored.
+ */
+export type AgentToolUpdateCallback<T = any> = (partialResult: AgentToolResult<T>) => void;
+
+/** Tool definition used by the agent runtime. */
+export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any> extends Tool<TParameters> {
+	/** Human-readable label for UI display. */
+	label: string;
+	/**
+	 * Optional compatibility shim for raw tool-call arguments before schema validation.
+	 * Must return an object that matches `TParameters`.
+	 */
+	prepareArguments?: (args: unknown) => Static<TParameters>;
+	/**
+	 * JSON Schema of `structuredContent` in successful results. Tools that declare it should always
+	 * set `structuredContent`.
+	 */
+	outputSchema?: TSchema;
+	/**
+	 * Execute the tool call. Throw on failure, or return a result with `isError: true`; do not only
+	 * describe the failure in `content`.
+	 */
+	execute: (
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails>,
+	) => Promise<AgentToolResult<TDetails>>;
+	/** Recovery policy for an effect whose durable intent exists but whose outcome is unknown. */
+	replay?: "never" | "safe";
+	/**
+	 * Per-tool execution mode override.
+	 * - "sequential": this tool must execute one at a time with other tool calls.
+	 * - "parallel": this tool can execute concurrently with other tool calls.
+	 *
+	 * If omitted, the default execution mode applies.
+	 */
+	executionMode?: ToolExecutionMode;
+}
+```
+
+`AgentTool` 在 pi-ai 的 `Tool`（name、description、parameters）上加了：
+
+- `label`：UI 显示名。
+- `prepareArguments`：兼容层，在 schema 校验前改写原始参数，比如把旧格式的参数转换成当前 schema 要求的形状（测试 `should prepare tool arguments for validation` 有一个 edit 工具的例子）。
+- `execute`：实际执行。第四个参数 `onUpdate` 用于流式上报进度。
+- `executionMode`：单个工具可以强制串行。
+- `outputSchema`/`structuredContent`：给程序调用方的结构化结果，不发给模型。
+- `replay`：给持久化 harness 用的恢复策略，循环本身不读它。
+
+`AgentToolResult.isError` 让工具“不抛异常也能报告失败”，同时保留 `details` 给 UI。`terminate` 是一个提示：这批工具执行完之后不要再请求模型。
+
+### 6.2 分发：并行还是串行
+
+```ts title="packages/agent/src/agent-loop.ts:515-538"
+/**
+ * Execute tool calls from an assistant message.
+ */
+async function executeToolCalls(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<ExecutedToolCallBatch> {
+	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
+	const hasSequentialToolCall = toolCalls.some(
+		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
+	);
+	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	}
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+}
+
+type ExecutedToolCallBatch = {
+	messages: ToolResultMessage[];
+	terminate: boolean;
+};
+```
+
+默认并行（`Agent` 构造函数里 `toolExecution` 默认为 `"parallel"`）。只要配置为 `sequential`，或者本批中有任一工具声明了 `executionMode: "sequential"`，整批都改为串行。注意是“整批”：一个串行工具会让同一条消息里的其他工具也串行执行。
+
+### 6.3 prepareToolCall：查找、预处理、校验、beforeToolCall
+
+无论并行还是串行，每个工具调用都先经过 `prepareToolCall`：
+
+```ts title="packages/agent/src/agent-loop.ts:700-787"
+function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
+	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
+}
+
+function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
+	if (!tool.prepareArguments) {
+		return toolCall;
+	}
+	const preparedArguments = tool.prepareArguments(toolCall.arguments);
+	if (preparedArguments === toolCall.arguments) {
+		return toolCall;
+	}
+	return {
+		...toolCall,
+		arguments: preparedArguments as Record<string, any>,
+	};
+}
+
+async function prepareToolCall(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	toolCall: AgentToolCall,
+	config: ToolCallHooks,
+	signal: AbortSignal | undefined,
+	tools: readonly AgentTool<any>[] = currentContext.tools ?? [],
+): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
+	const tool = tools.find((t) => t.name === toolCall.name);
+	if (!tool) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			isError: true,
+		};
+	}
+
+	try {
+		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		if (config.beforeToolCall) {
+			const beforeResult = await config.beforeToolCall(
+				{
+					assistantMessage,
+					toolCall,
+					args: validatedArgs,
+					context: currentContext,
+				},
+				signal,
+			);
+			if (signal?.aborted) {
+				return {
+					kind: "immediate",
+					result: createErrorToolResult("Operation aborted"),
+					isError: true,
+				};
+			}
+			if (beforeResult?.block) {
+				const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
+				if (beforeResult.terminate === true) {
+					result.terminate = true;
+				}
+				return {
+					kind: "immediate",
+					result,
+					isError: true,
+				};
+			}
+		}
+		if (signal?.aborted) {
+			return {
+				kind: "immediate",
+				result: createErrorToolResult("Operation aborted"),
+				isError: true,
+			};
+		}
+		return {
+			kind: "prepared",
+			toolCall,
+			tool,
+			args: validatedArgs,
+		};
+	} catch (error) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+		};
+	}
+}
+```
+
+步骤：
+
+1. **查找工具**：找不到返回 `Tool xxx not found` 错误结果。
+2. **参数预处理** `prepareToolCallArguments`：调用 `tool.prepareArguments`；返回值和原参数是同一个对象时，不复制 toolCall。
+3. **schema 校验** `validateToolArguments`（来自 pi-ai）：先 `structuredClone` 参数，再做类型转换和校验，失败抛异常。如果流式解析参数时出错（`toolCall.argumentsError`），也在这里抛。
+4. **`beforeToolCall`**：收到校验后的 `args`。返回 `{ block: true }` 时，生成错误结果，`reason` 作为文本；`terminate` 可以一起带上。
+5. **检查 abort**：`beforeToolCall` 之后和最终返回前各检查一次。
+
+返回值有两种：`immediate`（已经有结果，不用执行）和 `prepared`（可以执行）。整个过程包在 `try/catch` 里，预处理、校验、`beforeToolCall` 抛出的异常都会变成错误结果，而不会打断循环。
+
+一个容易忽略的细节：传给 `beforeToolCall` 的是校验后的 `args` 对象，`prepared.args` 也是同一个对象。所以 `beforeToolCall` 可以原地修改参数，修改后的参数直接用于执行，**不再校验**。测试 `should execute mutated beforeToolCall args without revalidation` 正是把字符串参数改成了数字 123 并断言执行时收到 123。另外，`beforeToolCall` 收到的 `toolCall` 是原始的，没有经过 `prepareArguments`。
+
+`BeforeToolCallResult` 的定义：
+
+```ts title="packages/agent/src/types.ts:60-74"
+/**
+ * Result returned from `beforeToolCall`.
+ *
+ * Returning `{ block: true }` prevents the tool from executing. The loop emits an error tool result instead.
+ * `reason` becomes the text shown in that error result. If omitted, a default blocked message is used.
+ */
+export interface BeforeToolCallResult {
+	block?: boolean;
+	reason?: string;
+	/**
+	 * Hint that the agent should stop after the current tool batch when this call is blocked.
+	 * Early termination only happens when every finalized tool result in the batch sets this to true.
+	 */
+	terminate?: boolean;
+}
+```
+
+coding-agent 在 [agent-session.ts:653-654](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L653-L654) 设置这两个钩子，再转成扩展的 `tool_call`/`tool_result` 事件。pi 没有内置权限系统，权限扩展就是在这里拦截。
+
+### 6.4 executePreparedToolCall：执行与进度上报
+
+```ts title="packages/agent/src/agent-loop.ts:831-867"
+async function executePreparedToolCall(
+	prepared: PreparedToolCall,
+	signal: AbortSignal | undefined,
+	onUpdate: ToolUpdateSink,
+): Promise<ExecutedToolCallOutcome> {
+	const updateEvents: Promise<void>[] = [];
+	let acceptingUpdates = true;
+	const startedAt = performance.now();
+	const elapsed = () => Math.round(performance.now() - startedAt);
+
+	try {
+		const result = await prepared.tool.execute(
+			prepared.toolCall.id,
+			prepared.args as never,
+			signal,
+			(partialResult) => {
+				if (!acceptingUpdates) return;
+				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+			},
+		);
+		const durationMs = elapsed();
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return { result, isError: result.isError === true, durationMs };
+	} catch (error) {
+		const durationMs = elapsed();
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return {
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+			durationMs,
+		};
+	} finally {
+		acceptingUpdates = false;
+	}
+}
+```
+
+- `onUpdate` 回调被包了一层：每次进度上报都调用外部 sink（发出 `tool_execution_update`），返回的 Promise 收集到 `updateEvents`。
+- `execute` 结束后（无论成功或抛异常）把 `acceptingUpdates` 设为 false，之后工具再调 `onUpdate` 会被忽略。这符合 `AgentToolUpdateCallback` 的注释：“Calls made after the tool promise settles are ignored”。
+- `await Promise.all(updateEvents)` 等所有进度事件处理完再返回，所以 `tool_execution_update` 一定在同一工具的 `tool_execution_end` 之前。
+- `durationMs` 用 `performance.now()` 测量，只包括 `execute()`，不包括前后的钩子。
+- `execute` 抛异常会被转成错误结果，`isError: true`。
+
+### 6.5 finalizeExecutedToolCall：afterToolCall
+
+```ts title="packages/agent/src/agent-loop.ts:869-920"
+async function finalizeExecutedToolCall(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	prepared: PreparedToolCall,
+	executed: ExecutedToolCallOutcome,
+	config: ToolCallHooks,
+	signal: AbortSignal | undefined,
+): Promise<FinalizedToolCallOutcome> {
+	let result = executed.result;
+	let isError = executed.isError;
+
+	if (config.afterToolCall) {
+		try {
+			const afterResult = await config.afterToolCall(
+				{
+					assistantMessage,
+					toolCall: prepared.toolCall,
+					args: prepared.args,
+					result,
+					isError,
+					context: currentContext,
+				},
+				signal,
+			);
+			if (afterResult) {
+				// Structured content not replaced along with the content may no longer match it.
+				const structuredContent =
+					afterResult.structuredContent ?? (afterResult.content ? undefined : result.structuredContent);
+				result = {
+					...result,
+					content: afterResult.content ?? result.content,
+					details: afterResult.details ?? result.details,
+					usage: afterResult.usage ?? result.usage,
+					terminate: afterResult.terminate ?? result.terminate,
+				};
+				if (structuredContent === undefined) delete result.structuredContent;
+				else result.structuredContent = structuredContent;
+				isError = afterResult.isError ?? isError;
+			}
+		} catch (error) {
+			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+			isError = true;
+		}
+	}
+
+	return {
+		toolCall: prepared.toolCall,
+		result,
+		isError,
+		durationMs: executed.durationMs,
+	};
+}
+```
+
+`afterToolCall` 的返回值按字段覆盖，不做深合并。`AfterToolCallResult` 的注释写得很清楚：
+
+```ts title="packages/agent/src/types.ts:76-104"
+/**
+ * Partial override returned from `afterToolCall`.
+ *
+ * Merge semantics are field-by-field:
+ * - `content`: if provided, replaces the tool result content array in full
+ * - `details`: if provided, replaces the tool result details value in full
+ * - `isError`: if provided, replaces the tool result error flag
+ * - `usage`: if provided, replaces the tool result usage
+ * - `terminate`: if provided, replaces the early-termination hint
+ * - `structuredContent`: if provided, replaces the structured content. If `content` is provided
+ *   without it, the structured content is dropped, because it may no longer match the content.
+ *   Return it along with `content` to keep it.
+ *
+ * Other omitted fields keep the original executed tool result values.
+ * There is no deep merge for `content`, `details`, or `usage`.
+ */
+export interface AfterToolCallResult {
+	content?: (TextContent | ImageContent)[];
+	details?: unknown;
+	structuredContent?: JsonValue;
+	isError?: boolean;
+	/** Usage from the final tool execution itself, if available. Not used for main LLM context accounting. */
+	usage?: Usage;
+	/**
+	 * Hint that the agent should stop after the current tool batch.
+	 * Early termination only happens when every finalized tool result in the batch sets this to true.
+	 */
+	terminate?: boolean;
+}
+```
+
+`structuredContent` 有一条特殊规则：如果只替换了 `content` 而没给 `structuredContent`，旧的 `structuredContent` 会被删掉，因为它可能和新内容对不上了。`afterToolCall` 自己抛异常时，整个结果被替换成错误结果。
+
+### 6.6 串行执行
+
+```ts title="packages/agent/src/agent-loop.ts:540-594"
+async function executeToolCallsSequential(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	toolCalls: AgentToolCall[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<ExecutedToolCallBatch> {
+	const finalizedCalls: FinalizedToolCallOutcome[] = [];
+	const messages: ToolResultMessage[] = [];
+
+	for (const toolCall of toolCalls) {
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
+		});
+
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		let finalized: FinalizedToolCallOutcome;
+		if (preparation.kind === "immediate") {
+			finalized = {
+				toolCall,
+				result: preparation.result,
+				isError: preparation.isError,
+			};
+		} else {
+			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			finalized = await finalizeExecutedToolCall(
+				currentContext,
+				assistantMessage,
+				preparation,
+				executed,
+				config,
+				signal,
+			);
+		}
+
+		await emitToolExecutionEnd(finalized, emit);
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		finalizedCalls.push(finalized);
+		messages.push(toolResultMessage);
+
+		if (signal?.aborted) {
+			break;
+		}
+	}
+
+	return {
+		messages,
+		terminate: shouldTerminateToolBatch(finalizedCalls),
+	};
+}
+```
+
+每个工具依次走完 start → prepare → execute → finalize → end → toolResult 消息。abort 后跳出循环，剩下的工具调用**不会产生 toolResult**。之后循环会去请求下一个 turn，而 abort 信号已经触发，`streamFn` 按契约会返回 `aborted` 消息，于是走 4.5 节的硬退出。
+
+### 6.7 并行执行
+
+```ts title="packages/agent/src/agent-loop.ts:596-670"
+async function executeToolCallsParallel(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	toolCalls: AgentToolCall[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<ExecutedToolCallBatch> {
+	const finalizedCalls: FinalizedToolCallEntry[] = [];
+
+	for (const toolCall of toolCalls) {
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
+		});
+
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		if (preparation.kind === "immediate") {
+			const finalized = {
+				toolCall,
+				result: preparation.result,
+				isError: preparation.isError,
+			} satisfies FinalizedToolCallOutcome;
+			await emitToolExecutionEnd(finalized, emit);
+			finalizedCalls.push(finalized);
+			if (signal?.aborted) {
+				break;
+			}
+			continue;
+		}
+
+		finalizedCalls.push(async () => {
+			if (signal?.aborted) {
+				const finalized = {
+					toolCall,
+					result: createErrorToolResult("Operation aborted"),
+					isError: true,
+				} satisfies FinalizedToolCallOutcome;
+				await emitToolExecutionEnd(finalized, emit);
+				return finalized;
+			}
+			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const finalized = await finalizeExecutedToolCall(
+				currentContext,
+				assistantMessage,
+				preparation,
+				executed,
+				config,
+				signal,
+			);
+			await emitToolExecutionEnd(finalized, emit);
+			return finalized;
+		});
+		if (signal?.aborted) {
+			break;
+		}
+	}
+
+	const orderedFinalizedCalls = await Promise.all(
+		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	);
+	const messages: ToolResultMessage[] = [];
+	for (const finalized of orderedFinalizedCalls) {
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
+
+	return {
+		messages,
+		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+	};
+}
+```
+
+并行模式分三个阶段：
+
+1. **准备阶段（串行）**：按源顺序对每个工具发 `tool_execution_start`、调用 `prepareToolCall`。被拦截或校验失败的（`immediate`）立即发 `tool_execution_end`；可执行的包成一个闭包放进 `finalizedCalls`，此时**还没开始执行**。`beforeToolCall` 因此是串行调用的，比如需要用户确认的权限扩展，一次只会询问一个工具。
+2. **执行阶段（并发）**：`Promise.all` 同时调用所有闭包。每个工具执行完、`afterToolCall` 完成后立即发自己的 `tool_execution_end`，所以 end 事件按**完成顺序**。
+3. **收尾阶段（串行）**：`Promise.all` 保留数组顺序，按**源顺序**逐个发 toolResult 消息的 `message_start`/`message_end`。
+
+为什么 end 事件按完成顺序、结果消息按源顺序？UI 希望工具一完成就显示；而 transcript 里 toolResult 的顺序要稳定，和 assistant 消息里的 toolCall 顺序一致，这样会话回放和缓存都是确定的。测试 `should emit tool_execution_end in completion order but persist tool results in source order` 让第一个工具等第二个工具完成，断言 end 顺序是 `["tool-2", "tool-1"]`，而结果消息顺序是 `["tool-1", "tool-2"]`。
+
+另一个结果：并行模式下，所有 `tool_execution_start` 都在任何工具开始执行之前发出。
+
+### 6.8 terminate：提前结束
+
+`shouldTerminateToolBatch`（第 700-702 行，见 6.3 节的片段）要求**批内每一个**结果都设置了 `terminate: true`。只要有一个没设，循环就照常继续请求模型。原因：如果一批里有三个工具，只有一个说“可以停了”，另外两个的结果模型还没看到，直接停下就丢了信息。`terminate` 的来源有三个：工具结果本身、`beforeToolCall` 拦截时设置、`afterToolCall` 覆盖。
+
+### 6.9 length 截断：全部判失败
+
+模型输出达到 token 上限时，`stopReason` 为 `length`。此时回复可能停在某个工具调用的参数中间：
+
+```ts title="packages/agent/src/agent-loop.ts:481-513"
+/**
+ * Fail all tool calls from an assistant message that was truncated by the
+ * output token limit. Streamed tool-call arguments are finalized with a
+ * best-effort JSON salvage parser, so a truncated message can yield tool calls
+ * whose arguments parse and validate but are silently incomplete. None of them
+ * are safe to execute; report each as an error so the model can re-issue them.
+ */
+async function failToolCallsFromTruncatedMessage(
+	toolCalls: AgentToolCall[],
+	emit: AgentEventSink,
+): Promise<ExecutedToolCallBatch> {
+	const messages: ToolResultMessage[] = [];
+	for (const toolCall of toolCalls) {
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
+		});
+		const finalized: FinalizedToolCallOutcome = {
+			toolCall,
+			result: createErrorToolResult(
+				`Tool call "${toolCall.name}" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.`,
+			),
+			isError: true,
+		};
+		await emitToolExecutionEnd(finalized, emit);
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
+	return { messages, terminate: false };
+}
+```
+
+注释解释了为什么不能只失败“看起来残缺”的那个：pi-ai 流式解析参数时用了“尽力挽救”的 JSON 解析器，截断的参数也可能被解析成合法对象、通过 schema 校验，但内容不完整。比如一个 `write` 调用的文件内容被截掉一半，校验能过，执行后文件就坏了。所以整条消息里的工具调用一律不执行，每个都发 `tool_execution_start`/`tool_execution_end` 和一条错误 toolResult，让模型重新发出完整调用。`terminate` 固定为 false，循环会继续请求，模型能看到这些错误。
+
+### 6.10 结果消息与 runToolCall
+
+```ts title="packages/agent/src/agent-loop.ts:922-959"
+function createErrorToolResult(message: string): AgentToolResult<any> {
+	return {
+		content: [{ type: "text", text: message }],
+		details: {},
+	};
+}
+
+async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: AgentEventSink): Promise<void> {
+	await emit({
+		type: "tool_execution_end",
+		toolCallId: finalized.toolCall.id,
+		toolName: finalized.toolCall.name,
+		result: finalized.result,
+		isError: finalized.isError,
+		...(finalized.durationMs === undefined ? {} : { durationMs: finalized.durationMs }),
+	});
+}
+
+function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId: finalized.toolCall.id,
+		toolName: finalized.toolCall.name,
+		// Untyped tools (JS extensions) can return results without content; normalize
+		// so the null never enters session history or provider payloads.
+		content: finalized.result.content ?? [],
+		details: finalized.result.details,
+		usage: finalized.result.usage,
+		isError: finalized.isError,
+		...(finalized.durationMs === undefined ? {} : { durationMs: finalized.durationMs }),
+		timestamp: Date.now(),
+	};
+}
+
+async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
+	await emit({ type: "message_start", message: toolResultMessage });
+	await emit({ type: "message_end", message: toolResultMessage });
+}
+```
+
+`createToolResultMessage` 把 `content` 为空的情况规范成 `[]`，因为用 JS 写的扩展工具可能不返回 content。每条 toolResult 消息也走 `message_start`/`message_end`，所以 Agent 会把它记入状态。
+
+`agent-loop.ts` 还导出了一个独立的 `runToolCall`：
+
+```ts title="packages/agent/src/agent-loop.ts:812-829"
+/**
+ * Run one tool call through the same steps as a model-issued call: argument preparation, schema
+ * validation, `beforeToolCall`, execution, and `afterToolCall`. Emits no events and adds no
+ * messages. Tools that call other tools use this so the hooks (for example permission checks)
+ * apply to those calls too.
+ *
+ * Never rejects for tool failures: unknown tools, validation errors, blocked calls, and thrown
+ * errors come back as `isError: true`.
+ */
+export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallOptions): Promise<AgentToolCallOutcome> {
+	const { assistantMessage, context, signal } = options;
+	const preparation = await prepareToolCall(context, assistantMessage, toolCall, options, signal, options.tools);
+	if (preparation.kind === "immediate") {
+		return { toolCall, result: preparation.result, isError: preparation.isError };
+	}
+	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}));
+	return finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
+}
+```
+
+问题：有些工具会调用其他工具（比如 codemode 让模型写的脚本去调用工具，或者 sub-agent 工具）。如果它们直接调 `tool.execute`，就绕过了 `beforeToolCall` 里的权限检查。`runToolCall` 走同样的预处理、校验、两个钩子，但不发事件、不加消息。coding-agent 在 [agent-session.ts:752-753](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L752-L753) 就是这样把钩子传进去的。
+
+## 7. 事件
+
+### 7.1 AgentEvent 类型
+
+```ts title="packages/agent/src/types.ts:509-539"
+/**
+ * Events emitted by the Agent for UI updates.
+ *
+ * `agent_end` is the last event emitted for a run, but awaited `Agent.subscribe()`
+ * listeners for that event are still part of run settlement. The agent becomes
+ * idle only after those listeners finish.
+ */
+export type AgentEvent =
+	// Agent lifecycle
+	| { type: "agent_start" }
+	| { type: "agent_end"; messages: AgentMessage[] }
+	// Turn lifecycle - a turn is one assistant response + any tool calls/results
+	| { type: "turn_start" }
+	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	// Message lifecycle - emitted for system, user, assistant, and toolResult messages
+	| { type: "message_start"; message: AgentMessage }
+	// Only emitted for assistant messages during streaming
+	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
+	| { type: "message_end"; message: AgentMessage }
+	// Tool execution lifecycle
+	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
+	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
+	| {
+			type: "tool_execution_end";
+			toolCallId: string;
+			toolName: string;
+			result: any;
+			isError: boolean;
+			/** Milliseconds `execute()` took, measured with a monotonic clock; absent when the tool did not run. */
+			durationMs?: number;
+	  };
+```
+
+三个层次：
+
+- agent 生命周期：`agent_start`、`agent_end`。一次运行各一个。
+- turn 生命周期：`turn_start`、`turn_end`。`turn_end` 带上本 turn 的 assistant 消息和全部 toolResult。
+- 消息生命周期：`message_start`/`message_update`/`message_end`，覆盖 system、user、assistant、toolResult 四类消息。
+- 工具执行：`tool_execution_start`/`update`/`end`。
+
+`tool_execution_*` 和 toolResult 消息事件是两回事：前者描述执行过程（给 UI 显示进度），后者描述进入 transcript 的消息（给状态和持久化）。
+
+### 7.2 完整事件顺序
+
+一次运行：用户发一条消息，模型调用两个工具（并行），然后回复文本结束；第一个 turn 期间用户插了一句 steering。
+
+| # | 事件 | 来源（agent-loop.ts） | 说明 |
+| --- | --- | --- | --- |
+| 1 | `agent_start` | 126 | |
+| 2 | `turn_start` | 127 | 第一个 turn |
+| 3 | `message_start` / `message_end`（system） | 129-130 | 仅当工具集有变化 |
+| 4 | `message_start` / `message_end`（user） | 129-130 | prompt |
+| 5 | `message_start`（assistant） | 430 | 收到 `start` |
+| 6 | `message_update` × N | 445 | 文本、思考、工具调用的增量 |
+| 7 | `message_end`（assistant） | 464 | |
+| 8 | `tool_execution_start`（A）、`tool_execution_start`（B） | 607 | 准备阶段，按源顺序 |
+| 9 | `tool_execution_update` × N | 791 | 执行阶段，A、B 交错 |
+| 10 | `tool_execution_end`（B）、`tool_execution_end`（A） | 648 | 按完成顺序 |
+| 11 | `message_start` / `message_end`（toolResult A，再 B） | 957-958 | 按源顺序 |
+| 12 | `turn_end` | 296 | 在 `finishTurn` 之后 |
+| 13 | `turn_start` | 216 | 第二个 turn，在 `prepareNextTurn` 之后 |
+| 14 | `message_start` / `message_end`（steering 的 user 消息） | 221-222 | |
+| 15 | `message_start` / `message_update` × N / `message_end`（assistant） | 430-464 | 纯文本回复 |
+| 16 | `turn_end` | 296 | |
+| 17 | `agent_end` | 329 | follow-up 队列为空 |
+
+几种变体：
+
+- **串行执行**：第 8-11 步变成每个工具依次 `start → update* → end → toolResult 消息`。
+- **error / aborted**：assistant 的 `message_end` 之后直接 `turn_end`、`agent_end`（261-263）。
+- **finishTurn 返回 end**：`turn_end` 之后直接 `agent_end`（298-300）。
+- **continue**：没有第 3-4 步，`turn_start` 后直接是 assistant 消息。
+- **length 截断**：第 8-11 步变成每个工具依次 `start → end → toolResult 消息`，全是错误。
+- **follow-up**：第 16 步之后不是 `agent_end`，而是 `turn_start`、follow-up 消息、下一条 assistant……
+
+## 8. Agent 类
+
+`agent-loop.ts` 是无状态的：它拿一个上下文快照，跑完，返回新消息。真实应用还需要：一份持续存在的 transcript、运行中能接收插话的队列、一个可以随时调用的 `abort()`、多个 UI 组件同时订阅事件。这些由 [agent.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/src/agent.ts) 的 `Agent` 类提供。
+
+### 8.1 状态
+
+`AgentState` 的公共接口：
+
+```ts title="packages/agent/src/types.ts:376-421"
+/**
+ * Public agent state.
+ *
+ * `tools` and `messages` use accessor properties so implementations can copy
+ * assigned arrays before storing them.
+ */
+export interface AgentState {
+	/**
+	 * Current system prompt, replayed from the transcript's system messages.
+	 *
+	 * Read-only: to change the prompt, append a system message with `content` or `sections`.
+	 * In `initialState`, this seeds the leading system message.
+	 */
+	readonly systemPrompt: string;
+	/** Active model used for future turns. */
+	model: Model<any>;
+	/** Requested reasoning level for future turns. */
+	thinkingLevel: ThinkingLevel;
+	/**
+	 * Executable tools. Assigning a new array copies the top-level array.
+	 *
+	 * Differences from the tools declared in the transcript are announced to the model
+	 * with a system message before the next request.
+	 */
+	set tools(tools: AgentTool<any>[]);
+	get tools(): AgentTool<any>[];
+	/**
+	 * Conversation transcript. Assigning a new array copies the top-level array.
+	 *
+	 * System messages in the transcript carry the prompt and tool declarations.
+	 */
+	set messages(messages: AgentMessage[]);
+	get messages(): AgentMessage[];
+	/**
+	 * True while the agent is processing a prompt or continuation.
+	 *
+	 * This remains true until awaited `agent_end` listeners settle.
+	 */
+	readonly isStreaming: boolean;
+	/** Partial assistant message for the current streamed response, if any. */
+	readonly streamingMessage?: AgentMessage;
+	/** Tool call ids currently executing. */
+	readonly pendingToolCalls: ReadonlySet<string>;
+	/** Error message from the most recent failed or aborted assistant turn, if any. */
+	readonly errorMessage?: string;
+}
+```
+
+内部实现用闭包变量和 getter/setter：
+
+```ts title="packages/agent/src/agent.ts:78-112"
+/** Initial state for {@link Agent}. `systemPrompt` and `tools` become the leading system message unless `messages` already starts with one. */
+export type AgentInitialState = Partial<
+	Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">
+>;
+
+function createMutableAgentState(initialState?: AgentInitialState): MutableAgentState {
+	let tools = initialState?.tools?.slice() ?? [];
+	let messages = initialState?.messages?.slice() ?? [];
+	const initialMessage = createInitialSystemMessage(initialState?.systemPrompt, tools.map(toToolDeclaration));
+	if (messages[0]?.role !== "system" && initialMessage) messages.unshift(initialMessage);
+
+	return {
+		get systemPrompt() {
+			return getCurrentSystemPrompt(messages);
+		},
+		model: initialState?.model ?? DEFAULT_MODEL,
+		thinkingLevel: initialState?.thinkingLevel ?? "off",
+		get tools() {
+			return tools;
+		},
+		set tools(nextTools: AgentTool<any>[]) {
+			tools = nextTools.slice();
+		},
+		get messages() {
+			return messages;
+		},
+		set messages(nextMessages: AgentMessage[]) {
+			messages = nextMessages.slice();
+		},
+		isStreaming: false,
+		streamingMessage: undefined,
+		pendingToolCalls: new Set<string>(),
+		errorMessage: undefined,
+	};
+}
+```
+
+- `systemPrompt` 是只读 getter，每次从 `messages` 里回放 system 消息得出。要改提示，就追加一条 system 消息，这和 4.2 节的工具声明是同一套机制。
+- `tools` 和 `messages` 的 setter 会复制顶层数组，外部修改原数组不会影响 Agent。
+- 初始化时，如果 `messages` 不以 system 消息开头，就用 `systemPrompt` 和 `tools` 生成一条放在最前面。
+- `isStreaming`、`streamingMessage`、`pendingToolCalls`、`errorMessage` 对外只读。`isStreaming` 由运行生命周期设置（8.5 节），其余三个由事件更新（8.6 节）。
+
+构造函数里的默认值：
+
+```ts title="packages/agent/src/agent.ts:238-263"
+	constructor(options: AgentOptions) {
+		// Older compiled consumers may omit options or streamFn even though the current API requires them.
+		const runtimeOptions: Partial<AgentOptions> = options ?? {};
+		this._state = createMutableAgentState(runtimeOptions.initialState);
+		this.convertToLlm = runtimeOptions.convertToLlm ?? defaultConvertToLlm;
+		this.transformContext = runtimeOptions.transformContext;
+		this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn();
+		this.getApiKey = runtimeOptions.getApiKey;
+		this.onPayload = runtimeOptions.onPayload;
+		this.onResponse = runtimeOptions.onResponse;
+		this.onProviderStreamEvent = runtimeOptions.onProviderStreamEvent;
+		this.beforeToolCall = runtimeOptions.beforeToolCall;
+		this.afterToolCall = runtimeOptions.afterToolCall;
+		this.finishTurn = runtimeOptions.finishTurn;
+		this.prepareRequest = runtimeOptions.prepareRequest;
+		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
+		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
+		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
+		this.followUpQueue = new PendingMessageQueue(runtimeOptions.followUpMode ?? "one-at-a-time");
+		this.sessionId = runtimeOptions.sessionId;
+		this.thinkingBudgets = runtimeOptions.thinkingBudgets;
+		this.transport = runtimeOptions.transport ?? "auto";
+		this.maxRetryDelayMs = runtimeOptions.maxRetryDelayMs;
+		this.toolExecution = runtimeOptions.toolExecution ?? "parallel";
+		this.identity = runtimeOptions.identity;
+	}
+```
+
+两个队列默认都是 `one-at-a-time`，工具默认并行，`streamFn` 不传时取全局默认值（8.7 节）。
+
+### 8.2 两个队列
+
+```ts title="packages/agent/src/agent.ts:149-180"
+class PendingMessageQueue {
+	private messages: AgentMessage[] = [];
+	public mode: QueueMode;
+
+	constructor(mode: QueueMode) {
+		this.mode = mode;
+	}
+
+	enqueue(message: AgentMessage): void {
+		this.messages.push(message);
+	}
+
+	hasItems(): boolean {
+		return this.messages.length > 0;
+	}
+
+	peek(): AgentMessage[] {
+		if (this.mode === "all") return this.messages.slice();
+		const first = this.messages[0];
+		return first ? [first] : [];
+	}
+
+	drain(): AgentMessage[] {
+		const drained = this.peek();
+		this.messages = this.messages.slice(drained.length);
+		return drained;
+	}
+
+	clear(): void {
+		this.messages = [];
+	}
+}
+```
+
+`QueueMode` 决定每次 drain 取多少：
+
+```ts title="packages/agent/src/types.ts:49-55"
+/**
+ * Controls how many queued user messages are injected when the agent loop reaches a queue drain point.
+ *
+ * - "all": drain and inject every queued message at that point.
+ * - "one-at-a-time": drain and inject only the oldest queued message, leaving the rest queued for later drain points.
+ */
+export type QueueMode = "all" | "one-at-a-time";
+```
+
+用户连续插了三句话。`all` 模式下三句在同一个 turn 注入；`one-at-a-time` 模式下每个 turn 只注入一句，模型逐句响应。默认选后者，让每条插话都得到一次单独的回应。
+
+公开的队列 API：
+
+```ts title="packages/agent/src/agent.ts:307-342"
+	/** Queue a message to be injected after the current assistant turn finishes. */
+	steer(message: AgentMessage): void {
+		this.steeringQueue.enqueue(message);
+	}
+
+	/** Queue a message to run only after the agent would otherwise stop. */
+	followUp(message: AgentMessage): void {
+		this.followUpQueue.enqueue(message);
+	}
+
+	/** Remove all queued steering messages. */
+	clearSteeringQueue(): void {
+		this.steeringQueue.clear();
+	}
+
+	/** Remove all queued follow-up messages. */
+	clearFollowUpQueue(): void {
+		this.followUpQueue.clear();
+	}
+
+	/** Remove all queued steering and follow-up messages. */
+	clearAllQueues(): void {
+		this.clearSteeringQueue();
+		this.clearFollowUpQueue();
+	}
+
+	/** Returns true when either queue still contains pending messages. */
+	hasQueuedMessages(): boolean {
+		return this.steeringQueue.hasItems() || this.followUpQueue.hasItems();
+	}
+
+	/** Preview the messages selected for the next turn without consuming them. */
+	peekQueuedMessages(): AgentMessage[] {
+		const steering = this.steeringQueue.peek();
+		return steering.length > 0 ? steering : this.followUpQueue.peek();
+	}
+```
+
+`steer()` 和 `followUp()` 只是入队，不检查是否在运行。没在运行时入队的消息会留到下一次运行被 poll。`peekQueuedMessages` 先看 steering，再看 follow-up，与循环的优先级一致。
+
+### 8.3 把队列接进循环：createLoopConfig
+
+```ts title="packages/agent/src/agent.ts:469-515"
+	private createContextSnapshot(): AgentContext {
+		return {
+			messages: this._state.messages.slice(),
+			tools: this._state.tools.slice(),
+		};
+	}
+
+	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
+		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
+		return {
+			model: this._state.model,
+			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
+			sessionId: this.sessionId,
+			onPayload: this.onPayload,
+			onResponse: this.onResponse,
+			onProviderStreamEvent: this.onProviderStreamEvent,
+			transport: this.transport,
+			thinkingBudgets: this.thinkingBudgets,
+			maxRetryDelayMs: this.maxRetryDelayMs,
+			identity: this.identity,
+			toolExecution: this.toolExecution,
+			beforeToolCall: this.beforeToolCall,
+			afterToolCall: this.afterToolCall,
+			finishTurn: this.finishTurn,
+			prepareRequest: this.prepareRequest,
+			prepareNextTurn:
+				this.prepareNextTurnWithContext || this.prepareNextTurn
+					? async (context) => {
+							if (this.prepareNextTurnWithContext) {
+								return await this.prepareNextTurnWithContext(context, this.signal);
+							}
+							return await this.prepareNextTurn?.(this.signal);
+						}
+					: undefined,
+			convertToLlm: this.convertToLlm,
+			transformContext: this.transformContext,
+			getApiKey: this.getApiKey,
+			getSteeringMessages: async () => {
+				if (skipInitialSteeringPoll) {
+					skipInitialSteeringPoll = false;
+					return [];
+				}
+				return this.steeringQueue.drain();
+			},
+			getFollowUpMessages: async () => this.followUpQueue.drain(),
+		};
+	}
+```
+
+每次运行都重新生成一份 `AgentLoopConfig`，从 Agent 的公共字段读取当前值。所以在两次运行之间修改 `agent.beforeToolCall` 或 `agent.state.model` 都会在下次运行生效。
+
+- `getSteeringMessages` 和 `getFollowUpMessages` 就是两个队列的 `drain()`。
+- `prepareNextTurn` 有两种写法：`prepareNextTurnWithContext(context, signal)` 优先，否则 `prepareNextTurn(signal)`。都会收到当前运行的 abort 信号。
+- `skipInitialSteeringPoll`：只让第一次 steering poll 返回空数组，下一节解释。
+- `createContextSnapshot` 复制了 `messages` 和 `tools` 数组。循环 push 进的是这个副本，不是 Agent 的状态。
+
+### 8.4 prompt 与 continue
+
+```ts title="packages/agent/src/agent.ts:379-467"
+	/** Start a new prompt from text, a single message, or a batch of messages. */
+	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
+	async prompt(input: string, images?: ImageContent[]): Promise<void>;
+	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+		if (this.activeRun) {
+			throw new Error(
+				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+			);
+		}
+		const messages = this.normalizePromptInput(input, images);
+		await this.runPromptMessages(messages);
+	}
+
+	/** Continue from the current transcript. The last message must be a user or tool-result message. */
+	async continue(): Promise<void> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before continuing.");
+		}
+
+		const lastMessage = this._state.messages[this._state.messages.length - 1];
+		if (!lastMessage || this._state.messages.every((message) => message.role === "system")) {
+			throw new Error("No messages to continue from");
+		}
+
+		if (lastMessage.role === "assistant") {
+			const queuedSteering = this.steeringQueue.drain();
+			if (queuedSteering.length > 0) {
+				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
+				return;
+			}
+
+			const queuedFollowUps = this.followUpQueue.drain();
+			if (queuedFollowUps.length > 0) {
+				await this.runPromptMessages(queuedFollowUps);
+				return;
+			}
+
+			throw new Error("Cannot continue from message role: assistant");
+		}
+
+		await this.runContinuation();
+	}
+
+	private normalizePromptInput(
+		input: string | AgentMessage | AgentMessage[],
+		images?: ImageContent[],
+	): AgentMessage[] {
+		if (Array.isArray(input)) {
+			return input;
+		}
+
+		if (typeof input !== "string") {
+			return [input];
+		}
+
+		const content: Array<TextContent | ImageContent> = [{ type: "text", text: input }];
+		if (images && images.length > 0) {
+			content.push(...images);
+		}
+		return [{ role: "user", content, timestamp: Date.now() }];
+	}
+
+	private async runPromptMessages(
+		messages: AgentMessage[],
+		options: { skipInitialSteeringPoll?: boolean } = {},
+	): Promise<void> {
+		await this.runWithLifecycle(async (signal) => {
+			await runAgentLoop(
+				messages,
+				this.createContextSnapshot(),
+				this.createLoopConfig(options),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+			);
+		});
+	}
+
+	private async runContinuation(): Promise<void> {
+		await this.runWithLifecycle(async (signal) => {
+			await runAgentLoopContinue(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+			);
+		});
+	}
+```
+
+`prompt` 有三种输入：字符串（可带图片）、一条消息、一组消息。正在运行时调用会抛异常，提示改用 `steer()` 或 `followUp()`。
+
+`continue` 的逻辑更绕一些：
+
+- 最后一条不是 assistant：调用 `runAgentLoopContinue`，比如重试一次失败的请求。
+- 最后一条是 assistant：不能直接 continue（第 3 节说过 provider 不接受）。这时先 drain steering 队列，有的话把它们当作 prompt 启动新运行；否则 drain follow-up 队列；都没有才报错。
+
+为什么 steering 这条路径要带 `skipInitialSteeringPoll: true`？`drain()` 已经按 `one-at-a-time` 取走了一条。如果 `runLoop` 开头（第 185 行）再 poll 一次，又会取走一条，第一个 turn 就注入了两条消息，违反了 one-at-a-time 的语义。这和 4.3 节第 211-212 行注释是同一个考虑。follow-up 路径不需要跳过，因为它 drain 的是 follow-up 队列，开头 poll 的是 steering 队列。
+
+### 8.5 生命周期、abort 与失败兜底
+
+```ts title="packages/agent/src/agent.ts:517-566"
+	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing.");
+		}
+
+		const abortController = new AbortController();
+		let resolvePromise = () => {};
+		const promise = new Promise<void>((resolve) => {
+			resolvePromise = resolve;
+		});
+		this.activeRun = { promise, resolve: resolvePromise, abortController };
+
+		this._state.isStreaming = true;
+		this._state.streamingMessage = undefined;
+		this._state.errorMessage = undefined;
+
+		try {
+			await executor(abortController.signal);
+		} catch (error) {
+			await this.handleRunFailure(error, abortController.signal.aborted);
+		} finally {
+			this.finishRun();
+		}
+	}
+
+	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+		const failureMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "" }],
+			api: this._state.model.api,
+			provider: this._state.model.provider,
+			model: this._state.model.id,
+			usage: EMPTY_USAGE,
+			stopReason: aborted ? "aborted" : "error",
+			errorMessage: error instanceof Error ? error.message : String(error),
+			timestamp: Date.now(),
+		} satisfies AgentMessage;
+		await this.processEvents({ type: "message_start", message: failureMessage });
+		await this.processEvents({ type: "message_end", message: failureMessage });
+		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
+		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+	}
+
+	private finishRun(): void {
+		this._state.isStreaming = false;
+		this._state.streamingMessage = undefined;
+		this._state.pendingToolCalls = new Set<string>();
+		this.activeRun?.resolve();
+		this.activeRun = undefined;
+	}
+```
+
+`runWithLifecycle` 把一次运行包成 `activeRun`：一个 Promise、它的 resolve、一个 `AbortController`。
+
+- `abort()` 就是 `activeRun?.abortController.abort()`（第 350-352 行）。信号一路传给 `streamFn`、工具的 `execute`、各个钩子，各自负责响应。
+- `waitForIdle()` 返回 `activeRun.promise`，它在 `finishRun` 里 resolve，即所有 `agent_end` 监听器都执行完之后。
+- 如果循环抛出异常（违反了“不能抛”的契约），`handleRunFailure` 会合成一条 assistant 错误消息，补发 `message_start`、`message_end`、`turn_end`、`agent_end`。这样订阅者总能看到完整的结尾，不会卡在“运行中”。
+
+`reset()`（第 363-377 行）清空 transcript 和队列，但保留回放出来的 system 消息作为基线。运行中调用会抛异常。
+
+### 8.6 事件处理：先更新状态，再通知订阅者
+
+```ts title="packages/agent/src/agent.ts:568-622"
+	/**
+	 * Reduce internal state for a loop event, then await listeners.
+	 *
+	 * `agent_end` only means no further loop events will be emitted. The run is
+	 * considered idle later, after all awaited listeners for `agent_end` finish
+	 * and `finishRun()` clears runtime-owned state.
+	 */
+	private async processEvents(event: AgentEvent): Promise<void> {
+		switch (event.type) {
+			case "message_start":
+				this._state.streamingMessage = event.message;
+				break;
+
+			case "message_update":
+				this._state.streamingMessage = event.message;
+				break;
+
+			case "message_end":
+				this._state.streamingMessage = undefined;
+				this._state.messages.push(event.message);
+				break;
+
+			case "tool_execution_start": {
+				const pendingToolCalls = new Set(this._state.pendingToolCalls);
+				pendingToolCalls.add(event.toolCallId);
+				this._state.pendingToolCalls = pendingToolCalls;
+				break;
+			}
+
+			case "tool_execution_end": {
+				const pendingToolCalls = new Set(this._state.pendingToolCalls);
+				pendingToolCalls.delete(event.toolCallId);
+				this._state.pendingToolCalls = pendingToolCalls;
+				break;
+			}
+
+			case "turn_end":
+				if (event.message.role === "assistant" && event.message.errorMessage) {
+					this._state.errorMessage = event.message.errorMessage;
+				}
+				break;
+
+			case "agent_end":
+				this._state.streamingMessage = undefined;
+				break;
+		}
+
+		const signal = this.activeRun?.abortController.signal;
+		if (!signal) {
+			throw new Error("Agent listener invoked outside active run");
+		}
+		for (const listener of this.listeners) {
+			await listener(event, signal);
+		}
+	}
+```
+
+这是 Agent 状态的唯一写入点：
+
+| 事件 | 状态变化 |
+| --- | --- |
+| `message_start` / `message_update` | `streamingMessage` = 当前消息 |
+| `message_end` | `streamingMessage` 清空，消息 push 进 `messages` |
+| `tool_execution_start` / `end` | `pendingToolCalls` 增删（每次换一个新 Set） |
+| `turn_end` | assistant 消息带 `errorMessage` 时记入 `errorMessage` |
+| `agent_end` | `streamingMessage` 清空 |
+
+`Agent.state.messages` 不是从 `runAgentLoop` 的返回值拿的，而是靠 `message_end` 事件一条条追加的。这意味着事件流就是状态变化的唯一来源：订阅者看到的事件序列和状态严格一致，持久化层（coding-agent 在 `message_end` 时写会话文件）也只需要订阅同一个事件。
+
+`pendingToolCalls` 每次都换成新 Set 而不是原地修改。源码没写原因，效果是之前拿到的 Set 引用不会被改动，用引用比较就能发现变化。
+
+订阅者按订阅顺序**依次 await**：
+
+```ts title="packages/agent/src/agent.ts:265-278"
+	/**
+	 * Subscribe to agent lifecycle events.
+	 *
+	 * Listener promises are awaited in subscription order and are included in
+	 * the current run's settlement. Listeners also receive the active abort
+	 * signal for the current run.
+	 *
+	 * `agent_end` is the final emitted event for a run, but the agent does not
+	 * become idle until all awaited listeners for that event have settled.
+	 */
+	subscribe(listener: (event: AgentEvent, signal: AbortSignal) => Promise<void> | void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+```
+
+循环里每个 `emit` 都是 `await emit(...)`，所以一个慢的监听器会让整个循环等它。好处是顺序有保证：比如 coding-agent 在 `message_end` 时写会话文件，循环继续之前这条消息已经交给了监听器。代价是监听器要尽量快，重活应该自己放到后台。
+
+### 8.7 默认 streamFn 与 proxy
+
+`stream-fn.ts` 只有一个全局变量：
+
+```ts title="packages/agent/src/stream-fn.ts:3-20"
+let defaultStreamFn: StreamFn | undefined;
+
+/**
+ * Configure the fallback used by Agent and low-level loops when callers omit streamFn.
+ *
+ * Hosts that provide a default model runtime can install its stream function here
+ * without making pi-agent-core depend on a provider catalog or compatibility layer.
+ */
+export function setDefaultStreamFn(streamFn: StreamFn | undefined): void {
+	defaultStreamFn = streamFn;
+}
+
+export function getDefaultStreamFn(): StreamFn {
+	if (!defaultStreamFn) {
+		throw new Error("No default stream function configured. Pass streamFn explicitly or call setDefaultStreamFn().");
+	}
+	return defaultStreamFn;
+}
+```
+
+注释说明了动机：agent-core 不依赖任何 provider 目录。宿主（比如 coding-agent）可以在启动时注册一个默认 stream 函数，旧代码省略 `streamFn` 也能工作。
+
+`proxy.ts` 提供另一种 `StreamFn`：把请求发到自己的代理服务器，由服务器持有密钥并转发给 provider。服务器为了省带宽，事件里不带 `partial` 字段，客户端自己重建：
+
+```ts title="packages/agent/src/proxy.ts:106-231"
+export function streamProxy(
+	model: Model<any>,
+	context: TranscriptContext,
+	options: ProxyStreamOptions,
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+
+	(async () => {
+		// Initialize the partial message that we'll build up from events
+		const partial: AssistantMessage = {
+			role: "assistant",
+			stopReason: "pending",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+			// ...
+			if (!sawTerminalEvent) {
+				// A clean EOF without a done/error event means the server dropped the
+				// response mid-stream. Surface it as an error instead of leaving
+				// consumers waiting on a result that never arrives.
+				partial.stopReason = "error";
+				partial.errorMessage = "Connection closed by proxy server before the response completed";
+				stream.push({
+					type: "error",
+					reason: "error",
+					error: partial,
+				});
+			}
+```
+
+流正常结束却没收到 `done`/`error` 时，它主动推一个 error 事件，避免消费者一直等。这也是在履行 5.1 节的契约：失败编码在流里，不抛异常。
+
+## 9. 设计回顾
+
+把这一章串起来，几个贯穿的设计：
+
+1. **循环无状态，状态在外面。** `runLoop` 只操作传进来的快照和局部变量；`Agent` 持有状态，通过事件同步。同一个循环可以被 `Agent` 用，也可以被测试直接调用，或者被持久化 harness 用。
+2. **所有可变行为都是钩子。** 模型切换、compaction、权限、上下文加工、重试，agent-core 一个都不实现，只在固定位置调用钩子。
+3. **失败不抛异常，而是变成消息。** 工具找不到、校验失败、被拦截、执行出错、输出被截断，都变成 `isError` 的 toolResult；请求失败变成 `stopReason: "error"` 的 assistant 消息。模型能看到这些错误并自我修正，事件序列也始终完整。
+4. **transcript 合法性优先。** steering 不打断工具，toolResult 按源顺序写入，工具变化写成 system 消息。transcript 随时可以回放、分支、发给 provider。
+
+## 小结
+
+- `runLoop` 是双层循环：内层每次迭代是一个 turn（一次模型回复 + 全部工具调用），有工具调用或待注入消息就继续；外层在内层结束后检查 follow-up 队列。
+- steering 在三个点 poll：循环开头、`prepareNextTurn` 之后（仅当 pending 为空）、每个 turn 结束后；注入发生在下一次请求之前，不会跳过当前 turn 的工具调用。follow-up 只在内层退出后 poll。
+- 钩子顺序：`prepareNextTurn` → `turn_start` → 注入消息 → `prepareRequest` → `transformContext` → `convertToLlm` → `getApiKey` → `streamFn` → 工具（`beforeToolCall`、`execute`、`afterToolCall`）→ `finishTurn` → `turn_end` → `getSteeringMessages`。
+- `finishTurn` 返回 end 立即结束；返回 continue 保证至少再请求一次，但不额外增加请求。error/aborted 是硬退出，不 poll 任何队列。
+- `declareToolChanges` 在每次请求前把 `context.tools` 与 transcript 声明的差异写成 system 消息。
+- 工具流水线：查找 → `prepareArguments` → schema 校验 → `beforeToolCall`（可拦截、可原地改参数）→ `execute`（`onUpdate` 上报进度）→ `afterToolCall`（按字段覆盖）。所有失败都变成错误结果。
+- 并行模式：准备串行、执行并发；`tool_execution_end` 按完成顺序，toolResult 消息按源顺序。任一工具声明 sequential 则整批串行。
+- 整批工具结果都设置 `terminate` 才提前停止。`stopReason` 为 `length` 时整条消息的工具调用全部判失败。
+- `Agent` 状态只通过 `processEvents` 更新，`messages` 由 `message_end` 追加；监听器按顺序 await；队列默认 `one-at-a-time`。
+
+## 动手验证
+
+1. **读测试**：[packages/agent/test/agent-loop.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/test/agent-loop.test.ts) 几乎每个 `it` 都对应本章的一个要点。建议先读这几个：`should emit tool_execution_end in completion order but persist tool results in source order`、`should not execute tool calls from a length-truncated assistant message`、`makes exactly one context-only request when no natural request satisfies continuation`、`picks up steering queued during prepareNextTurn before the next request`、`should continue after a mixed batch with one terminating blocked call`。
+
+2. **跑测试**：在 `packages/agent` 目录下运行
+
+   ```bash
+   node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/agent-loop.test.ts test/agent.test.ts
+   ```
+
+   这两个文件用的是手写的 mock stream，不访问真实 provider。不要直接跑整个 vitest 套件，里面的 `e2e.test.ts` 在有 API key 环境变量时会发真实请求。
+
+3. **打印事件顺序**：复制 `should handle tool calls and results` 这个测试，在 `for await (const event of stream)` 里把 `event.type`（以及 `tool_execution_*` 的 `toolCallId`）打印出来，对照 7.2 节的表格。再把 `toolExecution` 改成 `"sequential"`，看第 8-11 步怎么变化。
+
+4. **观察 steering 的注入时机**：参考 `should inject queued messages after all tool calls complete`，让一个工具在执行中途调用 `agent.steer(...)`，确认 steering 的 user 消息出现在该 turn 全部 toolResult 和 `turn_end` 之后、下一条 assistant 消息之前。再把 `steeringMode` 设为 `"all"`，连续 steer 三次，比较注入的条数。

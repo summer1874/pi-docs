@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "实验线：pi-durable、chord、pi-env",
+    "locale": "zh-CN",
+    "output": "docs/public/diagrams/ch09-experimental.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "git@github.com:earendil-works/pi.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "44f6851b7f27ad5c18ccc94f6b4321650e757e3e"
+    }
+  },
+  "components": [
+    { "id": "app", "type": "external", "label": "你的应用", "sublabel": "submit / watch", "pos": [40, 220], "size": [140, 64] },
+    { "id": "chord", "type": "messagebus", "label": "chord", "sublabel": "Context · delta · Watch", "pos": [300, 60], "size": [150, 64],
+      "sources": [{ "path": "packages/chord/src/delta/index.ts", "line": 32, "end_line": 40, "label": "Op" }] },
+    { "id": "session", "type": "backend", "label": "Session", "sublabel": "唯一提交线", "pos": [300, 220], "size": [150, 64],
+      "sources": [{ "path": "packages/durable/src/session/session.ts", "line": 844, "end_line": 912, "label": "#runCommit" }] },
+    { "id": "storage", "type": "database", "label": "Storage", "sublabel": "SQLite / JSONL / 内存", "pos": [300, 380], "size": [150, 64],
+      "sources": [{ "path": "packages/durable/src/types.ts", "line": 1278, "end_line": 1286, "label": "commit + adopt" }] },
+    { "id": "scheduler", "type": "backend", "label": "TaskScheduler", "sublabel": "generation / tool 任务", "pos": [560, 220], "size": [150, 64],
+      "sources": [{ "path": "packages/durable/src/harness/scheduler.ts", "line": 382, "end_line": 411, "label": "open 恢复" }] },
+    { "id": "piai", "type": "backend", "label": "pi-ai", "sublabel": "Models.streamSimple", "pos": [560, 60], "size": [150, 64],
+      "sources": [{ "path": "packages/durable/src/harness/generation.ts", "line": 634, "label": "streamSimple" }] },
+    { "id": "llm", "type": "cloud", "label": "模型服务", "sublabel": "HTTPS", "pos": [820, 60], "size": [150, 64] },
+    { "id": "remoteenv", "type": "backend", "label": "RemoteExecutionEnv", "sublabel": "pi-env 客户端", "pos": [820, 220], "size": [150, 64],
+      "sources": [{ "path": "packages/env/src/remote-env.ts", "line": 852, "label": "exec" }] },
+    { "id": "daemon", "type": "backend", "label": "pi-env daemon", "sublabel": "Rust，stdin/stdout 帧", "pos": [1080, 220], "size": [150, 64],
+      "sources": [{ "path": "packages/env/daemon/src/main.rs", "line": 404, "end_line": 470, "label": "serve_frames" }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "pi-durable", "wraps": ["session", "scheduler"] },
+    { "kind": "region", "label": "远程机器", "wraps": ["daemon"] }
+  ],
+  "connections": [
+    { "id": "submit", "from": "app", "to": "session", "label": "submit", "variant": "emphasis" },
+    { "id": "watch", "from": "session", "to": "app", "label": "watch ops", "variant": "dashed" },
+    { "id": "persist", "from": "session", "to": "storage", "label": "先落盘再发布" },
+    { "id": "delta", "from": "chord", "to": "session", "label": "delta / Watch", "variant": "dashed" },
+    { "id": "checkpoint", "from": "scheduler", "to": "session", "label": "检查点提交" },
+    { "id": "stream", "from": "scheduler", "to": "piai", "label": "调模型", "variant": "emphasis" },
+    { "id": "http", "from": "piai", "to": "llm", "label": "HTTPS" },
+    { "id": "exec", "from": "scheduler", "to": "remoteenv", "label": "ExecutionEnv" },
+    { "id": "ssh", "from": "remoteenv", "to": "daemon", "label": "SSH 帧" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "先提交再展示", "items": ["watch 只收到已持久化的 op", "流式进度用 deferred 提交，最多丢约 1 秒"] },
+    { "dot": "amber", "title": "崩溃恢复", "items": ["running 任务改回 pending，restarts 加一", "连续打断 5 次即终止"] }
+  ]
+}

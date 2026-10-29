@@ -1,0 +1,1367 @@
+---
+title: 第 8 章　独立小包：pi-mcp、pi-codemode、pi-telemetry
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 8 章　独立小包：pi-mcp、pi-codemode、pi-telemetry
+
+## 导读
+
+<Say id="k08-01">这一章看三个独立小包：pi-mcp、pi-codemode 和 pi-telemetry。</Say>
+<Say id="k08-02">它们都不依赖 coding-agent，可以单独发布，也能被别的程序直接拿去用。</Say>
+<Say id="k08-03">pi-mcp 是自己写的 MCP 客户端，不用官方 SDK，只依赖一个 cross-spawn。</Say>
+<Say id="k08-04">它把传输层和协议层分开：传输只管收发 JSON-RPC 消息，客户端负责握手、请求配对和超时。</Say>
+<Say id="k08-05">pi-codemode 在 QuickJS 沙箱里运行模型写的脚本，脚本唯一能做的事就是调用注入的工具。</Say>
+<Say id="k08-06">中间的工具结果只留在脚本里，只有脚本的输出回到模型上下文，所以省上下文。</Say>
+<Say id="k08-07">pi-telemetry 只定义 span 和 metric 的契约，父 span 必须显式传递，不用全局状态。</Say>
+<Say id="k08-08">读完你应该能讲清：一次 MCP 工具调用、一段 codemode 脚本、一个请求 span 各自怎么走完全程。</Say>
+
+## 1. 三个包的位置
+
+先看依赖关系。三个包都在依赖图的叶子上：
+
+| 包 | npm 名 | 运行时依赖 | 谁在用 |
+|---|---|---|---|
+| `packages/mcp` | `@earendil-works/pi-mcp` | `cross-spawn` | coding-agent 内置扩展 `src/extensions/mcp` |
+| `packages/codemode` | `@earendil-works/pi-codemode` | `quickjs-wasi` | coding-agent 内置扩展 `src/extensions/codemode`、pi-durable |
+| `packages/telemetry` | `@earendil-works/pi-telemetry` | 无 | pi-ai、chord、pi-durable |
+
+这三个包和 pi 的其他部分只通过类型和函数调用相连，不反向依赖上层。这样做的直接好处是：pi-mcp 和 pi-codemode 可以给别的 agent 程序用，pi-telemetry 可以在 Node、Bun、浏览器和 Cloudflare Workers 里用。
+
+下面按包分别讲。
+
+## 2. pi-mcp：不依赖官方 SDK 的 MCP 客户端
+
+MCP（Model Context Protocol）是一个让 agent 连接外部工具服务器的协议。底层是 JSON-RPC 2.0：一方发请求（带 `id`），另一方回响应（带同一个 `id`）；不需要回复的消息叫通知（没有 `id`）。
+
+pi 没有用官方的 `@modelcontextprotocol/sdk`，而是在 [packages/mcp](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/package.json) 里自己实现了客户端。整个包 3.3k 行，`package.json` 里唯一的运行时依赖是 `cross-spawn`（用来在 Windows 上正确启动 `.cmd` 脚本）：
+
+```json title="packages/mcp/package.json:53-55"
+	"dependencies": {
+		"cross-spawn": "7.0.6"
+	},
+```
+
+代码分三层：
+
+| 层 | 文件 | 职责 |
+|---|---|---|
+| 协议数据 | `protocol/jsonrpc.ts`、`protocol/types.ts`、`protocol/content.ts` | JSON-RPC 消息类型、MCP 结构、结果转成模型内容 |
+| 传输 | `transports/stdio.ts`、`transports/streamable-http.ts`、`transports/in-memory.ts` | 把一条 JSON-RPC 消息送到对端，再把对端的消息交回来 |
+| 客户端 | `client.ts` | 握手、请求 id 分配与配对、超时、取消、进度、分页 |
+
+另有 `oauth/` 子目录实现 HTTP 服务器的 OAuth 授权，这里不展开。
+
+### 2.1 传输接口：只管收发消息
+
+传输层的契约很小。它不理解 MCP，只理解“一条 JSON-RPC 消息”：
+
+```ts title="packages/mcp/src/transports/transport.ts:18-26"
+export interface McpTransport {
+	start(): Promise<void>;
+	send(message: JsonRpcMessage, options?: McpTransportSendOptions): Promise<void>;
+	close(): Promise<void>;
+	onMessage(listener: McpTransportMessageListener): () => void;
+	onError(listener: McpTransportErrorListener): () => void;
+	onClose(listener: McpTransportCloseListener): () => void;
+	setProtocolVersion?(version: string): void;
+}
+```
+
+`send` 只负责把消息发出去，不等回复；回复通过 `onMessage` 回调异步到达。请求和回复的配对完全是客户端的事。这样一来，stdio、HTTP、内存三种传输可以共用同一个客户端。
+
+`JsonRpcMessage` 是三种消息的联合类型：
+
+```ts title="packages/mcp/src/protocol/jsonrpc.ts:1-35"
+export type JsonRpcId = string | number;
+
+export interface JsonRpcRequest {
+	jsonrpc: "2.0";
+	id: JsonRpcId;
+	method: string;
+	params?: unknown;
+}
+
+export interface JsonRpcNotification {
+	jsonrpc: "2.0";
+	method: string;
+	params?: unknown;
+}
+// ...
+export interface JsonRpcSuccessResponse {
+	jsonrpc: "2.0";
+	id: JsonRpcId;
+	result: unknown;
+}
+
+export interface JsonRpcErrorResponse {
+	jsonrpc: "2.0";
+	id: JsonRpcId;
+	error: JsonRpcErrorObject;
+}
+
+export type JsonRpcResponse = JsonRpcSuccessResponse | JsonRpcErrorResponse;
+export type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
+```
+
+### 2.2 stdio 传输：一行一条消息
+
+本地 MCP 服务器通常是一个子进程，通过 stdin/stdout 通信，每条消息占一行 JSON。发送就是写一行：
+
+```ts title="packages/mcp/src/transports/stdio.ts:143-150"
+	async send(message: JsonRpcMessage): Promise<void> {
+		const stdin = this.child?.stdin;
+		if (!this.started || this.closed || !stdin?.writable) throw new McpConnectionClosedError();
+		const payload = `${JSON.stringify(message)}\n`;
+		await new Promise<void>((resolve, reject) => {
+			stdin.write(payload, (error) => (error ? reject(error) : resolve()));
+		});
+	}
+```
+
+接收要处理“半行”：stdout 的 `data` 事件不保证按行到达，一条大消息可能分成几块。[stdio.ts:181-207](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/transports/stdio.ts#L181-L207) 用一个 Buffer 累积，遇到换行符（`0x0a`）才切出一条完整消息：
+
+```ts title="packages/mcp/src/transports/stdio.ts:181-207"
+	private handleStdout(chunk: Buffer | string): void {
+		this.stdoutBuffer = Buffer.concat([this.stdoutBuffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+		const maxMessageBytes = this.options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES;
+		while (true) {
+			const newline = this.stdoutBuffer.indexOf(0x0a);
+			if (newline < 0) {
+				if (this.stdoutBuffer.length > maxMessageBytes) {
+					this.stdoutBuffer = Buffer.alloc(0);
+					this.emitError(new Error(`MCP stdio message exceeds ${maxMessageBytes} bytes`));
+				}
+				return;
+			}
+			const line = this.stdoutBuffer.subarray(0, newline);
+			this.stdoutBuffer = this.stdoutBuffer.subarray(newline + 1);
+			if (line.length > maxMessageBytes) {
+				this.emitError(new Error(`MCP stdio message exceeds ${maxMessageBytes} bytes`));
+				continue;
+			}
+			const text = line.toString("utf8").replace(/\r$/, "");
+			if (!text.trim()) continue;
+			try {
+				this.emitMessage(parseJsonRpcMessage(JSON.parse(text)));
+			} catch (error) {
+				this.emitError(error);
+			}
+		}
+	}
+```
+
+两个细节：
+
+- 按字节找换行，而不是先转成字符串。UTF-8 多字节字符可能被切在两块之间，先拼 Buffer 再解码就不会乱码。
+- 单条消息有上限（默认 16 MB，`DEFAULT_MAX_MESSAGE_BYTES`）。一个不换行的服务器不会让宿主内存无限增长。
+
+关闭子进程也有讲究。很多 MCP 服务器是用 `npx` 或 `uvx` 启动的，真正的服务器是包装进程的子进程。只杀直接子进程会留下孤儿。所以启动时 `detached: true` 让子进程拥有自己的进程组，关闭时对整个组发信号：
+
+```ts title="packages/mcp/src/transports/stdio.ts:164-178"
+		// Shutdown per the spec: close stdin and let the server exit, then SIGTERM, then SIGKILL.
+		const closeTimeoutMs = this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
+		await new Promise<void>((resolve) => {
+			const timers: ReturnType<typeof setTimeout>[] = [];
+			child.once("close", () => {
+				for (const timer of timers) clearTimeout(timer);
+				// Children of the server that ignored stdin closing would otherwise outlive it.
+				killProcessTree(child, "SIGTERM");
+				resolve();
+			});
+			const grace = Math.min(STDIN_CLOSE_GRACE_MS, closeTimeoutMs);
+			timers.push(setTimeout(() => killProcessTree(child, "SIGTERM"), grace));
+			timers.push(setTimeout(() => killProcessTree(child, "SIGKILL"), grace + closeTimeoutMs));
+			child.stdin?.end();
+		});
+```
+
+顺序是：先关 stdin，等 500 ms 让服务器自己退出；还没退就 SIGTERM；再等 `closeTimeoutMs`（默认 2 秒）还没退就 SIGKILL。`killProcessTree` 在 POSIX 上用负 pid 杀整个进程组（[stdio.ts:29-37](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/transports/stdio.ts#L29-L37)），Windows 上用 `taskkill /T`。
+
+### 2.3 Streamable HTTP 传输：一个请求，两种回复格式
+
+远程 MCP 服务器走 HTTP。每条消息是一次 POST；服务器可以直接回一个 JSON，也可以回一个 SSE 流（Server-Sent Events，一种 HTTP 长连接上逐条推送事件的格式），在流里先推进度通知，最后推响应：
+
+```ts title="packages/mcp/src/transports/streamable-http.ts:231-266"
+	async send(message: JsonRpcMessage, { signal }: McpTransportSendOptions = {}): Promise<void> {
+		if (!this.started || this.closed) throw new McpConnectionClosedError();
+		const response = await this.authorizedFetch(
+			"POST",
+			{
+				headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+				body: JSON.stringify(message),
+			},
+			signal,
+		);
+		await this.checkResponse(response);
+		this.captureSession(response);
+
+		if (!isJsonRpcRequest(message)) {
+			// Notifications and responses are acknowledged with 202 and carry no reply; ignore any body.
+			await discard(response);
+			// The server-to-client stream may only open once the session is initialized.
+			if ("method" in message && message.method === "notifications/initialized") this.startGetStream();
+			return;
+		}
+		if (response.status === 202 || response.status === 204) {
+			throw new McpHttpError(response.status, `MCP server accepted request ${message.method} without a response`);
+		}
+		const type = contentType(response);
+		if (type === "application/json") {
+			const body: unknown = await response.json();
+			for (const item of Array.isArray(body) ? body : [body]) this.emitMessage(parseJsonRpcMessage(item));
+			return;
+		}
+		if (type === "text/event-stream" && response.body) {
+			void this.consumeResponseStream(response.body, message.id);
+			return;
+		}
+		await discard(response);
+		throw new McpHttpError(response.status, `Unsupported MCP response content type: ${type ?? "missing"}`);
+	}
+```
+
+注意 SSE 分支用的是 `void this.consumeResponseStream(...)`：`send` 不等流读完就返回。响应从流里解析出来后同样走 `emitMessage`，客户端照常按 `id` 配对。对客户端来说，JSON 回复和 SSE 回复没有区别。
+
+会话状态放在请求头里。握手后服务器在响应头返回 `mcp-session-id`，之后每个请求都带上它和协商好的协议版本：
+
+```ts title="packages/mcp/src/transports/streamable-http.ts:325-337"
+	private buildHeaders(extra: Record<string, string>, token: string | undefined): Headers {
+		const headers = new Headers(this.options.headers);
+		for (const [name, value] of Object.entries(extra)) headers.set(name, value);
+		if (this.sessionIdValue) headers.set("Mcp-Session-Id", this.sessionIdValue);
+		if (this.protocolVersion) headers.set("MCP-Protocol-Version", this.protocolVersion);
+		if (token) headers.set("Authorization", `Bearer ${token}`);
+		return headers;
+	}
+
+	private captureSession(response: Response): void {
+		const sessionId = response.headers.get("mcp-session-id");
+		if (sessionId) this.sessionIdValue = sessionId;
+	}
+```
+
+这个文件还实现了 SSE 解析（`consumeSseStream`，[streamable-http.ts:41-109](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/transports/streamable-http.ts#L41-L109)）、断线后带 `Last-Event-ID` 重连、401 时交给 `authProvider` 刷新令牌后重试一次（`authorizedFetch`，[streamable-http.ts:295-317](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/transports/streamable-http.ts#L295-L317)）。这些是官方 SDK 也要做的事，pi 在 500 行内写完了。
+
+coding-agent 根据配置选传输：有 `url` 就用 HTTP，否则启动子进程：
+
+```ts title="packages/coding-agent/src/extensions/mcp/runtime.ts:98-122"
+export function createDefaultTransport(
+	entry: McpServerEntry,
+	cwd: string,
+	authProvider: AuthProvider | undefined,
+): McpTransport {
+	const { config, name } = entry;
+	if ("url" in config) {
+		return new StreamableHttpTransport({
+			url: config.url,
+			headers: resolveHeadersOrThrow(config.headers, `MCP server "${name}"`),
+			authProvider,
+		});
+	}
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(config.env ?? {})) {
+		env[key] = resolveConfigValueOrThrow(value, `MCP server "${name}" env "${key}"`);
+	}
+	return new StdioTransport({
+		command: expandHome(config.command),
+		args: config.args?.map(expandHome),
+		cwd: resolve(cwd, expandHome(config.cwd ?? ".")),
+		env,
+		stderr: "pipe",
+	});
+}
+```
+
+测试用的第三种传输 `InMemoryTransport`（[in-memory.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/transports/in-memory.ts)）只有 51 行：一对传输互为 peer，`send` 时 `structuredClone` 一份，在微任务里交给对方。它让测试可以在同一进程里同时跑客户端和假服务器。
+
+### 2.4 握手：initialize 与 notifications/initialized
+
+MCP 连接建立后必须先握手。客户端发 `initialize` 请求，报告自己的协议版本、能力和身份；服务器回自己选的版本、能力、服务器信息和可选的 `instructions`。客户端确认版本可接受后，再发一个 `notifications/initialized` 通知，握手完成：
+
+```ts title="packages/mcp/src/client.ts:204-250"
+	async connect(transport: McpTransport): Promise<InitializeResult> {
+		if (this.state !== "idle") throw new Error(`Cannot connect MCP client in ${this.state} state`);
+		this.state = "connecting";
+		this.transport = transport;
+		this.disposers = [
+			transport.onMessage((message) => this.handleMessage(message)),
+			// Transport errors are reported only. Pending requests fail when the transport closes.
+			transport.onError((error) => this.emitError(error)),
+			transport.onClose(() => this.handleTransportClose()),
+		];
+
+		try {
+			await transport.start();
+			const capabilities: ClientCapabilities = { ...this.options.capabilities };
+			if (this.options.roots && capabilities.roots === undefined) capabilities.roots = {};
+			const result = validateInitializeResult(
+				await this.requestInternal(
+					"initialize",
+					{
+						protocolVersion: this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION,
+						capabilities,
+						clientInfo: {
+							name: this.options.name,
+							version: this.options.version,
+							...(this.options.title === undefined ? {} : { title: this.options.title }),
+						},
+					},
+					{},
+					true,
+				),
+			);
+			if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
+				throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
+			}
+			this.protocolVersionValue = result.protocolVersion;
+			this.serverInfoValue = result.serverInfo;
+			this.serverCapabilitiesValue = result.capabilities;
+			this.instructionsValue = result.instructions;
+			transport.setProtocolVersion?.(result.protocolVersion);
+			await this.notifyInternal("notifications/initialized", undefined, true);
+			this.state = "connected";
+			return result;
+		} catch (error) {
+			await this.close().catch(() => {});
+			throw error;
+		}
+	}
+```
+
+关键点：
+
+- 状态机只有四个值：`idle → connecting → connected → closed`（[client.ts:41](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/client.ts#L41)）。`requestInternal` 的最后一个参数 `allowConnecting = true`，表示握手期间也允许发请求；普通的 `request()` 传 `false`，握手完成前调用会直接抛错。
+- 版本协商：客户端发最新版本 `2025-11-25`，服务器不支持时会回它自己的最新版本。只要在 `SUPPORTED_PROTOCOL_VERSIONS` 里就接受（[types.ts:4-9](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/protocol/types.ts#L4-L9)，包括 `2025-06-18`、`2025-03-26`、`2024-11-05`）。
+- `transport.setProtocolVersion?.()` 只有 HTTP 传输实现，用来在之后的请求头里带上 `MCP-Protocol-Version`。
+- 握手失败时立刻 `close()`，不会留下一个半开的连接。
+
+客户端也要回答服务器发来的请求。构造函数里预先注册了 `ping` 和（配置了 roots 时的）`roots/list`：
+
+```ts title="packages/mcp/src/client.ts:173-182"
+	constructor(options: McpClientOptions) {
+		this.options = Object.freeze({ ...options });
+		this.requestHandlers.set("ping", () => ({}));
+		const roots = options.roots;
+		if (roots) {
+			this.requestHandlers.set("roots/list", async () => ({
+				roots: [...(typeof roots === "function" ? await roots() : roots)],
+			}));
+		}
+	}
+```
+
+pi 把当前工作目录作为 root 告诉服务器（[runtime.ts:360-365](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/extensions/mcp/runtime.ts#L360-L365)）。
+
+### 2.5 请求与响应的配对
+
+`send` 不等回复，那 `await client.request(...)` 怎么拿到结果？答案是一张 `pending` 表：发请求前分配一个自增 `id`，把 Promise 的 `resolve/reject` 存进表里；响应到达时按 `id` 取出来调用。
+
+```ts title="packages/mcp/src/client.ts:396-444"
+	private async requestInternal(
+		method: string,
+		params: Record<string, unknown> | undefined,
+		options: McpRequestOptions,
+		allowConnecting: boolean,
+	): Promise<unknown> {
+		const transport = this.requireTransport(allowConnecting);
+		if (options.signal?.aborted) throw new McpAbortError();
+		const id = this.nextRequestId++;
+		const progressToken = options.onProgress ? id : undefined;
+		const requestParams =
+			progressToken === undefined
+				? params
+				: { ...params, _meta: { ...(isObject(params?._meta) ? params._meta : {}), progressToken } };
+		const message: JsonRpcRequest = {
+			jsonrpc: "2.0",
+			id,
+			method,
+			...(requestParams === undefined ? {} : { params: requestParams }),
+		};
+		return new Promise<unknown>((resolve, reject) => {
+			const entry: PendingRequest = {
+				resolve,
+				reject,
+				timeoutMs: options.timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+				timer: undefined,
+				signal: options.signal,
+				// The spec forbids cancelling `initialize`.
+				onAbort: () =>
+					this.cancelPending(
+						id,
+						new McpAbortError(),
+						method !== "initialize",
+						String(options.signal?.reason ?? "Aborted"),
+					),
+				sendController: new AbortController(),
+				cancellable: method !== "initialize",
+				onProgress: options.onProgress,
+				progressToken,
+			};
+			this.pending.set(id, entry);
+			if (progressToken !== undefined) this.progressRequests.set(progressToken, id);
+			options.signal?.addEventListener("abort", entry.onAbort, { once: true });
+			this.armTimeout(id, entry);
+			transport
+				.send(message, { signal: entry.sendController.signal })
+				.catch((error) => this.cancelPending(id, error, false));
+		});
+	}
+```
+
+收到的消息先分类：是响应就配对，是请求就找 handler 回答，是通知就分发给监听者：
+
+```ts title="packages/mcp/src/client.ts:465-490"
+	private handleMessage(message: JsonRpcMessage): void {
+		if (isJsonRpcResponse(message)) {
+			this.handleResponse(message);
+			return;
+		}
+		if (isJsonRpcRequest(message)) {
+			void this.handleRequest(message);
+			return;
+		}
+		if (isJsonRpcNotification(message)) {
+			this.handleNotification(message.method, message.params);
+			return;
+		}
+		this.emitError(new McpError(JSON_RPC_ERROR_CODES.invalidRequest, "Received invalid JSON-RPC message"));
+	}
+
+	private handleResponse(message: JsonRpcResponse): void {
+		const entry = this.pending.get(message.id);
+		if (!entry) {
+			this.emitError(new Error(`Received response for unknown MCP request ${String(message.id)}`));
+			return;
+		}
+		this.removePending(message.id, entry);
+		if ("error" in message) entry.reject(new McpError(message.error.code, message.error.message, message.error.data));
+		else entry.resolve(message.result);
+	}
+```
+
+超时和取消也围绕这张表：
+
+```ts title="packages/mcp/src/client.ts:553-575"
+	private armTimeout(id: JsonRpcId, entry: PendingRequest): void {
+		if (entry.timer) clearTimeout(entry.timer);
+		if (!Number.isFinite(entry.timeoutMs) || entry.timeoutMs <= 0) return;
+		entry.timer = setTimeout(() => {
+			this.cancelPending(id, new McpTimeoutError(entry.timeoutMs), entry.cancellable, "Request timed out");
+		}, entry.timeoutMs);
+	}
+
+	private cancelPending(id: JsonRpcId, error: unknown, notifyServer: boolean, reason?: string): void {
+		const entry = this.pending.get(id);
+		if (!entry) return;
+		this.removePending(id, entry);
+		entry.reject(error);
+		if (notifyServer && this.transport) {
+			void this.transport
+				.send({
+					jsonrpc: "2.0",
+					method: "notifications/cancelled",
+					params: { requestId: id, ...(reason ? { reason } : {}) },
+				})
+				.catch((sendError) => this.emitError(sendError));
+		}
+	}
+```
+
+举一个具体例子。一个长时间运行的工具每秒发一次进度：
+
+1. 客户端发 `tools/call`，`id = 7`，`params._meta.progressToken = 7`，超时 30 秒。
+2. 服务器每秒发 `notifications/progress`，`progressToken = 7`。`handleProgress`（[client.ts:536-547](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/client.ts#L536-L547)）找到请求 7，调用 `armTimeout` 重新计时，再调用 `onProgress`。所以只要服务器还在汇报进度，请求就不会超时。
+3. 用户按 Esc，`signal` 触发 `onAbort` → `cancelPending(7, ..., true)`：本地 Promise 立刻 reject，同时给服务器发 `notifications/cancelled`，让它停止工作。
+4. 之后服务器如果还是回了 `id = 7` 的响应，`handleResponse` 在表里找不到它，只报一个错误，不会影响别的请求。
+
+`removePending` 还会 `sendController.abort()`：如果这条请求还没真正发出（例如 HTTP 传输正在刷新令牌），传输看到信号就不再发送。
+
+### 2.6 工具列表与工具调用
+
+`tools/list` 是分页的：服务器每页返回一些工具和一个 `nextCursor`。`listAll` 循环取完所有页，并防御两种异常服务器——游标重复（会死循环）和页数过多：
+
+```ts title="packages/mcp/src/client.ts:357-386"
+	private async listAll(
+		method: string,
+		key: string,
+		isItem: (item: Record<string, unknown>) => boolean,
+		options: McpRequestOptions,
+	): Promise<Record<string, unknown>[]> {
+		const items: Record<string, unknown>[] = [];
+		const cursors = new Set<string>();
+		let cursor: string | undefined;
+		for (let pageNumber = 0; pageNumber < MAX_LIST_PAGES; pageNumber++) {
+			const page = await this.listPage(method, key, isItem, cursor, options);
+			items.push(...page.items);
+			if (page.nextCursor === undefined) return items;
+			if (cursors.has(page.nextCursor))
+				throw new Error(`MCP ${method} returned duplicate cursor: ${page.nextCursor}`);
+			cursors.add(page.nextCursor);
+			cursor = page.nextCursor;
+		}
+		throw new Error(`MCP ${method} exceeded ${MAX_LIST_PAGES} pages`);
+	}
+
+	async callTool(
+		name: string,
+		args?: Record<string, unknown>,
+		options: McpRequestOptions = {},
+	): Promise<CallToolResult> {
+		return validateCallToolResult(
+			await this.request("tools/call", { name, ...(args === undefined ? {} : { arguments: args }) }, options),
+		);
+	}
+```
+
+每一页的条目都要校验：工具必须有字符串 `name` 和对象 `inputSchema`（[client.ts:111](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/client.ts#L111)）。校验对“不完全守规范”的服务器比较宽容，代码里的注释记录了这些现实情况：有的服务器用 `null` 或空字符串结束分页（[client.ts:105](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/client.ts#L105)），有的工具结果只有 `structuredContent` 没有 `content`：
+
+```ts title="packages/mcp/src/client.ts:144-153"
+/**
+ * `content` is required by the spec, but servers that only return `structuredContent` omit it (the SDK defaults it too).
+ * `structuredContent` may be any JSON value, as MCP 2026-07-28 allows.
+ */
+function validateCallToolResult(value: unknown): CallToolResult {
+	if (!isObject(value) || (value.content !== undefined && !Array.isArray(value.content))) {
+		throw new McpError(JSON_RPC_ERROR_CODES.invalidRequest, "Invalid MCP tools/call result");
+	}
+	return (value.content === undefined ? { ...value, content: [] } : value) as unknown as CallToolResult;
+}
+```
+
+MCP 的结果内容块有文本、图片、音频、资源链接、嵌入资源五种，而 LLM 接口只接受文本和图片。`toLlmContent` 做这一步转换，其余类型变成一行文字占位：
+
+```ts title="packages/mcp/src/protocol/content.ts:112-118"
+export function toLlmContent(result: Pick<CallToolResult, "content" | "structuredContent">): LlmContent[] {
+	const content = (result.content ?? []).map(blockToLlmContent);
+	if (content.length === 0 && result.structuredContent !== undefined) {
+		content.push({ type: "text", text: JSON.stringify(result.structuredContent, null, 2) });
+	}
+	return content;
+}
+```
+
+`LlmContent` 的形状特意和 pi-ai 的 `TextContent`、`ImageContent` 一致（[content.ts:73-77](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/protocol/content.ts#L73-L77)），但 pi-mcp 并不 import pi-ai。这是结构类型的好处：两个包不互相依赖，数据却能直接互通。
+
+### 2.7 接入 coding-agent
+
+coding-agent 的内置 MCP 扩展连上服务器后，先 `listTools()`（服务器声明了 tools 能力才调用），再把每个 MCP 工具包装成一个普通的 pi 工具定义：
+
+```ts title="packages/coding-agent/src/extensions/mcp/tools.ts:327-350"
+	return {
+		name: options.name,
+		label,
+		description: tool.description?.trim() || title || `MCP tool ${tool.name} from server ${server}`,
+		parameters: toParameters(tool.inputSchema),
+		outputSchema: createMcpResultSchema(tool.outputSchema),
+		exposure: toToolExposure(options.exposure),
+		namespace: options.namespace,
+		...(annotations ? { annotations } : {}),
+		...createMcpToolRenderers(label),
+		async execute(_toolCallId, params, signal, onUpdate) {
+			const client = await options.getClient();
+			const result = await client.callTool(tool.name, (params ?? {}) as Record<string, unknown>, {
+				signal,
+				timeoutMs: options.timeoutMs,
+				onProgress: (progress) => {
+					const total = progress.total === undefined ? "" : `/${progress.total}`;
+					const text = progress.message ?? `Progress ${progress.progress}${total}`;
+					onUpdate?.({ content: [{ type: "text", text }], details: { server, tool: tool.name } });
+				},
+			});
+			return convertMcpResult(server, tool.name, result, { readableResources: options.readableResources?.() });
+		},
+	};
+```
+
+这里能看到第 2 章工具流水线的每个接口被接上：agent 的 `signal` 变成 MCP 的取消通知，MCP 的进度通知变成 `onUpdate` 的流式进度，MCP 的 `inputSchema` 变成 pi 工具的 `parameters`，MCP 的 `outputSchema` 变成 pi 工具的 `outputSchema`。对 agent 循环来说，MCP 工具和内置的 read、bash 没有区别。
+
+另外，服务器发来 `notifications/tools/list_changed` 时，扩展会重新拉取工具列表（[runtime.ts:380-382](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/extensions/mcp/runtime.ts#L380-L382)）。
+
+### 2.8 为什么不用官方 SDK
+
+源码没有专门的注释解释这个选择，下面是从代码能看出的好处：
+
+- **依赖面小**：只有 `cross-spawn`。pi 把依赖变化当成需要审查的代码（见第 10 章），少一个大依赖就少一份审查负担。
+- **运行环境广**：HTTP 传输只用 `fetch`、`Headers`、`ReadableStream`、`TextDecoder`，在 Cloudflare Workers 里也能跑。构造函数里专门处理了 Workers 的一个坑：`fetch` 不能带着别的 `this` 调用（[streamable-http.ts:211-214](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/transports/streamable-http.ts#L211-L214)）。
+- **可以按 pi 的需要定行为**：进程组清理、进度刷新超时、结果转成 LLM 内容，都是 coding agent 场景的具体需求。
+
+## 3. pi-codemode：让模型写脚本调用工具
+
+### 3.1 问题：工具结果会撑满上下文
+
+先看一个具体场景。用户说“找出 `src/` 下所有导出了 `createX` 的文件，告诉我每个文件有几处调用”。模型按普通方式做：
+
+1. 调用 `grep`，结果 200 行进入上下文。
+2. 对其中 15 个文件逐个调用 `read`，每个结果 300 行进入上下文。
+3. 自己数出调用次数，回答。
+
+这里有两个开销。第一是 token：15 个文件的全文都留在了对话历史里，之后每一轮请求都要重新发给模型。第二是轮次：每次工具调用都是一次完整的模型请求，模型要“想一下、发调用、等结果”。
+
+codemode 的做法是：给模型一个 `codemode` 工具，参数是一段 JavaScript。模型写一段脚本，在脚本里调用 `tools.grep`、`tools.read`，在脚本里计数、过滤，最后只把结论输出出来：
+
+```js
+// 示意：模型可能写出的脚本（不是 pi 源码）
+const hits = await tools.grep({ pattern: "export function createX", path: "src" });
+const files = [...new Set(hits.split("\n").map((l) => l.split(":")[0]).filter(Boolean))];
+const counts = await Promise.all(files.map(async (path) => {
+  const text = await tools.read({ path });
+  return { path, calls: (text.match(/createX\(/g) ?? []).length };
+}));
+text(counts);
+```
+
+整个过程是一次模型请求、一个工具调用。`grep` 的 200 行和 15 个文件的全文只在沙箱里存在过，进入模型上下文的只有最后那几行 `counts`。
+
+coding-agent 的 codemode 工具文件头把这一点写得很直接：
+
+```ts title="packages/coding-agent/src/extensions/codemode/tool.ts:7-10"
+ * Scripts can call the agent loop's nested tools: active `direct` tools and every `codemode` or
+ * `deferred` tool. Nested calls run through the agent loop's tool pipeline (`ctx.executeTool`), so
+ * validation, `tool_call`/`tool_result` hooks, and permission checks apply exactly as for direct
+ * calls. Only the script's output reaches the model; nested results do not.
+```
+
+和这个设计配套的，是 pi-codemode 包本身：一个只能调用注入工具的 JavaScript 沙箱。它的 `package.json` 描述就是这句话：
+
+```json title="packages/codemode/package.json:4"
+	"description": "Sandboxed JavaScript execution where the only capability is calling injected tools",
+```
+
+### 3.2 沙箱是什么：QuickJS 跑在 WASM 里
+
+QuickJS 是一个小型 JavaScript 引擎，`quickjs-wasi` 把它编译成了 WebAssembly。pi-codemode 每次执行脚本都创建一个新的 QuickJS 实例。脚本运行在一个独立的 wasm 实例里，和宿主的 JS 堆完全隔开：
+
+- 没有 `fetch`、`process`、`require`、模块、定时器。
+- 能用的全局只有：`tools`、`ALL_TOOLS`、`console`、`text`、`image`、`exit`、`store`、`load`，以及宿主配置的 globals。
+
+这份“只有这些”的承诺写在 `CodemodeSandboxBase` 的注释里：
+
+```ts title="packages/codemode/src/runtime/execution.ts:451-459"
+/**
+ * Tool table, defaults, and in-flight executions; the behavior every sandbox shares. Subclasses
+ * only choose where the VM runs by passing a {@link VmLauncher}.
+ *
+ * The script sees `tools.<name>(args)` for every registered tool, `ALL_TOOLS`, the output helpers
+ * `text`, `image`, `exit`, and `console.*`, `store`/`load`, and the configured globals; nothing
+ * else (no timers, `fetch`, `process`, `require`, modules). Each `execute()` gets its own VM; the
+ * sandbox only holds the tool table and defaults. `close()` aborts in-flight executions.
+ */
+```
+
+VM 跑在哪里由 `VmLauncher` 决定，有三种：
+
+| 类 | VM 位置 | 适用环境 |
+|---|---|---|
+| `CodemodeSandbox` | Node/Bun 的 worker 线程 | pi CLI |
+| `InlineCodemodeSandbox` | 调用者线程 | Cloudflare Workers、浏览器 |
+| `RemoteCodemodeSandbox` | 另一个 isolate，经 RPC | 远程执行 |
+
+三者共享 `execution.ts` 里的宿主逻辑和 `vm.ts` 里的 VM 逻辑，只有传输和终止方式不同。
+
+### 3.3 注入：工具怎么出现在脚本里
+
+宿主定义的工具长这样，只需要名字和一个 `execute` 函数：
+
+```ts title="packages/codemode/src/types.ts:14-41"
+export interface CodemodeTool {
+	/**
+	 * The script calls tools as `tools.<id>(args)`, where `<id>` is the name with characters that
+	 * are not valid in identifiers replaced by `_` (see `toCodemodeIdentifier`), and also as
+	 * `tools["<name>"](args)`. Globals are called as `<name>(args)` and must be identifiers, or
+	 * `<namespace>.<member>`, which groups them into a frozen namespace object.
+	 */
+	name: string;
+	/** Shown as a doc comment in {@link renderDeclarations}, and listed in `ALL_TOOLS` for tools. */
+	description?: string;
+	/** Schema of the single argument. Rendered as the parameter type; `unknown` when omitted. */
+	inputSchema?: CodemodeJsonSchema;
+	/** Schema of the resolved value. Rendered as the promise type; `unknown` when omitted. */
+	outputSchema?: CodemodeJsonSchema;
+	/** Globals only: `execute` receives all call arguments as an array instead of the first one. */
+	spread?: boolean;
+	/**
+	 * Globals only: TypeScript parameter list and return type for {@link renderDeclarations}, for
+	 * example `(type: string, id?: string): Promise<Model[]>`. Replaces the rendering from the schemas.
+	 */
+	signature?: string;
+	/**
+	 * `args` is whatever the script passed, after a JSON round trip. The return
+	 * value must be JSON-serializable; a thrown error surfaces in the script as
+	 * an `Error` with the same message.
+	 */
+	execute(args: unknown, context: CodemodeToolContext): Promise<unknown> | unknown;
+}
+```
+
+`execute` 函数本身不进沙箱，它留在宿主。进沙箱的只是工具名单：宿主把 `{ name, jsName, description }` 列表序列化成 JSON 字符串，传给 VM 里的一段“前导代码”（prelude）。prelude 为每个名字生成一个桩函数：
+
+```ts title="packages/codemode/src/runtime/prelude-source.ts:197-225"
+	function caller(kind, name, spread) {
+		return (...args) =>
+			new Promise((resolve, reject) => {
+				let json;
+				try {
+					json = serialize(spread ? args : args[0]);
+				} catch (error) {
+					reject(error);
+					return;
+				}
+				const id = nextId++;
+				pending.set(id, { resolve, reject });
+				bridge(kind, id, name, json);
+			});
+	}
+
+	const tools = Object.create(null);
+	const allTools = [];
+	for (const { name, jsName, description } of parse(toolsJson)) {
+		const fn = caller("call", name);
+		// The first tool wins when two names normalize to the same identifier.
+		if (!(jsName in tools)) {
+			tools[jsName] = fn;
+			allTools.push(Object.freeze({ name: jsName, description }));
+		}
+		if (!(name in tools)) tools[name] = fn;
+	}
+	Object.freeze(tools);
+	Object.freeze(allTools);
+```
+
+脚本调用 `tools.read({ path })` 时，桩函数做三件事：把参数 JSON 化；分配一个调用 id，把 Promise 的 `resolve/reject` 存进 `pending`；调用 `bridge` 通知宿主。这和 MCP 客户端的请求配对是同一个模式。
+
+`bridge` 是宿主用 `vm.newFunction` 注入的唯一一个宿主函数。prelude 把它关在闭包里，脚本拿不到它：
+
+```ts title="packages/codemode/src/runtime/vm.ts:253-266"
+		// Called from the prelude with primitives only.
+		const bridge = vm.newFunction("bridge", (kind, a, b, c) => {
+			switch (kind.toString()) {
+				case "call":
+				case "global":
+					issued++;
+					post({
+						type: "call",
+						id: a.toNumber(),
+						target: kind.toString() === "call" ? "tool" : "global",
+						name: b.toString(),
+						args: c === undefined || c.isUndefined ? undefined : c.toString(),
+					});
+					break;
+```
+
+注意 `bridge` 只接收原始值（数字、字符串），参数始终是 JSON 字符串。沙箱和宿主之间从不共享对象，所以脚本无法通过对象引用触碰宿主。
+
+脚本本身被包成一个 async 函数再求值，所以脚本里可以直接写顶层 `await` 和 `return`：
+
+```ts title="packages/codemode/src/runtime/vm.ts:323-335"
+		// The prefix shares the first line with the script so reported line numbers
+		// match the script as written.
+		let fn: JSValueHandle;
+		try {
+			fn = vm.evalCode(`(async (tools, console) => {${data.code}\n})`, "codemode.js");
+		} catch (error) {
+			if (!(error instanceof JSException)) throw error;
+			post({ type: "done", ok: false, error: describeException(error) });
+			return session;
+		}
+		vm.callFunction(run, api, fn).dispose();
+		fn.dispose();
+		drain();
+```
+
+prelude 在做任何事之前，先冻结所有内建对象（[prelude-source.ts:58-139](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/prelude-source.ts#L58-L139)）。原因是 prelude 和脚本共用同一组内建对象：如果脚本改了 `Array.prototype.toJSON`，prelude 序列化给宿主的数据就会被篡改。冻结之后脚本改不了；万一数据还是坏了，宿主解析失败时会报 `Sandbox bridge broken` 错误（[execution.ts:320-326](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/execution.ts#L320-L326)）。
+
+### 3.4 调用：宿主执行工具
+
+`call` 消息经 worker 的 `postMessage` 到达宿主的 `Execution`，宿主查表找到真正的 `execute` 函数并调用：
+
+```ts title="packages/codemode/src/runtime/execution.ts:378-408"
+	private async handleCall(message: Extract<WorkerToHostMessage, { type: "call" }>): Promise<void> {
+		const { id, name } = message;
+		const isTool = message.target === "tool";
+		const record: CodemodeCall | undefined = isTool ? { name, status: "cancelled", durationMs: 0 } : undefined;
+		if (record) this.calls.push(record);
+		const pending: PendingCall = { record, startedAt: performance.now(), controller: new AbortController() };
+		this.pending.set(id, pending);
+
+		let status: CodemodeCallStatus;
+		let reply: HostToWorkerMessage;
+		try {
+			const tool = (isTool ? this.executors.tools : this.executors.globals).get(name);
+			if (!tool) throw new Error(`Unknown ${isTool ? "tool" : "global"} "${name}"`);
+			const args: unknown = message.args === undefined ? undefined : JSON.parse(message.args);
+			const value = await tool.execute(args, { signal: pending.controller.signal });
+			reply = { type: "result", id, ok: true, payload: value === undefined ? undefined : JSON.stringify(value) };
+			status = "ok";
+		} catch (error) {
+			reply = { type: "result", id, ok: false, payload: errorMessage(error) };
+			status = "error";
+		}
+
+		// Already cancelled by finish(): the record keeps "cancelled" and the
+		// VM is gone or going.
+		if (!this.pending.delete(id)) return;
+		if (record) {
+			record.status = status;
+			record.durationMs = performance.now() - pending.startedAt;
+		}
+		this.post(reply);
+	}
+```
+
+几个点：
+
+- 每个调用都有自己的 `AbortController`。脚本结束、超时、外部中止时，`finish()` 统一 abort 所有还在跑的调用（[execution.ts:421-426](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/execution.ts#L421-L426)）。脚本里没有 await 的调用不会继续在后台跑。
+- `calls` 只记录名字、状态和耗时，不记录参数和结果。
+- `handleCall` 是 `void` 调用的（[execution.ts:340](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/execution.ts#L340)），所以脚本里的 `Promise.all` 发出的多个调用会在宿主并发执行。
+
+在 coding-agent 里，注入的 `execute` 不是直接调工具实现，而是走 agent 循环的工具流水线 `ctx.executeTool`：
+
+```ts title="packages/coding-agent/src/extensions/codemode/execute.ts:525-551"
+	const sandboxTools: CodemodeTool[] = callable.map((tool) => ({
+		name: tool.name,
+		description: samples.get(tool.name),
+		execute: async (args, { signal: callSignal }) => {
+			const record: CodemodeNestedCall = {
+				id: `${toolCallId}/?`,
+				name: tool.name,
+				args: previewArgs(args),
+				status: "running",
+			};
+			calls.push(record);
+			publish();
+			const callStartedAt = performance.now();
+			// Only tools from ctx.tools are callable, so ctx is set here.
+			if (!ctx) throw new Error("Tool calls need a session");
+			const outcome = await ctx.executeTool(tool.name, args, { signal: callSignal });
+			record.id = outcome.toolCall.id;
+			record.durationMs = performance.now() - callStartedAt;
+			if (outcome.isError) {
+				record.status = callSignal.aborted ? "cancelled" : "error";
+				record.error = truncateText(textOf(outcome.result) || `Tool "${tool.name}" failed`, ERROR_PREVIEW_CHARS);
+			} else {
+				record.status = "ok";
+			}
+			publish();
+			return toScriptValue(tool, outcome);
+		},
+	}));
+```
+
+这一点很重要：脚本绕不过权限扩展。比如第 6 章的 permission-gate 扩展拦截危险的 bash 命令，脚本里调用 `tools.bash` 也会触发同样的 `tool_call` 事件。沙箱限制的是脚本“能做什么”，扩展限制的是工具“允许做什么”，两层叠加。
+
+### 3.5 结果回传：settle 与 drain
+
+宿主把 `result` 消息发回 worker，worker 调用 `session.deliver`，最终在 VM 里调用 prelude 返回的 `settle`：
+
+```ts title="packages/codemode/src/runtime/vm.ts:189-201"
+	const apply = (message: HostToWorkerMessage): void => {
+		vm.withScope(() => {
+			vm.callFunction(
+				settle,
+				api,
+				vm.newNumber(message.id),
+				message.ok ? vm.true : vm.false,
+				message.payload === undefined ? vm.undefined : vm.newString(message.payload),
+				message.properties === undefined ? vm.undefined : vm.newString(message.properties),
+			);
+		});
+		drain();
+	};
+```
+
+`settle` 按 id 找回脚本那边挂起的 Promise，成功就 `resolve(JSON.parse(payload))`，失败就用错误消息构造一个 `Error` 并 reject：
+
+```ts title="packages/codemode/src/runtime/prelude-source.ts:459-483"
+		settle(id, ok, payload, propertiesJson) {
+			const entry = pending.get(id);
+			if (!entry) return;
+			pending.delete(id);
+			if (!ok) {
+				const error = new ErrorCtor(payload);
+				if (propertiesJson !== undefined) {
+					const properties = parse(propertiesJson);
+					for (const key of Object.keys(properties)) {
+						if (key === "name" || key === "message" || key === "stack") continue;
+						Object.defineProperty(error, key, { value: properties[key], writable: true, enumerable: true, configurable: true });
+					}
+				}
+				entry.reject(error);
+				return;
+			}
+			let value;
+			try {
+				value = payload === undefined ? undefined : parse(payload);
+			} catch (error) {
+				entry.reject(error);
+				return;
+			}
+			entry.resolve(value);
+		},
+```
+
+resolve 只是把 Promise 的回调放进 QuickJS 的任务队列，脚本并没有往下跑。`apply` 最后调用的 `drain()` 才真正把队列跑完，直到脚本再次等待某个工具调用或结束：
+
+```ts title="packages/codemode/src/runtime/vm.ts:241-250"
+	/** Run queued jobs, then fail a script that waits on nothing that can ever resume it. */
+	const drain = () => {
+		let jobs = 0;
+		while (exports.qjs_is_job_pending()) {
+			// A job only fails for uncatchable errors, such as an interrupt.
+			if (exports.qjs_execute_pending_job() < 0) throw new Error("Promise job failed");
+			if (++jobs % JOBS_PER_POLL === 0 && options.shouldInterrupt()) throw new Error("Execution interrupted");
+		}
+		vm.callFunction(stalled, api).dispose();
+	};
+```
+
+`stalled()` 处理一种特殊的死锁：脚本在等一个永远不会完成的 Promise（比如 `await new Promise(() => {})`），而沙箱里没有定时器、没有 I/O，也没有挂起的工具调用。这种脚本永远醒不过来，prelude 会直接让它失败，而不是让它挂到超时（[prelude-source.ts:509-520](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/prelude-source.ts#L509-L520)）。
+
+一次完整的往返如下：
+
+| 步 | 位置 | 发生了什么 |
+|---|---|---|
+| 1 | VM / prelude | `tools.read(args)` → `pending.set(id)` → `bridge("call", id, "read", json)` |
+| 2 | VM / vm.ts | `bridge` → `post({ type: "call", ... })`，经 `postMessage` 发到主线程 |
+| 3 | 宿主 / execution.ts | `handleCall` → `tool.execute(args)` → coding-agent 的 `ctx.executeTool` |
+| 4 | 宿主 / execution.ts | `post({ type: "result", id, ok, payload })` 发回 worker |
+| 5 | VM / vm.ts | `deliver` → `apply` → `settle(id, ...)` → `drain()` |
+| 6 | VM / prelude | 脚本从 `await` 处继续 |
+
+### 3.6 为什么每次一个 worker
+
+`CodemodeSandbox` 为每次执行启动一个新的 worker 线程和一个新的 VM：
+
+```ts title="packages/codemode/src/runtime/host.ts:12-19"
+/**
+ * Each execution gets its own worker thread and QuickJS VM. A fresh worker per run keeps
+ * termination simple: a runaway script, including one that only spins the microtask queue, is
+ * killed with `terminate()` and cannot poison a later run. Before terminating, the host sets a
+ * shared interrupt flag that the VM polls, because Bun's `terminate()` cannot stop a thread that
+ * is spinning in wasm. Stopping requests termination without waiting for exit: some built-ins do
+ * not poll the flag, so on Bun a worker can outlive the script's result.
+ */
+```
+
+问题是 QuickJS 同步执行。如果脚本写了 `while (true) {}`，而 VM 在主线程上跑，主线程的事件循环就停了，超时定时器也永远不会触发。放到 worker 线程里，主线程还能计时，到点就 `terminate()`。
+
+在没有 worker 的环境（Cloudflare Workers），`InlineCodemodeSandbox` 用“中断预算”代替：QuickJS 运行时会周期性调用中断回调，launcher 数这些调用次数，超过预算（默认 100,000 次，大约 2 到 10 秒的纯计算）就中断脚本，详见 [inline.ts:1-33](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/inline.ts#L1-L33) 的注释。
+
+### 3.7 为什么省上下文：只回传脚本输出
+
+最后看 coding-agent 怎么组装返回给模型的工具结果：
+
+```ts title="packages/coding-agent/src/extensions/codemode/execute.ts:617-651"
+	const scriptOutput = [...result.output];
+	if (result.ok) {
+		const { set, delete: deleted } = result.storeWrites;
+		if (Object.keys(set).length > 0 || deleted.length > 0) {
+			options.appendEntry?.(CODEMODE_STORE_ENTRY_TYPE, { set, delete: deleted });
+		}
+		// pi extension: a returned value is appended like text().
+		if (result.value !== undefined) scriptOutput.push({ type: "text", text: valueText(result.value) });
+	}
+	const items = formatOutput(scriptOutput);
+	if (!result.ok) items.push({ type: "text", text: `Script error:\n${formatError(result, calls)}` });
+	if (generatedImages > 0 && !items.some((item) => item.type === "image")) {
+		items.push({
+			type: "text",
+			text: `Note: models.generateImages() returned ${generatedImages} image${generatedImages === 1 ? "" : "s"} that the script did not show. Show each image block of result.output with image(block).`,
+		});
+	}
+
+	const truncated = await truncateOutput(
+		joinAdjacentText(items),
+		sourceOptions.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+	);
+	// After truncation, which joins the text items and moves images after them, so each path stays
+	// next to its image and is never cut.
+	const output = joinAdjacentText(await saveImages(truncated.items));
+	const wallTime = ((performance.now() - startedAt) / 1000).toFixed(1);
+	const header = `${result.ok ? "Script completed" : "Script failed"}\nWall time ${wallTime} seconds\nOutput:\n`;
+	const details = snapshot();
+	if (truncated.fullOutputPath) details.fullOutputPath = truncated.fullOutputPath;
+	return {
+		content: [{ type: "text", text: header }, ...output],
+		details,
+		...(modelUsage ? { usage: modelUsage } : {}),
+		...(result.ok ? {} : { isError: true }),
+	};
+```
+
+`content` 里只有三样东西：一个头（成功或失败、耗时）、脚本通过 `text()`/`image()`/`console.*`/`return` 产生的输出、失败时的错误信息。嵌套工具的返回值从来没有被放进去。`details.calls` 里的嵌套调用记录只给 TUI 渲染用。
+
+嵌套调用另外会记在 tool result 消息的 `nestedCalls` 字段上，pi-ai 的类型注释写明它不发给模型：
+
+```ts title="packages/ai/src/types.ts:640-656"
+export type ToolResultMessage<TDetails = JsonValue> = IsJsonCompatible<TDetails> extends true
+	? {
+			role: "toolResult";
+			toolCallId: string;
+			toolName: string;
+			content: (TextContent | ImageContent)[]; // Supports text and images
+			details?: JsonRepresentation<TDetails>;
+			/** Usage from the tool execution itself, if available. Not part of main LLM context accounting. */
+			usage?: Usage;
+			/** Calls this tool made to other tools. Kept for the session record; not sent to the model. */
+			nestedCalls?: NestedToolCalls;
+			isError: boolean;
+			/** Unix timestamp in milliseconds when the result was created. */
+			timestamp: number;
+			/** Milliseconds the tool's execution took, measured with a monotonic clock. Absent for legacy results. */
+			durationMs?: number;
+		}
+	: never;
+```
+
+所以“省上下文”有三个来源：
+
+1. **中间结果不入上下文**：嵌套工具的返回值只在脚本变量里。
+2. **轮次减少**：多次工具调用合成一次，每少一轮就少一次“重发整个上下文”。
+3. **输出有上限**：`truncateOutput` 按 `max_output_tokens` 截断，超出的部分写到临时文件，结果里只给路径。
+
+这个设计还有一个代价要说明：模型看不到中间结果，就不能根据中间结果“临场判断”。所以 codemode 适合批量、过滤、链式这类模型能事先写清逻辑的任务；需要读完再想的任务，模型仍然会用普通工具调用。codemode 工具给模型的提示语也是这么写的：用它来批量独立调用、串联调用或过滤大输出（[tool.ts:108-113](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/extensions/codemode/tool.ts#L108-L113)）。
+
+### 3.8 其他细节
+
+- **store/load**：脚本可以用 `store(key, value)` 存小块 JSON，下次 codemode 调用用 `load(key)` 读回。写入以 `codemode-store` 自定义 entry 追加到会话（见上面代码中的 `appendEntry`），所以每个会话分支看到的是自己路径上的值。单个值上限 256 KB，总量 1 MB（[prelude-source.ts:34-35](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/prelude-source.ts#L34-L35)）。
+- **确定性模式**：`CodemodeSandboxBase.start()` 让脚本在虚拟时钟、固定随机种子、UTC 时区下运行，宿主可以在进程重启后重放脚本。这是给 pi-durable 用的，第 9 章再讲（[vm.ts:23-36](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/codemode/src/runtime/vm.ts#L23-L36)）。
+- **懒加载**：coding-agent 的 codemode 工具在第一次调用时才加载 worker 和 wasm（[tool.ts:388-390](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/extensions/codemode/tool.ts#L388-L390)）。
+- **原文输入**：codemode 工具声明了 `constrainedSampling` 语法，支持的模型可以直接输出 JavaScript 原文，而不是把代码转义成 JSON 字符串（[tool.ts:386-387](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/extensions/codemode/tool.ts#L386-L387)）。
+
+## 4. pi-telemetry：span 与 metric 的契约
+
+### 4.1 问题：遥测不能绑死在某个后端或运行时
+
+pi-ai 想记录“这次模型请求用了多久、多少 token、第一个 chunk 什么时候到”。但 pi-ai 是一个库：用户可能用 OpenTelemetry，可能用 Sentry，可能什么都不用；可能跑在 Node，也可能跑在 Cloudflare Workers。
+
+pi-telemetry 的回答是：只定义契约，不做实现。包里没有 exporter，没有全局状态，也不依赖任何后端。README 开头列出了这几点：
+
+| 提供 | 不提供 |
+|---|---|
+| 显式的、基于回调的 `TelemetryContext` / `TelemetrySpan` 契约 | exporter |
+| 共享的 `NOOP_TELEMETRY_CONTEXT` | 全局 current-span 状态 |
+| counter、up-down counter、histogram 与类型化 schema | 对任何遥测后端的依赖 |
+| 参考实现 `InMemoryTelemetryContext` | |
+
+先定义两个词。span 是一次操作的计时记录，有开始和结束，可以嵌套成树。metric 是聚合数值，比如计数器（counter）和直方图（histogram）。
+
+### 4.2 核心接口：startSpan 用回调包住工作
+
+```ts title="packages/telemetry/src/index.ts:97-110"
+/** Adapter contract for trusted typed inputs; malformed input behavior is unspecified. */
+export interface TelemetryContext {
+	/** Adapter capabilities remain available on child spans and extracted parents. */
+	readonly metrics?: TelemetryMetrics;
+	readonly propagation?: TelemetryPropagation;
+	startSpan<T>(options: SpanOptions, callback: (span: TelemetrySpan) => T | Promise<T>): Promise<T>;
+}
+
+export interface TelemetrySpan extends TelemetryContext {
+	addLink(link: SpanLink): void;
+	addEvent(name: string, attributes?: SpanAttributes): void;
+	setAttributes(attributes: SpanAttributes): void;
+	setStatus(status: SpanStatus): void;
+}
+```
+
+两个设计决定：
+
+1. **没有 `end()`**。span 的生命周期等于回调的生命周期：回调返回或 Promise settle 时 span 结束。调用者不可能忘记结束 span，也不会重复结束。
+2. **`TelemetrySpan` 继承 `TelemetryContext`**。span 本身就是子 span 的父上下文：在回调里调用 `span.startSpan(...)` 就得到一个子 span。
+
+这就是“context 显式传递”的含义：要建立父子关系，必须把父 span 当参数传下去。OpenTelemetry 在 Node 上通常用 `AsyncLocalStorage` 隐式记录“当前 span”，pi-telemetry 刻意不这么做。README 的说明是：
+
+> The package does not use `AsyncLocalStorage` or another runtime-specific ambient context API.
+
+（[README.md:519](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/telemetry/README.md?plain=1#L519)）
+
+`AsyncLocalStorage` 是 Node 特有的 API，在浏览器和部分 Workers 环境里没有或者行为不同。显式传递让同一份代码在所有运行时里行为一致，代价是调用者要多传一个参数。
+
+### 4.3 默认实现：noop
+
+没人提供遥测时用 noop。它直接调用回调，其他方法全是空函数：
+
+```ts title="packages/telemetry/src/noop.ts:4-37"
+async function startNoopSpan<T>(_options: SpanOptions, callback: (span: TelemetrySpan) => T | Promise<T>): Promise<T> {
+	return callback(noopTelemetrySpan);
+}
+
+const noopCounter: TelemetryCounter = Object.freeze({ add: () => {} });
+const noopUpDownCounter: TelemetryUpDownCounter = Object.freeze({ add: () => {} });
+const noopHistogram: TelemetryHistogram = Object.freeze({ record: () => {} });
+
+/** Shared instruments that never inspect or retain metadata, measurements, or contexts. */
+export const NOOP_TELEMETRY_METRICS: TelemetryMetrics = Object.freeze({
+	counter: () => noopCounter,
+	upDownCounter: () => noopUpDownCounter,
+	histogram: () => noopHistogram,
+});
+
+/** Shared propagation capability that neither inspects nor retains its inputs. */
+export const NOOP_TELEMETRY_PROPAGATION: TelemetryPropagation = Object.freeze({
+	inject: () => undefined,
+	extract: () => NOOP_TELEMETRY_CONTEXT,
+});
+
+const noopTelemetrySpan: TelemetrySpan = {
+	metrics: NOOP_TELEMETRY_METRICS,
+	propagation: NOOP_TELEMETRY_PROPAGATION,
+	startSpan: startNoopSpan,
+	addLink: () => {},
+	addEvent: () => {},
+	setAttributes: () => {},
+	setStatus: () => {},
+};
+Object.freeze(noopTelemetrySpan);
+
+/** Shared telemetry context used when an application does not provide one. */
+export const NOOP_TELEMETRY_CONTEXT: TelemetrySpan = noopTelemetrySpan;
+```
+
+有了 noop，埋点代码不需要到处写 `if (telemetry)`：没有传入时用 `options?.telemetry ?? NOOP_TELEMETRY_CONTEXT`，后面的代码照常调用。
+
+### 4.4 参考实现：span 何时结束
+
+`InMemoryTelemetryContext` 把 span 记在内存里，主要给测试用。它展示了“回调即生命周期”怎么实现：
+
+```ts title="packages/telemetry/src/memory.ts:230-246"
+	contextCarriers.set(span, recordedSpan.context);
+
+	try {
+		return await callback(span);
+	} catch (error) {
+		if (!recordedSpan.explicitStatus)
+			recordedSpan.status =
+				error instanceof Error
+					? { status: "error", error: { name: error.name, message: error.message } }
+					: { status: "error" };
+		throw error;
+	} finally {
+		recordedSpan.settled = true;
+		recordedSpan.endedMs = recordedSpan.startedMs + performance.now() - recordedSpan.clock;
+		recordedSpan.endSequence = state.nextEndSequence++;
+	}
+}
+```
+
+- 回调抛错 → 状态自动变为 `error`，除非调用者已经显式 `setStatus`。
+- `finally` 里标记 `settled`。之后再对这个 span 调 `addEvent`、`setAttributes`，都直接忽略（[memory.ts:206-227](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/telemetry/src/memory.ts#L206-L227) 每个方法开头都是 `if (recordedSpan.settled) return;`）。
+- 在一个已结束的 span 下再开子 span，会得到一个“惰性 span”，不记录任何东西（[memory.ts:188](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/telemetry/src/memory.ts#L188)）。
+
+后端适配器要满足同样的语义。`src/testing/conformance.ts` 提供了一套一致性测试，任何适配器都可以拿它来验证自己。
+
+### 4.5 类型化 schema：在编译期约束属性
+
+自由的 `setAttributes(record)` 容易写错名字、写错类型，或者不小心把 prompt 内容写进遥测。pi-telemetry 提供 `defineTelemetrySchema`：先用数据描述 span 和 metric，再从中推导出类型。pi-ai 的请求 span 是这样定义的：
+
+```ts title="packages/ai/src/telemetry.ts:22-61"
+const request = {
+	description: "One logical model request, including authentication and provider setup.",
+	parents: { kind: "any" },
+	startAttributes: {
+		provider,
+		api: { type: "string", description: "API identifier.", required: true },
+		model,
+		reasoning: { type: "string", description: "Scalar requested reasoning level.", required: false },
+	},
+	endAttributes: {
+		stop,
+		"usage.input": { type: "number", description: "Uncached input tokens." },
+		"usage.output": { type: "number", description: "Output tokens." },
+		"usage.cache_read": { type: "number", description: "Cache-read tokens." },
+		"usage.cache_write": { type: "number", description: "Cache-write tokens." },
+		"cost.total": { type: "number", description: "Total request cost in USD." },
+		"response.id": { type: "string", description: "Provider response identifier.", cardinality: "high" },
+	},
+	events: {
+		"pi.ai.first_chunk": { description: "First normalized stream event delivered.", attributes: {} },
+		"pi.ai.block": {
+			description: "A completed content block; content is never recorded.",
+			attributes: {
+				type: {
+					type: "string",
+					description: "Block kind.",
+					values: ["text", "thinking", "tool_call"],
+					required: true,
+				},
+				index: { type: "number", description: "Content block index.", required: true },
+				chars: { type: "number", description: "UTF-16 character count.", required: true },
+				tool: { type: "string", description: "Tool name, for tool-call blocks only.", required: false },
+			},
+		},
+	},
+	status: {
+		default: "ok",
+		errorWhen: "Stop reason is error: provider_error with at most 500 error-message characters. Aborted stays ok.",
+	},
+} as const;
+```
+
+注意 `pi.ai.block` 事件只记录块类型、序号和字符数，注释写明“content is never recorded”。schema 既是类型来源，也是一份可审查的数据策略文档。
+
+`createTypedSpanStarter` 把一个父 context 和若干 schema 绑定起来。运行时它只是转调 `startSpan`，类型上却只允许 schema 里声明过的 span 名和属性：
+
+```ts title="packages/telemetry/src/index.ts:427-457"
+function bindTypedSpanStarter<Schemas extends TelemetrySchemaTuple>(
+	telemetryContext: TelemetryContext,
+): TypedSpanStarter<Schemas> {
+	const startSpan = (
+		name: SpanNameInSchemas<Schemas>,
+		attributes: SpanAttributes,
+		callback: (
+			span: SpanInSchema<Schemas[number], SpanNameInSchemas<Schemas>>,
+			startChildSpan: TypedSpanStarter<Schemas>,
+		) => unknown,
+	): Promise<unknown> =>
+		telemetryContext.startSpan({ name, attributes }, (span) =>
+			callback(
+				span as SpanInSchema<Schemas[number], SpanNameInSchemas<Schemas>>,
+				bindTypedSpanStarter<Schemas>(span),
+			),
+		);
+
+	return startSpan as TypedSpanStarter<Schemas>;
+}
+
+/**
+ * Bind an explicit parent context to the combined span vocabulary of one or more schemas.
+ * Schema values are used only for type inference; no runtime schema validation is performed.
+ */
+export function createTypedSpanStarter<const Schemas extends TelemetrySchemaTuple>(
+	telemetryContext: TelemetryContext,
+	_schemas: Schemas & UniqueTelemetrySchemas<Schemas>,
+): TypedSpanStarter<Schemas> {
+	return bindTypedSpanStarter<Schemas>(telemetryContext);
+}
+```
+
+`_schemas` 参数在运行时完全没用到（下划线前缀），它只用于类型推导。回调的第二个参数 `startChildSpan` 已经绑定到当前 span 上，用它开的子 span 天然是当前 span 的孩子，这又是显式传递。
+
+metric 用同样的方式：`createTypedMetrics` 只在运行时把 schema 里的描述、单位传给适配器，类型层面约束名字和属性：
+
+```ts title="packages/telemetry/src/metrics.ts:129-145"
+export function createTypedMetrics<const Schemas extends MetricSchemas>(
+	metrics: TelemetryMetrics,
+	schemas: Schemas &
+		([DuplicateMetricNames<Schemas>] extends [never]
+			? unknown
+			: { readonly "duplicate telemetry metric names": DuplicateMetricNames<Schemas> }),
+): TypedTelemetryMetrics<Schemas> {
+	const definitions = new Map<string, TelemetryMetricDefinition>();
+	for (const schema of schemas) {
+		for (const [name, definition] of Object.entries(schema.metrics ?? {})) definitions.set(name, definition);
+	}
+	return {
+		counter: (name: string) => metrics.counter(name, definitions.get(name)),
+		upDownCounter: (name: string) => metrics.upDownCounter(name, definitions.get(name)),
+		histogram: (name: string) => metrics.histogram(name, definitions.get(name)),
+	} as unknown as TypedTelemetryMetrics<Schemas>;
+}
+```
+
+如果两个 schema 定义了同名 metric，`schemas` 参数的类型会变成一个带 `"duplicate telemetry metric names"` 字段的对象，调用处直接编译失败，错误信息里就是重复的名字。
+
+### 4.6 在 pi-ai 里的用法
+
+调用者把父 span 放进请求选项。字段注释写的就是“显式父 span”：
+
+```ts title="packages/ai/src/types.ts:160-163"
+export interface ProviderRequestOptions<TModel = Model<Api>> {
+	signal?: AbortSignal;
+	/** Explicit parent span for telemetry produced by this logical request. */
+	telemetry?: TelemetrySpan;
+```
+
+`observeModelRequest` 在每次 `stream`/`streamSimple` 时创建请求 span（[models.ts:917](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/models.ts#L917)、[models.ts:938](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/models.ts#L938)）。这里有个技巧：span 必须包住一个回调，而流式请求不是一个回调能包住的。解决办法是给回调一个“直到请求结束才 resolve”的 Promise：
+
+```ts title="packages/ai/src/telemetry.ts:121-153"
+export function observeModelRequest(
+	requestedModel: Model<Api>,
+	options: { telemetry?: TelemetrySpan; reasoning?: unknown } | undefined,
+	poll: boolean,
+): LazyStreamObserver {
+	const started = performance.now();
+	const attributes = { provider: requestedModel.provider, model: requestedModel.id };
+	const adapter = options?.telemetry?.metrics ?? NOOP_TELEMETRY_METRICS;
+	let instruments = instrumentCache.get(adapter);
+	if (!instruments) {
+		instruments = createInstruments(adapter);
+		instrumentCache.set(adapter, instruments);
+	}
+	const { requestDuration, firstChunkDuration, tokens, cost } = instruments;
+	let span!: RequestSpan;
+	let finish!: () => void;
+	let first = true;
+	const toolChars = new Map<number, number>();
+	const finished = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const run = (activeSpan: RequestSpan): Promise<void> => {
+		span = activeSpan;
+		return finished;
+	};
+	const startAttributes = {
+		...attributes,
+		api: requestedModel.api,
+		...(typeof options?.reasoning === "string" ? { reasoning: options.reasoning } : {}),
+	};
+	const start = createTypedSpanStarter(options?.telemetry ?? NOOP_TELEMETRY_CONTEXT, [AI_TELEMETRY_SCHEMA]);
+	if (poll) void start("pi.ai.poll", startAttributes, run);
+	else void start("pi.ai.request", startAttributes, run);
+```
+
+`run` 拿到 span 后返回 `finished`。之后流的每个事件调用 `onEvent`，往 span 上加事件；流结束调用 `onResult`，写结束属性、记 metric，然后 `finish()`，span 随之结束：
+
+```ts title="packages/ai/src/telemetry.ts:181-208"
+		onResult(message) {
+			if (message) {
+				span.setAttributes({
+					stop: message.stopReason,
+					"usage.input": message.usage.input,
+					"usage.output": message.usage.output,
+					"usage.cache_read": message.usage.cacheRead,
+					"usage.cache_write": message.usage.cacheWrite,
+					"cost.total": message.usage.cost.total,
+					"response.id": message.responseId,
+				});
+				if (message.stopReason === "error") {
+					span.setStatus({
+						status: "error",
+						error: { name: "provider_error", message: ownedSlice(message.errorMessage ?? "", 0, 500) },
+					});
+				}
+				requestDuration.record(performance.now() - started, { ...attributes, stop: message.stopReason }, span);
+				if (!poll || (message.stopReason !== "pending" && message.stopReason !== "deferred")) {
+					tokens.add(message.usage.input, { ...attributes, kind: "input" });
+					tokens.add(message.usage.output, { ...attributes, kind: "output" });
+					tokens.add(message.usage.cacheRead, { ...attributes, kind: "cache_read" });
+					tokens.add(message.usage.cacheWrite, { ...attributes, kind: "cache_write" });
+					cost.add(message.usage.cost.total, attributes);
+				}
+			}
+			finish();
+		},
+```
+
+`requestDuration.record(..., span)` 的第三个参数也是显式 context：适配器可以用它把这次测量和 span 关联（OpenTelemetry 里叫 exemplar）。
+
+还要注意：`instrumentCache` 是一个以适配器为键的 `WeakMap`，同一个适配器的 instrument 只创建一次，适配器被回收时缓存也跟着释放。
+
+目前 pi-ai、chord 和 pi-durable 用到了 pi-telemetry；pi-agent-core 和 coding-agent 的 `src` 里没有直接 import 它。
+
+## 小结
+
+- 三个小包都在依赖图的叶子上，不反向依赖上层，可以独立使用。
+- **pi-mcp**：传输只收发 JSON-RPC 消息；客户端用 `pending` 表按 `id` 配对请求，统一处理超时、取消通知和进度续期。握手是 `initialize` + `notifications/initialized`，带版本协商。工具列表按游标分页并防御异常服务器。只依赖 `cross-spawn`。
+- **pi-codemode**：脚本在 QuickJS wasm 实例里运行，唯一的宿主入口是闭包里的 `bridge`，参数和结果都以 JSON 字符串跨界。工具调用走“桩函数 → bridge → 宿主 execute → result → settle → drain”的往返。coding-agent 让嵌套调用走 `ctx.executeTool`，扩展钩子照常生效。
+- **codemode 省上下文**的原因：中间结果只在脚本变量里，返回给模型的只有脚本输出；多次调用合成一轮；输出有 token 上限。
+- **pi-telemetry**：`startSpan` 用回调界定 span 生命周期，没有 `end()`；span 就是子 span 的父上下文，必须显式传递，不用 `AsyncLocalStorage`；noop 让埋点代码无条件调用；schema 只用于类型推导和数据策略记录。
+
+## 动手验证
+
+1. 读 MCP 客户端测试 [packages/mcp/test/client.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/test/client.test.ts)，它用 `createInMemoryTransportPair` 搭假服务器。跟着一个用例走一遍 `connect → listTools → callTool`。在 `packages/mcp` 目录下运行：`node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/client.test.ts`。
+2. 写一个临时脚本（放在 `/tmp`），用 `new CodemodeSandbox({ tools: [{ name: "add", execute: ({ a, b }) => a + b }] })` 执行 `return await tools.add({ a: 1, b: 2 })`，打印 `result.value` 和 `result.calls`。再试 `await new Promise(() => {})`，观察 stalled 错误；再试 `while (true) {}` 配 `timeoutMs: 500`，观察 `kind: "timeout"`。
+3. 写一个临时脚本：创建 `InMemoryTelemetryContext`，用 `startSpan` 开一个父 span，在回调里用 `span.startSpan` 开两个子 span，其中一个抛错。结束后用 `findTraces()` 取出 trace，再用 `@earendil-works/pi-telemetry/render` 的 `renderTrace(trace.spans)` 打印成树，确认父子关系和自动设置的 error 状态。再读 [packages/ai/test](https://github.com/earendil-works/pi/tree/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/test) 里搜索 `AI_TELEMETRY_SCHEMA` 或 `pi.ai.request` 的测试，看请求 span 的断言。
+4. 读 [packages/coding-agent/test/suite/agent-session-codemode.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/test/suite/agent-session-codemode.test.ts) 和 [agent-session-mcp.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/test/suite/agent-session-mcp.test.ts)，看这两个包接入 AgentSession 后的行为是怎么被测试的。

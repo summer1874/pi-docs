@@ -1,0 +1,418 @@
+---
+title: 第 0 章　先当用户用起来
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 0 章　先当用户用起来
+
+## 导读
+
+<Say id="k00-01">读源码之前，先把 pi 当成一个普通工具用一遍。</Say>
+<Say id="k00-02">pi 是一个编码 agent 的骨架：调用模型、执行工具、保存会话。</Say>
+<Say id="k00-03">这一章用 pi-test.sh 从源码启动它，不需要先构建。</Say>
+<Say id="k00-04">然后亲手试四样东西：会话树、compaction、steer 和 follow-up。</Say>
+<Say id="k00-05">它们在后面的章节里都会拆开讲，这里只看用户能感受到的效果。</Say>
+<Say id="k00-06">每个功能我们都标出源码入口，方便你以后顺着找过去。</Say>
+<Say id="k00-07">读完你应该能说清：会话为什么是一棵树，插话和排队有什么区别。</Say>
+
+## 1. pi 是什么
+
+pi 自称 “minimal, extensible agent harness”。harness 在这里指一个“驾驭模型的外壳”：它本身不提供智能，只负责把模型、工具、上下文和会话记录串起来。它刻意不内置 sub-agent、plan mode 和权限系统，README 的原话是 “skips features like sub-agents and plan mode”，这些交给扩展去做。
+
+[how-pi-works.md](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/docs/how-pi-works.md) 用不到 50 行讲完了整体原理，读一遍就能对上后面所有章节。归纳成四件事：
+
+| 概念 | how-pi-works 里的说法 | 后续章节 |
+| --- | --- | --- |
+| Agent 循环 | 提交的消息加入活动分支；模型流式回复文本和工具调用；执行工具、记录结果，构成一个 turn；还有工具结果或排队消息就再来一个 turn | 第 2 章 |
+| 上下文 | 活动分支提供对话历史；系统提示由基础指令和发现的上下文文件组成；请求还带上工具定义和 skill 描述 | 第 3、5 章 |
+| 会话 | 会话是 JSONL 文件，每条 entry 有 ID 并指向父节点；从旧 entry 继续就是在同一个文件里开新分支 | 第 5 章 |
+| 界面 | 交互模式、print 模式、JSON 模式、RPC 模式和 SDK 共用同一套 agent 与会话机制 | 第 7 章 |
+
+pi 是一个 TypeScript monorepo。和本章相关的包有三个，从下往上依次是：
+
+| 包 | 目录 | 职责 |
+| --- | --- | --- |
+| `pi-ai` | `packages/ai` | 统一各家 LLM 的消息格式和流式事件 |
+| `pi-agent-core` | `packages/agent` | agent 循环：调用模型、执行工具、处理 steer 与 follow-up 队列 |
+| `pi-coding-agent` | `packages/coding-agent` | `pi` 命令本身：会话文件、compaction、内置工具、扩展、TUI |
+
+本章提到的四个功能，用户层面都在 `pi-coding-agent` 里触发，但真正的机制分布在三层里。下面每一节先说“你会看到什么”，再说“源码从哪里进去”。
+
+## 2. 从源码运行
+
+### 2.1 一条命令启动
+
+README 给出的开发流程是：
+
+```bash
+git clone https://github.com/earendil-works/pi
+cd pi
+npm install --ignore-scripts
+./pi-test.sh
+```
+
+`pi-test.sh` 可以在任何目录下调用，它会保留调用者的工作目录，所以你可以 `cd` 到一个练习用的项目里再执行 `/path/to/pi/pi-test.sh`。脚本的最后三行是关键：
+
+```bash title="pi-test.sh:83-85"
+# --import takes a module specifier, so pass the resolver as a file URL (raw paths break on #, ?, %).
+RESOLVER_URL="$(node -p 'require("node:url").pathToFileURL(process.argv[1]).href' "$SCRIPT_DIR/packages/coding-agent/src/experimental/source-resolver.ts")"
+node --import "$RESOLVER_URL" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${ARGS[@]+"${ARGS[@]}"}
+```
+
+这里没有任何构建步骤，直接用 `node` 运行 `.ts` 源文件。能这样做有两个前提：
+
+1. **Node 原生剥离类型**。pi 要求 Node.js 22.19 或更新版本，这些版本可以直接执行 TypeScript，但只支持“可擦除”的语法，也就是删掉类型标注后剩下的就是合法 JavaScript。这就是仓库规定不能用 `enum`、参数属性、`namespace` 的原因（第 10 章细讲）。
+2. **source-resolver 把包名映射到源码**。各包之间用 `@earendil-works/pi-ai` 这样的包名互相 import。正常安装时，包名会解析到 `node_modules` 里构建好的 `dist/`。从源码运行时我们希望它解析到 `src/`，这就是 [source-resolver.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/experimental/source-resolver.ts) 做的事：
+
+```ts title="packages/coding-agent/src/experimental/source-resolver.ts:6-8"
+// Node strips TypeScript natively, but it does not apply the workspace source
+// aliases from tsconfig.json. Internal source processes preload this resolver so
+// they cannot silently fall through to stale package dist files.
+```
+
+```ts title="packages/coding-agent/src/experimental/source-resolver.ts:45-56"
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		let matchedPattern: string | undefined;
+		for (const alias of aliases) {
+			const wildcard = matchAlias(alias, specifier);
+			if (wildcard === undefined) continue;
+			matchedPattern ??= alias.pattern;
+			for (const replacement of alias.replacements) {
+				const resolved = resolveSourcePath(replacement.replace("*", wildcard));
+				if (resolved) return { url: pathToFileURL(resolved).href, shortCircuit: true };
+			}
+		}
+```
+
+它读取根目录 `tsconfig.json` 的 `compilerOptions.paths`（例如 `"@earendil-works/pi-ai": ["./packages/ai/src/index.ts"]`），用 Node 的 `registerHooks` 在模块解析阶段把包名改写成源码路径。注释里那句 “cannot silently fall through to stale package dist files” 说明了动机：如果某个包名没被改写，就会悄悄加载一份过期的 `dist/`，改了源码却看不到效果，这种问题很难查。所以匹配上别名却找不到文件时，它直接抛错，而不是回退到 `nextResolve`。
+
+一个容易踩的坑：`packages/ai/src/providers/*.models.ts` 会 import `./data/*.json` 模型数据，而 `providers/data/` 是 gitignore 的，新克隆的仓库里没有。第一次从源码运行前，需要先生成这份数据，根目录提供了脚本 `npm run hydrate:model-data`（它执行 `generate-models.ts --strict --data-only`，需要联网）。
+
+`--no-env` 是脚本自己处理的参数：它会 `unset` 一长串 API key 环境变量，模拟“没有配置任何凭据”的新用户。
+
+### 2.2 入口和三种模式
+
+`cli.ts` 只有 6 行：
+
+```ts title="packages/coding-agent/src/cli.ts:1-6"
+#!/usr/bin/env node
+import { setupCli } from "./cli/setup.ts";
+import { main } from "./main.ts";
+
+setupCli();
+main(process.argv.slice(2));
+```
+
+`main.ts` 解析参数后决定进入哪种模式。末尾的分发很直白：
+
+```ts title="packages/coding-agent/src/main.ts:950-954"
+	if (appMode === "rpc") {
+		printTimings();
+		await runRpcMode(runtime);
+	} else if (appMode === "interactive") {
+		const interactiveMode = new InteractiveMode(runtime, {
+```
+
+不带参数运行就是交互模式（TUI）。`pi -p "问题"` 是 print 模式，跑完一次就退出；`--mode json` 输出 JSONL 事件；`--mode rpc` 从 stdin 读 JSONL 命令。三种模式拿到的是同一个 `runtime`，这印证了 how-pi-works 里 “All interfaces use the same agent and session mechanisms”。启动链路的细节在第 3 章。
+
+## 3. 会话树与 `/tree`
+
+### 3.1 用户看到什么
+
+试这样一个场景：
+
+1. 问 pi：“用 Python 写一个读取 CSV 的函数。”它写完了。
+2. 继续：“改成用 pandas。”它也改完了。
+3. 你后悔了，想回到第 1 步，换成“用 Go 写”。
+
+输入 `/tree`，会弹出一个树形选择器，列出会话里的每条消息。选中第 1 步那条用户消息，pi 会问你是否给要离开的分支生成摘要（“No summary / Summarize / Summarize with custom prompt”）。选完后，第 1 步的原文会被放回编辑器，你改成“用 Go 写”再提交，就从第 1 步之前长出了一个新分支。
+
+关键在于：**第 2 步的 pandas 版本没有被删除**。再次打开 `/tree`，两条分支都在，你可以随时跳回去。文档 [sessions.md](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/docs/sessions.md) 对选中不同节点的行为说得很清楚：选用户消息，文本放回编辑器，编辑后提交形成新分支；选助手回复或其他 entry，则从那条 entry 之后继续，编辑器为空。
+
+和它相近的还有两个命令：`/fork` 从某条用户消息新建一个会话文件，`/clone` 把当前活动分支复制成新会话。`/tree` 是唯一一个“在同一个文件里移动”的。
+
+### 3.2 为什么是一棵树
+
+会话文件存在 `~/.pi/agent/sessions/` 下，按工作目录分组，每行一条 JSON（JSONL）。每条 entry 都有 `id` 和 `parentId`：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:57-62"
+export interface SessionEntryBase {
+	type: string;
+	id: string;
+	parentId: string | null;
+	timestamp: string;
+}
+```
+
+`SessionManager` 额外维护一个“叶子指针”`leafId`，表示当前位置。新 entry 总是作为当前叶子的子节点追加。所谓“活动分支”，就是从叶子沿 `parentId` 一路走回根：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1479-1490"
+	getBranch(fromId?: string): SessionEntry[] {
+		const path: SessionEntry[] = [];
+		const startId = fromId ?? this.leafId;
+		let current = startId ? this.byId.get(startId) : undefined;
+		while (current) {
+			path.push(current);
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
+		path.reverse();
+		return path;
+	}
+```
+
+而“跳到树上另一个位置”只是挪一下叶子指针，不改任何已有 entry：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1589-1594"
+	branch(branchFromId: string): void {
+		if (!this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		this.leafId = branchFromId;
+	}
+```
+
+用上面的例子画出来（`u` 是用户消息，`a` 是助手回复）：
+
+```text
+P ─ u1 ─ a1 ─ u2(pandas) ─ a2
+ └─ u1'(Go) ─ a1'               ← 叶子
+```
+
+`P` 是 `u1` 的父节点。选中 `u1` 时，叶子被设成 `P`，新提交的 `u1'` 就成了 `P` 的第二个子节点。如果 `u1` 本身就是根（`parentId` 为 `null`），叶子会被 `resetLeaf()` 置空，`u1'` 成为另一个根。无论哪种情况，模型都只看到从 `a1'` 走回根的活动分支，看不到 pandas 那条。
+
+### 3.3 源码入口
+
+`/tree` 在交互模式的输入处理里被识别：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3245-3248"
+			if (text === "/tree") {
+				this.showTreeSelector();
+				this.editor.setText("");
+				return;
+```
+
+`showTreeSelector()`（[interactive-mode.ts:5560](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L5560)）渲染树并询问是否摘要，选定后调用 `AgentSession.navigateTree()`（[agent-session.ts:4024](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L4024)）。后者决定新叶子落在哪里，正好对应 3.1 里描述的两种行为：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:4152-4163"
+			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+				// User message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.message.content, "");
+			} else if (targetEntry.type === "custom_message") {
+				// Custom message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.content, "");
+			} else {
+				// Non-user message: leaf = selected node
+				newLeafId = targetId;
+			}
+```
+
+注意 `navigateTree` 开头会拒绝在模型输出或 compaction 进行时导航（“Wait for the current response to finish before navigating the session tree.”）。分支摘要（branch summarization）和会话树投影的细节在第 5 章。
+
+## 4. Compaction
+
+### 4.1 用户看到什么
+
+compaction（压缩）是指：上下文太长时，把较早的消息交给模型总结成一段摘要，之后的请求用“摘要 + 最近的消息”代替完整历史。
+
+你会在两种情况下遇到它：
+
+- **自动**：底部状态栏显示上下文占用。当占用逼近模型上限时，pi 自动压缩，界面上能看到压缩开始和结束的提示。
+- **手动**：输入 `/compact`，或 `/compact 重点保留数据库迁移的讨论`，后面的文字会作为额外指令影响摘要内容。
+
+压缩不删除任何东西。原始 entry 都还在会话文件里，用 `/tree` 依然能看到，只是不再发给模型。
+
+### 4.2 什么时候触发
+
+默认参数和判断函数都很短：
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:126-130"
+export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+	enabled: true,
+	reserveTokens: 16384,
+	keepRecentTokens: 20000,
+};
+```
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:267-270"
+export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+	if (!settings.enabled) return false;
+	return contextTokens > contextWindow - settings.reserveTokens;
+}
+```
+
+举个数字：模型窗口 200000 token，`reserveTokens` 16384，那么上下文超过 183616 token 就触发。`keepRecentTokens` 决定保留多少最近的消息不压缩，默认约 2 万 token。这两个值都能在 `~/.pi/agent/settings.json` 或项目的 `.pi/settings.json` 里改。
+
+### 4.3 结果是一条新 entry
+
+压缩的产物是一条 `compaction` 类型的 entry，追加在当前叶子之后：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:91-97"
+export interface CompactionEntry<T = unknown> extends SessionEntryBase {
+	type: "compaction";
+	summary: string;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
+	details?: T;
+```
+
+`firstKeptEntryId` 标出“从哪条开始原样保留”。之后重建上下文时，模型看到的是：系统提示、摘要、从 `firstKeptEntryId` 开始的消息。旧消息还在树上，只是被这条 entry “遮住”了。这又一次体现了会话的 append-only（只追加）设计：所有变化都是追加新 entry，从不改写旧 entry。
+
+### 4.4 源码入口
+
+- 手动：交互模式识别 `/compact`（[interactive-mode.ts:3271-3276](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3271-L3276)），调用 `AgentSession.compact()`（[agent-session.ts:2828](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L2828)）。
+- 自动：`AgentSession._checkCompaction()`（[agent-session.ts:3011](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L3011)），以及 agent 循环两次 turn 之间的 `prepareNextTurn` 钩子。
+- 算法本身：`packages/coding-agent/src/core/compaction/` 下的 `findCutPoint`、`prepareCompaction`、`compact`。
+
+`compact()` 一开头就会中止正在进行的模型输出：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2828-2832"
+	async compact(customInstructions?: string): Promise<CompactionResult> {
+		await this.abort();
+		this._compactionAbortController = new AbortController();
+		this._emit({ type: "compaction_start", reason: "manual" });
+		let fromExtension = false;
+```
+
+切点怎么选、摘要提示词怎么写、为什么切点只落在 user 或 assistant 消息上，都在第 5 章。
+
+## 5. steer 与 follow-up
+
+### 5.1 用户看到什么
+
+pi 在干活时（模型正在输出或工具正在执行），编辑器仍然可以输入。按什么键提交，决定了这条消息什么时候生效：
+
+| 你想做的 | 按键 | 效果 |
+| --- | --- | --- |
+| 调整当前任务（steer） | `Enter` | 等当前这次回复和它的工具调用全部执行完，在下一次请求模型前注入 |
+| 排队后续工作（follow-up） | `Alt+Enter` | 等 agent 把手头的事全部做完、本来要停下时，才作为新输入发出 |
+| 把排队的消息拿回编辑器 | `Alt+Up` | 清空两个队列，文本合并回编辑器 |
+| 停止当前任务 | `Escape` | 中止运行，排队消息退回编辑器 |
+
+用一个例子感受区别。让 pi “给项目里所有 Python 文件加类型标注”，它开始一个一个文件地读和改。
+
+- 这时按 `Enter` 发“跳过 tests 目录”。当前这一轮的工具调用跑完后，这句话马上进入上下文，下一次模型回复就会照做。这是 **steer**：中途纠偏。
+- 如果按 `Alt+Enter` 发“做完后跑一下 mypy”。pi 会把加类型标注的事全部做完，原本要结束时才处理这条。这是 **follow-up**：排在最后。
+
+排队中的消息会以灰色的 `Steering: ...` 或 `Follow-up: ...` 显示在编辑器上方。Windows 上快捷键不同（follow-up 是 `Ctrl+Q`，取回是 `Alt+Q`），这些默认值定义在 [keybindings.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/keybindings.ts#L67-L74)：
+
+```ts title="packages/coding-agent/src/core/keybindings.ts:67-74"
+	"app.message.followUp": {
+		defaultKeys: windowsKeybindings ? "ctrl+q" : "alt+enter",
+		description: "Queue follow-up message",
+	},
+	"app.message.dequeue": {
+		defaultKeys: windowsKeybindings ? "alt+q" : "alt+up",
+		description: "Restore queued messages",
+	},
+```
+
+### 5.2 源码入口：从按键到队列
+
+**第一站：交互模式**。普通 `Enter` 提交时，如果 session 正在流式输出，就带上 `streamingBehavior: "steer"`：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3338-3347"
+			// If streaming, use prompt() with steer behavior
+			// This handles extension commands (execute immediately), prompt template expansion, and queueing
+			if (this.session.isStreaming) {
+				this.editor.addToHistory?.(text);
+				this.editor.setText("");
+				await this.session.prompt(text, { streamingBehavior: "steer" });
+				this.updatePendingMessagesDisplay();
+				this.ui.requestRender();
+				return;
+			}
+```
+
+`Alt+Enter` 走 `handleFollowUp()`（[interactive-mode.ts:4472](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L4472)），区别只是 `streamingBehavior: "followUp"`。不在流式输出时，`Alt+Enter` 等同于 `Enter`。
+
+**第二站：AgentSession**。`prompt()` 发现正在流式输出，就按 `streamingBehavior` 分流：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2136-2150"
+		// If streaming, queue via steer() or followUp() based on option
+		if (this.isStreaming) {
+			if (!options?.streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
+			}
+			if (options.streamingBehavior === "followUp") {
+				await this._queueFollowUp(expandedText, currentImages);
+			} else {
+				await this._queueSteer(expandedText, currentImages);
+			}
+			preflightResult?.("queued");
+			return;
+		}
+```
+
+`_queueSteer` 把文本包成一条 user 消息，交给底层 `Agent`：`this.agent.steer({ role: "user", content, timestamp: Date.now() })`（[agent-session.ts:2302-2314](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L2302-L2314)）。
+
+**第三站：Agent 的两个队列**。
+
+```ts title="packages/agent/src/agent.ts:307-315"
+	/** Queue a message to be injected after the current assistant turn finishes. */
+	steer(message: AgentMessage): void {
+		this.steeringQueue.enqueue(message);
+	}
+
+	/** Queue a message to run only after the agent would otherwise stop. */
+	followUp(message: AgentMessage): void {
+		this.followUpQueue.enqueue(message);
+	}
+```
+
+两条注释就是两者的定义：steer 在“当前 assistant turn 结束后”注入，follow-up 只在 agent“本来要停下”时才运行。
+
+**第四站：agent 循环何时取队列**。这是两者行为不同的根本原因。`runLoop` 是双层循环，steering 队列在内层每个 turn 结束时读取，follow-up 队列只在内层循环退出后读取：
+
+```ts title="packages/agent/src/agent-loop.ts:303-317"
+			explicitContinuation = decision?.action === "continue";
+			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (hasMoreToolCalls || pendingMessages.length > 0) {
+				explicitContinuation = false;
+			}
+		}
+
+		// Agent would stop here. Check for follow-up messages.
+		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		if (followUpMessages.length > 0) {
+			// Set as pending so inner loop processes them
+			explicitContinuation = false;
+			pendingMessages = followUpMessages;
+			continue;
+		}
+```
+
+套到前面的例子：每处理完一个文件（一个 turn），第 304 行就检查一次 steering 队列，“跳过 tests 目录”在这里被取出，下一轮请求模型前写进上下文。“跑一下 mypy”则要等内层循环因为没有工具调用、也没有 steering 消息而退出，到第 311 行才被取出，然后 `continue` 让外层循环再跑一遍。
+
+还有一个细节：两个队列默认都是 `one-at-a-time` 模式（[settings-defaults.ts:7-8](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/settings-defaults.ts#L7-L8)），每次只取出一条。连发三条 steer，会分三个 turn 依次注入。设成 `all` 则一次取完。`runLoop` 的完整结构在第 2 章逐行讲。
+
+## 6. 源码入口速查
+
+| 功能 | 用户操作 | 交互层入口 | 会话层 | 底层机制 |
+| --- | --- | --- | --- | --- |
+| 从源码运行 | `./pi-test.sh` | `cli.ts` → `main.ts` | — | `source-resolver.ts` 改写包名 |
+| 会话树 | `/tree` | `showTreeSelector()` | `AgentSession.navigateTree()` | `SessionManager.branch()` / `getBranch()` |
+| Compaction | `/compact`、自动 | `handleCompactCommand()` | `AgentSession.compact()` / `_checkCompaction()` | `core/compaction/compaction.ts` |
+| steer | 流式中按 `Enter` | 输入提交处理 | `AgentSession.prompt()` → `_queueSteer()` | `Agent.steer()`，`runLoop` 内层取队列 |
+| follow-up | 流式中按 `Alt+Enter` | `handleFollowUp()` | `AgentSession.prompt()` → `_queueFollowUp()` | `Agent.followUp()`，`runLoop` 外层取队列 |
+
+## 小结
+
+- pi 是一个 agent harness：自己不提供智能，负责把模型、工具、上下文和会话串起来；sub-agent、plan mode、权限系统都留给扩展。
+- `pi-test.sh` 用 Node 原生的类型剥离直接运行 `.ts`，再用 `source-resolver.ts` 把 `@earendil-works/*` 包名改写到 `src/`，所以不用构建。首次运行前要生成 gitignore 的模型数据。
+- 会话是 JSONL 文件里由 `id / parentId` 连成的树。`/tree` 只挪动叶子指针，旧分支保留不动；模型只看到从叶子走回根的活动分支。
+- compaction 追加一条带摘要和 `firstKeptEntryId` 的 entry，后续请求用“摘要 + 最近消息”代替旧历史，原始 entry 不删。
+- steer 和 follow-up 是 `Agent` 上的两个队列。区别在 `runLoop` 读取它们的时机：steering 在每个 turn 结束时读，follow-up 在 agent 本来要停下时才读。
+
+## 动手验证
+
+1. **观察会话文件**。用 `./pi-test.sh` 聊两句，然后输入 `/session` 查看会话文件路径。用 `tail -n 5` 看最后几行，确认每行都有 `id` 和 `parentId`，并且后一条的 `parentId` 等于前一条的 `id`。
+2. **造一个分支**。按 3.1 的步骤，用 `/tree` 回到第一条消息改写后重新提交。再看会话文件：会出现两条 `parentId` 相同的 entry，这就是分叉点。
+3. **对比 steer 和 follow-up**。让 pi 做一件需要多次工具调用的事（比如“逐个读取 src 下的文件并总结”）。运行中分别用 `Enter` 和 `Alt+Enter` 发消息，观察编辑器上方的 `Steering:` / `Follow-up:` 提示，以及它们各自在对话里出现的位置。
+4. **读一个测试**。`packages/agent/test/agent-loop.test.ts` 和 `agent.test.ts` 里都有 follow-up 与 steering 的用例（`grep -n "followUp\|steer" packages/agent/test/agent-loop.test.ts`），看测试如何断言两种消息的注入时机。只跑这一个文件：在 `packages/agent` 下执行 `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/agent-loop.test.ts`。

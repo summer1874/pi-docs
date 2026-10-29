@@ -1,0 +1,318 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "一次 streamSimple：从统一请求到统一事件",
+    "locale": "zh-CN",
+    "output": "docs/public/diagrams/stream.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "git@github.com:earendil-works/pi.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "44f6851b7f27ad5c18ccc94f6b4321650e757e3e"
+    }
+  },
+  "lanes": [
+    {
+      "id": "caller",
+      "label": "调用方"
+    },
+    {
+      "id": "core",
+      "label": "pi-ai 核心"
+    },
+    {
+      "id": "api",
+      "label": "协议实现 api/"
+    },
+    {
+      "id": "net",
+      "label": "Anthropic 服务"
+    }
+  ],
+  "mainPath": [
+    "call",
+    "norm",
+    "auth",
+    "dispatch",
+    "lazy",
+    "build",
+    "http",
+    "map",
+    "forward",
+    "consume"
+  ],
+  "nodes": [
+    {
+      "id": "call",
+      "lane": "caller",
+      "col": 0,
+      "type": "external",
+      "label": "streamSimple()",
+      "sublabel": "model + Context",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 406,
+          "end_line": 417,
+          "label": "agent 调用流函数"
+        }
+      ]
+    },
+    {
+      "id": "norm",
+      "lane": "core",
+      "col": 1,
+      "type": "backend",
+      "label": "normalizeContext",
+      "sublabel": "折叠成 system 消息",
+      "sources": [
+        {
+          "path": "packages/ai/src/models.ts",
+          "line": 929,
+          "end_line": 940,
+          "label": "Models.streamSimple"
+        },
+        {
+          "path": "packages/ai/src/utils/transcript.ts",
+          "line": 30,
+          "end_line": 34,
+          "label": "normalizeContext"
+        }
+      ]
+    },
+    {
+      "id": "auth",
+      "lane": "core",
+      "col": 2,
+      "type": "security",
+      "label": "applyAuth",
+      "sublabel": "凭据 / 环境变量",
+      "sources": [
+        {
+          "path": "packages/ai/src/models.ts",
+          "line": 856,
+          "end_line": 899,
+          "label": "applyAuth"
+        },
+        {
+          "path": "packages/ai/src/auth/resolve.ts",
+          "line": 46,
+          "end_line": 93,
+          "label": "resolveProviderAuth"
+        }
+      ]
+    },
+    {
+      "id": "dispatch",
+      "lane": "core",
+      "col": 3,
+      "type": "backend",
+      "label": "Provider 分发",
+      "sublabel": "按 model.api 选实现",
+      "sources": [
+        {
+          "path": "packages/ai/src/models.ts",
+          "line": 1106,
+          "end_line": 1119,
+          "label": "apiFor / dispatch"
+        }
+      ]
+    },
+    {
+      "id": "lazy",
+      "lane": "api",
+      "col": 3,
+      "type": "messagebus",
+      "label": "lazyApi",
+      "sublabel": "首次调用才 import",
+      "sources": [
+        {
+          "path": "packages/ai/src/api/lazy.ts",
+          "line": 98,
+          "end_line": 104,
+          "label": "lazyApi"
+        },
+        {
+          "path": "packages/ai/src/api/anthropic-messages.lazy.ts",
+          "line": 4,
+          "label": "动态 import"
+        }
+      ]
+    },
+    {
+      "id": "build",
+      "lane": "api",
+      "col": 4,
+      "type": "backend",
+      "label": "buildParams",
+      "sublabel": "统一消息转协议请求",
+      "sources": [
+        {
+          "path": "packages/ai/src/api/anthropic-messages.ts",
+          "line": 954,
+          "end_line": 1002,
+          "label": "streamSimple"
+        },
+        {
+          "path": "packages/ai/src/api/anthropic-messages.ts",
+          "line": 1153,
+          "end_line": 1327,
+          "label": "buildParams"
+        }
+      ]
+    },
+    {
+      "id": "http",
+      "lane": "net",
+      "col": 4,
+      "type": "cloud",
+      "label": "Messages API",
+      "sublabel": "POST，SSE 回流",
+      "sources": [
+        {
+          "path": "packages/ai/src/api/anthropic-messages.ts",
+          "line": 651,
+          "end_line": 669,
+          "label": "SDK 发请求"
+        }
+      ]
+    },
+    {
+      "id": "map",
+      "lane": "api",
+      "col": 5,
+      "type": "backend",
+      "label": "SSE 转统一事件",
+      "sublabel": "text / thinking / toolcall",
+      "sources": [
+        {
+          "path": "packages/ai/src/api/anthropic-messages.ts",
+          "line": 477,
+          "end_line": 575,
+          "label": "解析 SSE"
+        },
+        {
+          "path": "packages/ai/src/api/anthropic-messages.ts",
+          "line": 702,
+          "end_line": 890,
+          "label": "映射事件"
+        }
+      ]
+    },
+    {
+      "id": "forward",
+      "lane": "core",
+      "col": 5,
+      "type": "messagebus",
+      "label": "外层事件流",
+      "sublabel": "forwardStream 转发",
+      "sources": [
+        {
+          "path": "packages/ai/src/api/lazy.ts",
+          "line": 37,
+          "end_line": 86,
+          "label": "lazyStream"
+        },
+        {
+          "path": "packages/ai/src/utils/event-stream.ts",
+          "line": 43,
+          "end_line": 88,
+          "label": "EventStream"
+        }
+      ]
+    },
+    {
+      "id": "consume",
+      "lane": "caller",
+      "col": 5,
+      "type": "external",
+      "label": "for await 事件",
+      "sublabel": "再 result() 取消息",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 424,
+          "end_line": 460,
+          "label": "消费事件"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-call",
+      "from": "call",
+      "to": "norm",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-norm",
+      "from": "norm",
+      "to": "auth"
+    },
+    {
+      "id": "e-auth",
+      "from": "auth",
+      "to": "dispatch"
+    },
+    {
+      "id": "e-dispatch",
+      "from": "dispatch",
+      "to": "lazy"
+    },
+    {
+      "id": "e-lazy",
+      "from": "lazy",
+      "to": "build"
+    },
+    {
+      "id": "e-build",
+      "from": "build",
+      "to": "http",
+      "label": "HTTP",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-http",
+      "from": "http",
+      "to": "map",
+      "label": "SSE",
+      "variant": "dashed"
+    },
+    {
+      "id": "e-map",
+      "from": "map",
+      "to": "forward",
+      "label": "push"
+    },
+    {
+      "id": "e-forward",
+      "from": "forward",
+      "to": "consume",
+      "label": "事件",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "同步返回，异步准备",
+      "items": [
+        "streamSimple 立刻返回一个空的事件流",
+        "鉴权、加载模块、发请求都在流的背后进行",
+        "准备阶段出错也变成一条 error 事件"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "流套流",
+      "items": [
+        "协议实现创建最内层流并 push 事件",
+        "lazyApi 和 Models 各包一层 lazyStream",
+        "调用方只看到最外层流"
+      ]
+    }
+  ]
+}

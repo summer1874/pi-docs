@@ -38,6 +38,31 @@ LEXICON = {
     "agent_end": "agent end",
     "follow-up": "follow up",
     "JSONL": "JSON L",
+    "AgentSessionRuntime": "Agent Session Runtime",
+    "pi-mcp": "派 M C P",
+    "pi-codemode": "派 code mode",
+    "pi-telemetry": "派 telemetry",
+    "pi-durable": "派 durable",
+    "pi-env": "派 env",
+    "pi-test.sh": "派 test 点 S H",
+    "test.sh": "test 点 S H",
+    "cli.ts": "cli 点 T S",
+    "packages/evals": "packages 下的 evals",
+    "message_end": "message end",
+    "session.prompt": "session 点 prompt",
+    "JSON-RPC": "JSON RPC",
+    "cross-spawn": "cross spawn",
+    "convertToLlm": "convert to LLM",
+    "transformContext": "transform context",
+    "beforeToolCall": "before tool call",
+    "afterToolCall": "after tool call",
+    "streamFn": "stream FN",
+    "buildSessionContext": "build session context",
+    "parentId": "parent ID",
+    "ExtensionAPI": "Extension API",
+    "ExtensionRunner": "Extension Runner",
+    "AgentMessage": "Agent Message",
+    "ToolDefinition": "Tool Definition",
 }
 SAY = re.compile(r'<Say\s+id="([^"]+)"[^>]*>(.*?)</Say>', re.S)
 
@@ -58,13 +83,20 @@ def spoken(text):
     return re.sub(r"\bpi\b", "派", text)
 
 
-def pages():
-    """Page routes in sidebar order, with their narrated lines."""
-    order = json.loads((DOCS / "_meta.json").read_text())
+def pages(directory=DOCS, prefix=""):
+    """Page routes in sidebar order, with their narrated lines; follows dir entries in _meta.json."""
     out = []
-    for name in order:
-        src = (DOCS / f"{name}.mdx").read_text()
-        route = "/" if name == "index" else f"/{name}"
+    for item in json.loads((directory / "_meta.json").read_text()):
+        if isinstance(item, str):
+            item = {"type": "file", "name": item}
+        if item["type"] in ("dir", "dir-section-header"):
+            out += pages(directory / item["name"], f"{prefix}/{item['name']}")
+            continue
+        if item["type"] != "file":
+            continue
+        name = item["name"]
+        src = (directory / f"{name}.mdx").read_text()
+        route = f"{prefix}/" if name == "index" else f"{prefix}/{name}"
         out.append((route, [(m.group(1), " ".join(m.group(2).split())) for m in SAY.finditer(src)]))
     return out
 

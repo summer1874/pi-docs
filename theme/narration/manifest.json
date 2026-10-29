@@ -3,7 +3,19 @@
   "/",
   "/pi-ai",
   "/agent-loop",
-  "/one-input"
+  "/one-input",
+  "/chapters/ch00-start",
+  "/chapters/ch01-pi-ai",
+  "/chapters/ch02-agent-core",
+  "/chapters/ch03-coding-agent",
+  "/chapters/ch04-tools",
+  "/chapters/ch05-session",
+  "/chapters/ch06-extensions",
+  "/chapters/ch07-ui",
+  "/chapters/ch08-small-packages",
+  "/chapters/ch09-experimental",
+  "/chapters/ch10-engineering",
+  "/chapters/appendix-principles"
  ],
  "lines": {
   "a01": {
@@ -213,6 +225,378 @@
   "d14": {
    "duration": 7.395563,
    "hash": "6c84904f2262"
+  },
+  "k00-01": {
+   "duration": 3.935813,
+   "hash": "23f91146f734"
+  },
+  "k00-02": {
+   "duration": 5.154844,
+   "hash": "6ddd42bf4293"
+  },
+  "k00-03": {
+   "duration": 5.363813,
+   "hash": "5a9d9cf0f5b9"
+  },
+  "k00-04": {
+   "duration": 6.09525,
+   "hash": "d299b2b4629e"
+  },
+  "k00-05": {
+   "duration": 4.713656,
+   "hash": "ce03c7103ec8"
+  },
+  "k00-06": {
+   "duration": 4.551125,
+   "hash": "8211731530a5"
+  },
+  "k00-07": {
+   "duration": 5.561188,
+   "hash": "32cde75de292"
+  },
+  "k01-01": {
+   "duration": 6.049469,
+   "hash": "99287daa7172"
+  },
+  "k01-02": {
+   "duration": 6.455156,
+   "hash": "6e467489a4c9"
+  },
+  "k01-03": {
+   "duration": 6.292625,
+   "hash": "c41bd46cf111"
+  },
+  "k01-04": {
+   "duration": 5.282563,
+   "hash": "44de807575e5"
+  },
+  "k01-05": {
+   "duration": 5.851438,
+   "hash": "acaf4af95cf1"
+  },
+  "k01-06": {
+   "duration": 5.851438,
+   "hash": "9028d6313ce6"
+  },
+  "k01-07": {
+   "duration": 5.526375,
+   "hash": "430b11a645f0"
+  },
+  "k01-08": {
+   "duration": 6.257781,
+   "hash": "3c391e49d04a"
+  },
+  "k02-01": {
+   "duration": 7.5465,
+   "hash": "0e5e3fb0c09b"
+  },
+  "k02-02": {
+   "duration": 8.080563,
+   "hash": "e7ac16c1ece2"
+  },
+  "k02-03": {
+   "duration": 5.805,
+   "hash": "6730f04a72aa"
+  },
+  "k02-04": {
+   "duration": 7.476844,
+   "hash": "dc475931b748"
+  },
+  "k02-05": {
+   "duration": 5.770188,
+   "hash": "eba0265a4df2"
+  },
+  "k02-06": {
+   "duration": 7.592938,
+   "hash": "0b4ce1d70411"
+  },
+  "k02-07": {
+   "duration": 8.161844,
+   "hash": "68c9c657eddc"
+  },
+  "k02-08": {
+   "duration": 8.452094,
+   "hash": "35691faa1b30"
+  },
+  "k03-01": {
+   "duration": 8.359188,
+   "hash": "fb1af9b48686"
+  },
+  "k03-02": {
+   "duration": 7.233031,
+   "hash": "a59328d03b6d"
+  },
+  "k03-03": {
+   "duration": 8.649438,
+   "hash": "4412deeaf04f"
+  },
+  "k03-04": {
+   "duration": 7.430406,
+   "hash": "7eaba07f1220"
+  },
+  "k03-05": {
+   "duration": 4.260875,
+   "hash": "f38240ae1b34"
+  },
+  "k03-06": {
+   "duration": 5.479938,
+   "hash": "6f87045aa03d"
+  },
+  "k03-07": {
+   "duration": 7.720656,
+   "hash": "6adabf615fa4"
+  },
+  "k03-08": {
+   "duration": 7.0705,
+   "hash": "b26f79fbce59"
+  },
+  "k04-01": {
+   "duration": 5.689469,
+   "hash": "602afaed3ed5"
+  },
+  "k04-02": {
+   "duration": 6.78025,
+   "hash": "4e0f63b26b1b"
+  },
+  "k04-03": {
+   "duration": 7.999281,
+   "hash": "d727477f3e16"
+  },
+  "k04-04": {
+   "duration": 7.674219,
+   "hash": "7b73db2216a0"
+  },
+  "k04-05": {
+   "duration": 8.243094,
+   "hash": "0239fe46dd68"
+  },
+  "k04-06": {
+   "duration": 6.257781,
+   "hash": "bb8f0b4d1344"
+  },
+  "k04-07": {
+   "duration": 7.105313,
+   "hash": "87034301207e"
+  },
+  "k04-08": {
+   "duration": 5.967531,
+   "hash": "fa369105bb31"
+  },
+  "k05-01": {
+   "duration": 6.013969,
+   "hash": "be243b94eddc"
+  },
+  "k05-02": {
+   "duration": 7.511656,
+   "hash": "53d47b6c72c7"
+  },
+  "k05-03": {
+   "duration": 7.186594,
+   "hash": "0c4cca36a9cd"
+  },
+  "k05-04": {
+   "duration": 5.317375,
+   "hash": "aefa051cec9a"
+  },
+  "k05-05": {
+   "duration": 7.024063,
+   "hash": "db5cd0315bfa"
+  },
+  "k05-06": {
+   "duration": 6.617688,
+   "hash": "88a04202d1a6"
+  },
+  "k05-07": {
+   "duration": 6.617688,
+   "hash": "7bc2ca5b909e"
+  },
+  "k05-08": {
+   "duration": 6.049469,
+   "hash": "de1223399822"
+  },
+  "k06-01": {
+   "duration": 6.049469,
+   "hash": "260f3cc03000"
+  },
+  "k06-02": {
+   "duration": 6.130094,
+   "hash": "b01b6d5f8495"
+  },
+  "k06-03": {
+   "duration": 6.09525,
+   "hash": "d622abf85122"
+  },
+  "k06-04": {
+   "duration": 7.0705,
+   "hash": "44d05dea1b0f"
+  },
+  "k06-05": {
+   "duration": 6.582875,
+   "hash": "0ef273e97de7"
+  },
+  "k06-06": {
+   "duration": 6.989219,
+   "hash": "c52a4a7dfca2"
+  },
+  "k06-07": {
+   "duration": 9.427313,
+   "hash": "f5b6311d1d52"
+  },
+  "k06-08": {
+   "duration": 6.582875,
+   "hash": "5e02319eab65"
+  },
+  "k07-01": {
+   "duration": 5.236125,
+   "hash": "eefbb12c7b6e"
+  },
+  "k07-02": {
+   "duration": 8.080563,
+   "hash": "effaa999c4af"
+  },
+  "k07-03": {
+   "duration": 5.4335,
+   "hash": "61952df238ad"
+  },
+  "k07-04": {
+   "duration": 7.639375,
+   "hash": "e55f5944866f"
+  },
+  "k07-05": {
+   "duration": 6.664156,
+   "hash": "abfbd699c3ec"
+  },
+  "k07-06": {
+   "duration": 6.257781,
+   "hash": "7cbc3caa9219"
+  },
+  "k07-07": {
+   "duration": 8.614625,
+   "hash": "80844b5bb1e2"
+  },
+  "k07-08": {
+   "duration": 5.4335,
+   "hash": "920d0324f7f4"
+  },
+  "k08-01": {
+   "duration": 5.154844,
+   "hash": "3a28d6ead7b9"
+  },
+  "k08-02": {
+   "duration": 5.363813,
+   "hash": "a13ae27b6199"
+  },
+  "k08-03": {
+   "duration": 6.013969,
+   "hash": "8cb08c653898"
+  },
+  "k08-04": {
+   "duration": 9.299594,
+   "hash": "d991344575ca"
+  },
+  "k08-05": {
+   "duration": 7.186594,
+   "hash": "e10db292ff65"
+  },
+  "k08-06": {
+   "duration": 6.698969,
+   "hash": "f2d41810149e"
+  },
+  "k08-07": {
+   "duration": 6.8615,
+   "hash": "c0fbe89c08a3"
+  },
+  "k08-08": {
+   "duration": 6.78025,
+   "hash": "cd67528e8e9c"
+  },
+  "k09-01": {
+   "duration": 4.0635,
+   "hash": "629d6d6d5edc"
+  },
+  "k09-02": {
+   "duration": 7.314313,
+   "hash": "70f1486041fa"
+  },
+  "k09-03": {
+   "duration": 7.430406,
+   "hash": "8a7e286f6241"
+  },
+  "k09-04": {
+   "duration": 3.900969,
+   "hash": "e4fb6083801f"
+  },
+  "k09-05": {
+   "duration": 6.8615,
+   "hash": "9f2b0291fbd5"
+  },
+  "k09-06": {
+   "duration": 7.349125,
+   "hash": "5ee42ea792b4"
+  },
+  "k09-07": {
+   "duration": 7.883188,
+   "hash": "b2e996475398"
+  },
+  "k09-08": {
+   "duration": 4.7485,
+   "hash": "b0ced2c4efc0"
+  },
+  "k10-01": {
+   "duration": 5.642469,
+   "hash": "219c76e54728"
+  },
+  "k10-02": {
+   "duration": 7.349125,
+   "hash": "e1e526e620af"
+  },
+  "k10-03": {
+   "duration": 8.939688,
+   "hash": "640c5ed42241"
+  },
+  "k10-04": {
+   "duration": 7.395563,
+   "hash": "c0b5d22a1a7e"
+  },
+  "k10-05": {
+   "duration": 6.257781,
+   "hash": "90f93a32ba79"
+  },
+  "k10-06": {
+   "duration": 7.233031,
+   "hash": "ecbc54d21d7b"
+  },
+  "k10-07": {
+   "duration": 5.596031,
+   "hash": "45f761e73552"
+  },
+  "kap-01": {
+   "duration": 7.476844,
+   "hash": "41fe7886e8bd"
+  },
+  "kap-02": {
+   "duration": 8.649438,
+   "hash": "bea4738d5877"
+  },
+  "kap-03": {
+   "duration": 8.243094,
+   "hash": "0ab91ae8b919"
+  },
+  "kap-04": {
+   "duration": 5.526375,
+   "hash": "ae66876c5354"
+  },
+  "kap-05": {
+   "duration": 6.420344,
+   "hash": "aab80ec14243"
+  },
+  "kap-06": {
+   "duration": 6.733813,
+   "hash": "d64b38042deb"
+  },
+  "kap-07": {
+   "duration": 5.526375,
+   "hash": "06846234372c"
   }
  }
 }

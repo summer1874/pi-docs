@@ -1,0 +1,972 @@
+---
+title: 第 10 章　工程化：构建、检查与测试
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 10 章　工程化：构建、检查与测试
+
+## 导读
+
+<Say id="k10-01">这一章不讲运行时逻辑，讲 pi 仓库怎么构建、怎么检查、怎么测试。</Say>
+<Say id="k10-02">根目录的 build 脚本按依赖顺序一个包一个包地编译，因为上层包的类型来自下层包的 dist。</Say>
+<Say id="k10-03">npm run check 是一条流水线：biome、依赖版本锁定、导入规则、入口预算、tsc 类型检查。</Say>
+<Say id="k10-04">源码只用可擦除的 TypeScript 语法，这样 Node 去掉类型注解就能直接运行源码，不需要编译。</Say>
+<Say id="k10-05">测试用 vitest 加 faux provider，模型回复是预先排好的，不联网也不花钱。</Say>
+<Say id="k10-06">test.sh 在隔离的空环境里跑测试，packages/evals 则用真实模型做行为评测。</Say>
+<Say id="k10-07">读完你应该知道改完代码要跑什么，以及为什么某些 TypeScript 写法在这里被禁止。</Say>
+
+## 1. 仓库布局
+
+pi 是一个 npm workspaces monorepo。根 `package.json` 声明了工作区：
+
+```json title="package.json:1-13"
+{
+	"name": "pi-monorepo",
+	"private": true,
+	"type": "module",
+	"workspaces": [
+		"packages/*",
+		"apps/*",
+		"packages/coding-agent/examples/extensions/with-deps",
+		"packages/coding-agent/examples/extensions/custom-provider-anthropic",
+		"packages/coding-agent/examples/extensions/custom-provider-gitlab-duo",
+		"packages/coding-agent/examples/extensions/sandbox",
+		"packages/coding-agent/examples/extensions/gondolin"
+	],
+```
+
+除了 `packages/*`，几个带自己依赖的示例扩展也是工作区，这样它们的依赖会被一起安装，`tsc` 能检查它们。
+
+`packages/` 下有 11 个目录：agent、ai、chord、codemode、coding-agent、durable、env、evals、mcp、telemetry、tui。其中 `evals` 是私有包（`"private": true`），不发布。
+
+## 2. 构建顺序
+
+### 2.1 build 脚本是一条串行链
+
+```json title="package.json:16"
+		"build": "cd packages/telemetry && npm run build && cd ../chord && npm run build && cd ../tui && npm run build && cd ../codemode && npm run build && cd ../mcp && npm run build && cd ../ai && npm run build && cd ../durable && npm run build && cd ../env && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build",
+```
+
+顺序是：telemetry → chord → tui → codemode → mcp → ai → durable → env → agent → coding-agent。
+
+为什么是这个顺序？把每个包 `dependencies` 里的内部包列出来（从各包 `package.json` 读出）：
+
+| 包 | 依赖的内部包 |
+|---|---|
+| telemetry | 无 |
+| chord | pi-telemetry |
+| tui | 无 |
+| codemode | 无 |
+| mcp | 无 |
+| ai | pi-telemetry |
+| durable | chord、pi-ai、pi-codemode、pi-telemetry |
+| env | chord、pi-durable |
+| agent | pi-ai |
+| coding-agent | pi-agent-core、pi-ai、pi-codemode、pi-mcp、pi-tui |
+
+build 顺序就是这张表的一个拓扑排序：每个包都排在它依赖的所有包之后。
+
+### 2.2 为什么必须按顺序
+
+每个包的 `build` 是 `tsc -p tsconfig.build.json`。关键在于构建配置里的 `paths` 指向的是**下层包的 dist**，而不是源码：
+
+```json title="packages/coding-agent/tsconfig.build.json:1-16"
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"outDir": "./dist",
+		"paths": {
+			"@earendil-works/pi-agent-core": ["../agent/dist/index.d.ts"],
+			"@earendil-works/pi-agent-core/*": ["../agent/dist/*.d.ts"],
+			"@earendil-works/pi-ai": ["../ai/dist/index.d.ts"],
+			"@earendil-works/pi-ai/*": ["../ai/dist/*.d.ts", "../ai/dist/providers/*.d.ts"],
+			"@earendil-works/pi-tui": ["../tui/dist/index.d.ts"],
+			"@earendil-works/pi-tui/*": ["../tui/dist/*.d.ts", "../tui/dist/components/*.d.ts"]
+		},
+		"rootDir": "./src"
+	},
+	"include": ["src/**/*.ts", "src/**/*.d.ts"],
+	"exclude": ["node_modules", "dist", "src/experimental"]
+}
+```
+
+coding-agent 编译时要读 `../agent/dist/index.d.ts`。如果 agent 还没构建，这个文件不存在，编译失败。这样做是为了让每个包的产物和它发布到 npm 后被使用的方式一致：发布出去的 coding-agent 依赖的就是 pi-agent-core 的 `dist`。
+
+coding-agent 的 build 比别的包多两步：
+
+```json title="packages/coding-agent/package.json:33-34"
+		"build": "npm run build:unbundled && node ../../scripts/build-coding-agent-bundle.mjs",
+		"build:unbundled": "tsc -p tsconfig.build.json && shx chmod +x dist/cli.js dist/rpc-entry.js && npm run copy-assets",
+```
+
+先 `tsc` 出非打包产物并复制主题、图片等资源，再用 esbuild 打一个 `dist/bundle/cli.js`。`package.json` 里的 `bin.pi` 指向的就是这个 bundle。
+
+### 2.3 什么时候需要 build
+
+AGENTS.md 对 build 的用途写得很明确：只在确实需要 `dist/` 时才跑，不要拿它做类型检查：
+
+```md title="AGENTS.md:32-33"
+- After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
+- Run `npm run build` whenever something needs built output (`dist/`): tests or benchmarks that import built packages, Durable's workerd suite. Never use it to type check or lint: that is `npm run check`, the preferred check.
+```
+
+日常开发几乎不需要 build：第 4 节会讲，源码可以直接运行，测试也直接引用源码。
+
+## 3. npm run check：一条检查流水线
+
+### 3.1 全貌
+
+```json title="package.json:21-28"
+		"check": "node scripts/biome-check.mjs --write && npm run check:pinned-deps && npm run check:runtime-deps && npm run check:ts-imports && npm run check:entry-graphs && npm run check:install-lock:coding-agent && tsc --noEmit && npm run check:browser-smoke",
+		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
+		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
+		"check:runtime-deps": "node scripts/check-runtime-deps.mjs",
+		"check:package-install": "node scripts/check-package-install.mjs",
+		"check:install-lock:coding-agent": "node scripts/generate-coding-agent-install-lock.mjs --check",
+		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
+		"check:entry-graphs": "node scripts/check-entry-graphs.mjs",
+```
+
+用 `&&` 串起来，任何一步失败后面都不跑。各步作用：
+
+| 步骤 | 脚本 | 检查什么 |
+|---|---|---|
+| 格式与 lint | `scripts/biome-check.mjs --write` | Biome 格式化并 lint，警告也算失败 |
+| 版本锁定 | `scripts/check-pinned-deps.mjs` | 所有 registry 依赖必须写精确版本 |
+| 运行时依赖 | `scripts/check-runtime-deps.mjs` | 源码 import 的包必须在本包 `package.json` 里声明 |
+| 导入后缀 | `scripts/check-ts-relative-imports.mjs` | `.ts` 文件里不许出现相对的 `.js` 导入 |
+| 入口预算 | `scripts/check-entry-graphs.mjs` | 每个公开入口能拉进多少模块有上限 |
+| 安装锁 | `generate-coding-agent-install-lock.mjs --check` | coding-agent 的安装锁文件是最新的 |
+| 类型检查 | `tsc --noEmit` | 整个仓库一次性类型检查 |
+| 浏览器冒烟 | `scripts/check-browser-smoke.mjs` | 浏览器可用的入口能被打包 |
+
+下面挑重要的几步看源码。
+
+### 3.2 Biome：格式和 lint
+
+Biome 是一个用 Rust 写的格式化 + lint 工具，替代 Prettier + ESLint。配置如下：
+
+```json title="biome.json:1-44"
+{
+	"$schema": "https://biomejs.dev/schemas/2.3.5/schema.json",
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"style": {
+				"noNonNullAssertion": "off",
+				"useConst": "error",
+				"useNodejsImportProtocol": "off"
+			},
+			"suspicious": {
+				"noExplicitAny": "off",
+				"noControlCharactersInRegex": "off",
+				"noEmptyInterface": "off"
+			}
+		}
+	},
+	"formatter": {
+		"enabled": true,
+		"formatWithErrors": false,
+		"indentStyle": "tab",
+		"indentWidth": 3,
+		"lineWidth": 120
+	},
+	"files": {
+		"includes": [
+			"scripts/model-catalog-protocol.ts",
+			"scripts/model-catalog-protocol.test.ts",
+			"packages/*/src/**/*.ts",
+			"packages/*/test/**/*.ts",
+			"packages/coding-agent/examples/**/*.ts",
+			"packages/agent/examples/**/*.ts",
+			"!**/node_modules/**/*",
+			"!**/test-sessions.ts",
+			"!**/models.generated.ts",
+			"!**/*.models.ts",
+			"!packages/mom/data/**/*",
+			"!!**/node_modules",
+			"!!apps"
+		]
+	},
+	"plugins": ["./scripts/biome/model-type-comparison.grit"]
+}
+```
+
+几个值得注意的选择：tab 缩进、行宽 120；`noExplicitAny` 关掉了，但 AGENTS.md 要求“除非绝对必要否则不用 `any`”，规则交给人来守；生成的模型文件（`models.generated.ts`、`*.models.ts`）不参与检查；还有一个自定义的 GritQL 插件 `model-type-comparison.grit`。
+
+`biome-check.mjs` 是对 Biome CLI 的包装，主要是为了一个边角情况：Android（Termux）上没有 Biome 原生二进制，脚本退回到 Biome 的 WASM 绑定，一个文件一个文件地检查。正常平台上它就是带 `--error-on-warnings` 调原生 CLI：
+
+```js title="scripts/biome-check.mjs:11-22"
+const write = process.argv.includes("--write");
+
+// Same platform table as @biomejs/biome/bin/biome.
+const hasNativeBinary = ["win32", "darwin", "linux"].includes(process.platform) && ["x64", "arm64"].includes(process.arch);
+
+if (hasNativeBinary) {
+	const biomeBin = createRequire(import.meta.url).resolve("@biomejs/biome/bin/biome");
+	const args = ["check", "--error-on-warnings", ...(write ? ["--write"] : []), "."];
+	const result = spawnSync(process.execPath, [biomeBin, ...args], { stdio: "inherit" });
+	if (result.error) throw result.error;
+	process.exit(result.status ?? 1);
+}
+```
+
+注意 `--write`：check 会自动改写格式，所以跑完 check 后工作区可能出现格式化带来的修改。
+
+### 3.3 依赖版本锁定
+
+pi 要求所有直接依赖都写死精确版本，不许用 `^1.2.3` 或 `~1.2.3`。`check-pinned-deps.mjs` 遍历仓库里所有 `package.json`：
+
+```js title="scripts/check-pinned-deps.mjs:36-59"
+const failures = [];
+
+collectPackageJsonFiles(".");
+
+for (const file of packageJsonFiles.sort()) {
+	const packageJson = JSON.parse(readFileSync(file, "utf8"));
+
+	for (const section of dependencySections) {
+		const dependencies = packageJson[section];
+		if (!dependencies) continue;
+
+		for (const [name, specifier] of Object.entries(dependencies)) {
+			if (isNonRegistrySpecifier(specifier)) continue;
+			if (exactVersionPattern.test(getVersionSpecifier(specifier))) continue;
+			failures.push(`${file}: ${section}.${name} must be pinned, found ${specifier}`);
+		}
+	}
+}
+
+if (failures.length > 0) {
+	console.error("Direct registry dependencies must use exact versions:");
+	for (const failure of failures) console.error(`  ${failure}`);
+	process.exit(1);
+}
+```
+
+`exactVersionPattern`（[check-pinned-deps.mjs:5](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/scripts/check-pinned-deps.mjs#L5)）只接受 `主.次.补丁` 加可选的预发布和构建后缀。`dependencies`、`devDependencies`、`optionalDependencies` 都检查；`workspace:`、`file:`、git 地址这类非 registry 来源跳过。内部包之间也写精确版本，例如 coding-agent 依赖 `"@earendil-works/pi-agent-core": "1.4.0"`。
+
+为什么要这么严？范围版本意味着“同一份 `package.json` 在不同时间安装会得到不同代码”。一个间接被拉进来的新版本可能带来行为变化，甚至供应链攻击。锁死版本后，依赖的每一次变化都要在 diff 里出现，可以被审查。AGENTS.md 把这一点写成规则：
+
+```md title="AGENTS.md:46"
+- Treat npm dep and lockfile changes as reviewed code. Direct registry deps, including internal workspace deps, stay pinned to exact versions.
+```
+
+同一节还规定：安装时用 `npm install --ignore-scripts`，不运行依赖的生命周期脚本（[AGENTS.md:48](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/AGENTS.md?plain=1#L48)）；新增带生命周期脚本的依赖需要在安装锁生成脚本里显式加白名单（[AGENTS.md:50](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/AGENTS.md?plain=1#L50)）。
+
+### 3.4 运行时依赖声明
+
+`check-runtime-deps.mjs` 用 TypeScript 的 AST 扫描每个公开包的源码，确认 import 的每个包都在本包的 `dependencies`、`optionalDependencies` 或 `peerDependencies` 里：
+
+```js title="scripts/check-runtime-deps.mjs:26-33"
+function checkSource(source, manifest) {
+	const file = source.fileName;
+	const declared = new Set([
+		manifest.name,
+		...Object.keys(manifest.dependencies ?? {}),
+		...Object.keys(manifest.optionalDependencies ?? {}),
+		...Object.keys(manifest.peerDependencies ?? {}),
+	]);
+```
+
+在 monorepo 里这个错误很容易犯：根目录 `node_modules` 里装了某个包，子包没声明也能 import 成功，本地一切正常，发布后用户一装就报“找不到模块”。这个检查在提交前就把它拦下来。
+
+### 3.5 入口预算
+
+`check-entry-graphs.mjs` 的文件头把问题讲得很清楚：
+
+```js title="scripts/check-entry-graphs.mjs:2-12"
+/**
+ * Entry points are cost contracts.
+ *
+ * A package's `exports` map is the only place that says which modules are public, and one stray
+ * `export *` can silently make a narrow entry drag an entire barrel: importing a 1-file pure
+ * function through a barrel costs ~37 MB of evaluated module graph, and nothing fails until someone
+ * measures a process. This walks the value-import graph of every declared entry point and enforces a
+ * budget per entry, so that regression fails at commit time instead.
+ *
+ * Only value imports count. `import type` / `export type` are erased before Node sees them.
+ */
+```
+
+举例：pi-ai 的 `./models` 入口应该只拉进模型注册表和少量工具文件。如果有人在其中某个文件里加了一行 `export * from "./index.ts"`，导入 `./models` 就会把 42 个 provider 全部加载进来，启动变慢、内存上涨，但不会有任何测试失败。这个脚本为每个入口列出允许到达的模块，超出就报错。
+
+这和第 1 章讲的 `*.lazy.ts` 懒加载是一回事的两面：懒加载让 provider 按需加载，入口预算保证懒加载不会被无意中破坏。
+
+### 3.6 类型检查：一次检查整个仓库
+
+check 里的 `tsc --noEmit` 用的是根目录的 `tsconfig.json`，不是各包的 `tsconfig.build.json`。根配置用 `paths` 把所有内部包名直接映射到**源码**：
+
+```json title="tsconfig.json:1-7"
+{
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		"noEmit": true,
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"paths": {
+```
+
+```json title="tsconfig.json:41-42"
+			"@earendil-works/pi-agent-core": ["./packages/agent/src/index.ts"],
+			"@earendil-works/pi-coding-agent": ["./packages/coding-agent/src/index.ts"],
+```
+
+```json title="tsconfig.json:52-53"
+	"include": ["scripts/model-catalog-protocol.ts", "scripts/model-catalog-protocol.test.ts", "packages/*/src/**/*", "packages/*/test/**/*", "packages/durable/test-workers/**/*", "packages/coding-agent/examples/**/*", "packages/agent/examples/**/*"],
+	"exclude": ["**/dist/**", "packages/coding-agent/examples/extensions/gondolin/**"]
+```
+
+所以 check 不需要先 build：改了 pi-ai 的一个类型，coding-agent 里所有受影响的地方在同一次 `tsc` 里报错。测试代码和示例扩展也在 `include` 里，一起被检查。根 `devDependencies` 里的 TypeScript 版本是 `7.0.2`。
+
+### 3.7 提交前钩子
+
+husky 的 pre-commit 钩子在每次提交前跑 check：
+
+```sh title=".husky/pre-commit:6-17"
+node scripts/check-lockfile-commit.mjs
+if [ $? -ne 0 ]; then
+  exit 1
+fi
+
+# Run the check script (formatting, linting, and type checking)
+echo "Running formatting, linting, and type checking..."
+npm run check
+if [ $? -ne 0 ]; then
+  echo "❌ Checks failed. Please fix the errors before committing."
+  exit 1
+fi
+```
+
+第一步 `check-lockfile-commit.mjs` 阻止提交 `package-lock.json` 的改动，除非设置了 `PI_ALLOW_LOCKFILE_CHANGE=1`（[AGENTS.md:51](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/AGENTS.md?plain=1#L51)）。钩子最后还会把被 `biome --write` 改过格式的已暂存文件重新 `git add`（[.husky/pre-commit:56-61](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/.husky/pre-commit#L56-L61)）。AGENTS.md 禁止用 `git commit --no-verify` 绕过它（[AGENTS.md:67](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/AGENTS.md?plain=1#L67)）。
+
+## 4. 只用可擦除的 TypeScript 语法
+
+### 4.1 问题：想直接运行源码
+
+开发时最快的循环是“改完 `.ts` 立刻运行”，不要等编译。Node 从 22.x 开始内置 TypeScript 类型剥离（strip-only 模式）：读 `.ts` 文件时，把类型注解替换成空白，剩下的就是合法 JavaScript，直接执行。
+
+“替换成空白”这个做法有一个前提：**删掉类型之后，剩下的代码必须就是要运行的代码**。大部分 TypeScript 语法满足这个前提，比如：
+
+```ts
+// 示意（不是 pi 源码）：删掉类型注解后仍是合法 JS
+function add(a: number, b: number): number { return a + b; }
+type Id = string | number;
+interface Point { x: number; y: number }
+```
+
+但有几种语法不满足。它们不只是类型，还会生成运行时代码，单纯删除会改变程序含义。这些语法叫“不可擦除”语法：
+
+| 语法 | 例子（示意） | 为什么不可擦除 |
+|---|---|---|
+| `enum` | `enum Color { Red, Green }` | 编译成一个运行时对象 `Color` |
+| 参数属性 | `constructor(private readonly x: number) {}` | 隐式生成 `this.x = x` 赋值 |
+| 带值的 `namespace`/`module` | `namespace Util { export const a = 1 }` | 编译成一个 IIFE 对象 |
+| `import =` | `import fs = require("fs")` | 编译成 `require` 调用 |
+| `export =` | `export = foo` | 编译成 `module.exports = foo` |
+
+以参数属性为例：
+
+```ts
+// 示意：不可擦除
+class Point {
+	constructor(private readonly x: number) {}
+}
+// 删掉类型后变成 constructor(x) {}，赋值 this.x = x 丢了
+```
+
+### 4.2 规则与编译器开关
+
+AGENTS.md 把这条写成了硬规则：
+
+```md title="AGENTS.md:24"
+- Use only erasable TypeScript syntax (Node strip-only mode) in code checked by the root config (`packages/*/src`, `packages/*/test`, `packages/coding-agent/examples`): no parameter properties, `enum`, `namespace`/`module`, `import =`, `export =`, or other constructs needing JS emit. Use explicit fields with constructor assignments.
+```
+
+规则不只靠人记，基础配置里打开了对应的编译器选项：
+
+```json title="tsconfig.base.json:1-23"
+{
+	"compilerOptions": {
+		"target": "ES2024",
+		"module": "Node16",
+		"lib": ["ES2024"],
+		"strict": true,
+		"erasableSyntaxOnly": true,
+		"verbatimModuleSyntax": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"declaration": true,
+		"declarationMap": true,
+		"sourceMap": true,
+		"inlineSources": true,
+		"inlineSourceMap": false,
+		"moduleResolution": "Node16",
+		"resolveJsonModule": true,
+		"allowImportingTsExtensions": true,
+		"rewriteRelativeImportExtensions": true,
+		"types": ["node"]
+	}
+}
+```
+
+和直接运行源码有关的四个选项：
+
+| 选项 | 作用 |
+|---|---|
+| `erasableSyntaxOnly` | 用到上表任何一种语法，`tsc` 直接报错 |
+| `verbatimModuleSyntax` | 只用作类型的导入必须写 `import type`。剥离器不做类型分析，分不清一个 import 是值还是类型；写明 `import type` 后整行可以安全删除 |
+| `allowImportingTsExtensions` | 允许源码写 `import ... from "./foo.ts"`。Node 直接跑源码时，磁盘上只有 `foo.ts`，没有 `foo.js` |
+| `rewriteRelativeImportExtensions` | `tsc` 构建 dist 时把 `./foo.ts` 改写成 `./foo.js`，发布产物照常工作 |
+
+于是源码里所有相对导入都带 `.ts` 后缀。`check-ts-relative-imports.mjs` 反过来禁止 `.js` 后缀的相对导入，因为直接运行源码时这样的路径找不到文件：
+
+```js title="scripts/check-ts-relative-imports.mjs:37-39"
+function isRelativeJavaScriptSpecifier(specifier) {
+	return /^\.\.?\//.test(specifier) && /\.js(?:[?#].*)?$/.test(specifier);
+}
+```
+
+```js title="scripts/check-ts-relative-imports.mjs:101-105"
+if (failures.length > 0) {
+	console.error("Relative .js imports are not allowed in non-declaration .ts files:");
+	for (const failure of failures) console.error(`  ${failure}`);
+	process.exit(1);
+}
+```
+
+### 4.3 源码里的写法
+
+规则落地后，代码里会看到一些固定写法。
+
+**用显式字段加构造函数赋值，代替参数属性**。pi-mcp 的错误类：
+
+```ts title="packages/mcp/src/protocol/jsonrpc.ts:45-55"
+export class McpError extends Error {
+	readonly code: number;
+	readonly data: unknown;
+
+	constructor(code: number, message: string, data?: unknown) {
+		super(message);
+		this.name = "McpError";
+		this.code = code;
+		this.data = data;
+	}
+}
+```
+
+**用 `as const` 对象代替 `enum`**：
+
+```ts title="packages/mcp/src/protocol/jsonrpc.ts:37-43"
+export const JSON_RPC_ERROR_CODES = {
+	parseError: -32700,
+	invalidRequest: -32600,
+	methodNotFound: -32601,
+	invalidParams: -32602,
+	internalError: -32603,
+} as const;
+```
+
+**用字符串字面量联合代替 `enum`**，例如 MCP 客户端的状态 `type ClientState = "idle" | "connecting" | "connected" | "closed"`（[client.ts:41](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/mcp/src/client.ts#L41)），以及 agent 事件的 `type` 字段。
+
+### 4.4 收益：哪些地方直接跑源码
+
+规则换来的是：仓库里很多入口不编译直接运行 `.ts`。
+
+**从源码运行 pi CLI**。第 0 章用的 `./pi-test.sh` 最后一行：
+
+```sh title="pi-test.sh:83-85"
+# --import takes a module specifier, so pass the resolver as a file URL (raw paths break on #, ?, %).
+RESOLVER_URL="$(node -p 'require("node:url").pathToFileURL(process.argv[1]).href' "$SCRIPT_DIR/packages/coding-agent/src/experimental/source-resolver.ts")"
+node --import "$RESOLVER_URL" "$SCRIPT_DIR/packages/coding-agent/src/cli.ts" ${ARGS[@]+"${ARGS[@]}"}
+```
+
+直接 `node .../src/cli.ts`，没有构建步骤。还剩一个问题：源码里写的是 `import ... from "@earendil-works/pi-ai"`，Node 默认会按 `node_modules` 解析到 pi-ai 的 `dist`。如果 dist 是旧的，就会悄悄跑到旧代码。`source-resolver.ts` 解决这个问题：它读根 `tsconfig.json` 的 `paths`，注册一个模块解析钩子，把内部包名改写到源码路径：
+
+```ts title="packages/coding-agent/src/experimental/source-resolver.ts:6-8"
+// Node strips TypeScript natively, but it does not apply the workspace source
+// aliases from tsconfig.json. Internal source processes preload this resolver so
+// they cannot silently fall through to stale package dist files.
+```
+
+```ts title="packages/coding-agent/src/experimental/source-resolver.ts:45-62"
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		let matchedPattern: string | undefined;
+		for (const alias of aliases) {
+			const wildcard = matchAlias(alias, specifier);
+			if (wildcard === undefined) continue;
+			matchedPattern ??= alias.pattern;
+			for (const replacement of alias.replacements) {
+				const resolved = resolveSourcePath(replacement.replace("*", wildcard));
+				if (resolved) return { url: pathToFileURL(resolved).href, shortCircuit: true };
+			}
+		}
+		if (matchedPattern) {
+			throw new Error(`Source runtime could not resolve ${specifier} through tsconfig path ${matchedPattern}`);
+		}
+		return nextResolve(specifier, context);
+	},
+});
+```
+
+注意找不到时是抛错而不是回退到 `nextResolve`：宁可失败，也不要静悄悄地用上旧的 dist。
+
+**其他直接运行 `.ts` 的地方**：
+
+- pi-tui 的测试用 Node 自带的 `node:test` 直接跑 `.ts`：
+
+  ```json title="packages/tui/package.json:13"
+  		"test": "node --test --test-reporter=dot --test-reporter-destination=stdout test/*.test.ts",
+  ```
+
+- evals 的文档评测运行器：`"eval:docs": "node --experimental-strip-types src/cli.ts"`（[packages/evals/package.json](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/evals/package.json)）。
+- pi-durable 的一系列 benchmark 脚本，例如 `node --conditions=source --experimental-strip-types test/storage-memory.ts`（[packages/durable/package.json:125](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/durable/package.json#L125)）。
+
+如果源码里混进一个 `enum`，上面这些全部会在运行时报语法错误。`erasableSyntaxOnly` 把这个错误提前到了 `npm run check`。
+
+## 5. 测试体系
+
+### 5.1 vitest 和源码别名
+
+除 pi-tui 外，各包用 vitest。根目录的 `vitest.base.ts` 和根 `tsconfig.json` 做同一件事：把内部包名指到源码，测试不需要先 build：
+
+```ts title="vitest.base.ts:29-42"
+export default defineConfig({
+	resolve: {
+		alias: [
+			{ find: /^@earendil-works\/chord$/, replacement: workspaceSourcePaths.chordIndex },
+			{ find: /^@earendil-works\/chord\/context$/, replacement: workspaceSourcePaths.chordContext },
+			{ find: /^@earendil-works\/chord\/delta$/, replacement: workspaceSourcePaths.chordDelta },
+			{ find: /^@earendil-works\/chord\/node$/, replacement: workspaceSourcePaths.chordNode },
+			{ find: /^@earendil-works\/pi-telemetry$/, replacement: workspaceSourcePaths.telemetryIndex },
+			{ find: /^@earendil-works\/pi-telemetry\/testing$/, replacement: workspaceSourcePaths.telemetryTesting },
+			{ find: /^@earendil-works\/pi-mcp$/, replacement: workspaceSourcePaths.mcpIndex },
+			{ find: /^@earendil-works\/pi-mcp\/oauth$/, replacement: workspaceSourcePaths.mcpOAuth },
+			{ find: /^@earendil-works\/pi-mcp\/testing$/, replacement: workspaceSourcePaths.mcpTesting },
+			{ find: /^@earendil-works\/pi-ai$/, replacement: workspaceSourcePaths.aiIndex },
+			{ find: /^@earendil-works\/pi-ai\/compat$/, replacement: workspaceSourcePaths.aiCompat },
+```
+
+各包的 vitest 配置合并这份基础配置。coding-agent 的配置还默认离线：
+
+```ts title="packages/coding-agent/vitest.config.ts:4-12"
+export default mergeConfig(
+	baseConfig,
+	defineConfig({
+		test: {
+			globals: true,
+			environment: "node",
+			testTimeout: 30000,
+			// Tests run offline by default; opt in with allowNetwork() from test/test-network-env.ts.
+			env: { PI_OFFLINE: "1" },
+```
+
+### 5.2 faux provider：预先排好的模型回复
+
+测 agent 行为最大的障碍是模型：真实模型慢、要钱、每次回复都不一样。pi-ai 提供了一个假 provider：`packages/ai/src/providers/faux.ts`。它和真实 provider 一样注册进模型注册表，但回复来自一个预先排好的队列。
+
+构造回复的辅助函数：
+
+```ts title="packages/ai/src/providers/faux.ts:63-102"
+export function fauxToolCall(name: string, arguments_: ToolCall["arguments"], options: { id?: string } = {}): ToolCall {
+	return {
+		type: "toolCall",
+		id: options.id ?? randomId("tool"),
+		name,
+		arguments: arguments_,
+	};
+}
+
+function normalizeFauxAssistantContent(content: string | FauxContentBlock | FauxContentBlock[]): FauxContentBlock[] {
+	if (typeof content === "string") {
+		return [fauxText(content)];
+	}
+	return Array.isArray(content) ? content : [content];
+}
+
+export function fauxAssistantMessage(
+	content: string | FauxContentBlock | FauxContentBlock[],
+	options: {
+		stopReason?: AssistantMessage["stopReason"];
+		deferred?: DeferredHandle;
+		errorMessage?: string;
+		responseId?: string;
+		timestamp?: number;
+	} = {},
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content: normalizeFauxAssistantContent(content),
+		api: DEFAULT_API,
+		provider: DEFAULT_PROVIDER,
+		model: DEFAULT_MODEL_ID,
+		usage: DEFAULT_USAGE,
+		stopReason: options.stopReason ?? "stop",
+		...(options.deferred === undefined ? {} : { deferred: options.deferred }),
+		...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
+		...(options.responseId === undefined ? {} : { responseId: options.responseId }),
+		timestamp: options.timestamp ?? Date.now(),
+	};
+}
+```
+
+每次模型请求从队列头取一条回复；队列空了就返回一个错误消息，测试会立刻看到“回复不够”：
+
+```ts title="packages/ai/src/providers/faux.ts:527-546"
+	const stream: StreamFunction<string, SimpleStreamOptions> = (requestModel, context, streamOptions) => {
+		const outer = createAssistantMessageEventStream();
+		const step = pendingResponses.shift();
+		state.callCount++;
+
+		queueMicrotask(async () => {
+			try {
+				await streamOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+				if (!step) {
+					let message = createErrorMessage(
+						new Error("No more faux responses queued"),
+						api,
+						provider,
+						requestModel.id,
+					);
+					message = withUsageEstimate(message, context, streamOptions, promptCache);
+					outer.push({ type: "error", reason: "error", error: message });
+					outer.end(message);
+					return;
+				}
+```
+
+它不只是“直接返回一个完整消息”：faux 会把回复切成 3 到 5 个字符的小块，按真实的事件序列（`start`、`text_delta`、`toolcall_delta`、`done`……）推出来（`DEFAULT_MIN_TOKEN_SIZE`、`DEFAULT_MAX_TOKEN_SIZE`，[faux.ts:30-31](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/providers/faux.ts#L30-L31)），还会估算 token 用量。所以流式渲染、部分 JSON 解析、用量统计这些路径都能被测到。队列里的一项也可以是函数（`FauxResponseFactory`），根据收到的上下文决定回复，用来测“模型看到了什么”。
+
+### 5.3 coding-agent 的测试 harness
+
+`packages/coding-agent/test/suite/` 是 coding-agent 的新一代测试套件，README 定了规矩：
+
+```md title="packages/coding-agent/test/suite/README.md:5-10"
+Rules:
+- Use `test/suite/harness.ts`
+- Use the faux provider from `packages/ai/src/providers/faux.ts`
+- Do not use real provider APIs, real API keys, network calls, or paid tokens
+- Keep these tests CI-safe and deterministic
+- Do not use or extend the legacy `test/test-harness.ts` path unless a missing capability forces it
+```
+
+`createHarness` 把一整套真实的 `AgentSession` 搭起来，只有模型是假的：
+
+```ts title="packages/coding-agent/test/suite/harness.ts:151-168"
+export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
+	const tempDir = createTempDir();
+	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
+		provider: options.provider,
+		models: options.models,
+	});
+	fauxProvider.setResponses([]);
+	const model = fauxProvider.getModel();
+	const toolMap = options.tools ? Object.fromEntries(options.tools.map((tool) => [tool.name, tool])) : undefined;
+	const withConfiguredAuth = options.withConfiguredAuth ?? true;
+	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
+	const settingsManager = SettingsManager.inMemory(options.settings);
+
+	const authStorage = AuthStorage.inMemory();
+	if (withConfiguredAuth) {
+		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "faux-key" }));
+	}
+```
+
+会话、设置、鉴权都用内存实现，不碰用户的 `~/.pi`。接着构造真实的 `Agent` 和 `AgentSession`，并订阅所有事件存进数组：
+
+```ts title="packages/coding-agent/test/suite/harness.ts:234-252"
+	const session = new AgentSession({
+		agent,
+		sessionManager,
+		settingsManager,
+		cwd: tempDir,
+		modelRuntime: getModelRuntime(modelRegistry),
+		resourceLoader,
+		baseToolsOverride: toolMap,
+		initialActiveToolNames: options.initialActiveToolNames,
+		usesDefaultTools: options.initialActiveToolNames === undefined,
+		allowedToolNames: options.allowedToolNames,
+		excludedToolNames: options.excludedToolNames,
+		extensionRunnerRef,
+	});
+
+	const events: AgentSessionEvent[] = [];
+	session.subscribe((event) => {
+		events.push(event);
+	});
+```
+
+一个典型用例：排两条回复（先调工具，再给结论），然后断言消息序列：
+
+```ts title="packages/coding-agent/test/suite/agent-session-prompt.test.ts:63-99"
+	it("handles a tool call turn and waits for the follow-up LLM response", async () => {
+		const toolRuns: string[] = [];
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async (_toolCallId, params) => {
+				const text = typeof params === "object" && params !== null && "text" in params ? String(params.text) : "";
+				toolRuns.push(text);
+				return {
+					content: [{ type: "text", text: `echo:${text}` }],
+					details: { text },
+				};
+			},
+		};
+		const harness = await createHarness({ tools: [echoTool] });
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("echo", { text: "hello" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("start");
+
+		expect(toolRuns).toEqual(["hello"]);
+		expect(harness.session.messages.map((message) => message.role)).toEqual([
+			"system",
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+		]);
+		expect(harness.session.messages[3]?.role).toBe("toolResult");
+		expect(harness.session.messages[4]?.role).toBe("assistant");
+	});
+```
+
+这个测试走的是完整链路：`AgentSession.prompt` → `Agent` → `runLoop` → faux 流 → 工具执行 → 第二轮请求。只有“模型想什么”被替换了。
+
+修 GitHub issue 时写的回归测试放在 `test/suite/regressions/`，文件名以 issue 号开头，例如 `2023-queued-slash-command-followup.test.ts`，`describe` 里也写上 issue 号：
+
+```ts title="packages/coding-agent/test/suite/regressions/2023-queued-slash-command-followup.test.ts:8"
+describe("issue #2023 queued slash-command follow-up", () => {
+```
+
+这对应 AGENTS.md 的要求：回归测试旁边写上 issue 编号（[AGENTS.md:40](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/AGENTS.md?plain=1#L40)）。
+
+### 5.4 e2e 测试为什么不能直接跑全量
+
+仓库里也有调用真实 API 的测试，它们靠环境变量开关：
+
+```ts title="packages/ai/test/openrouter-cache-write-repro.test.ts:13"
+describe.skipIf(!process.env.OPENROUTER_API_KEY)("OpenRouter cache_write repro E2E", () => {
+```
+
+问题在于：开发者的 shell 里通常就有 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`。直接 `npx vitest` 跑全量，这些 e2e 测试会自动启用，花钱、慢、还可能因网络失败。AGENTS.md 因此规定：
+
+```md title="AGENTS.md:34-37"
+- Never run `npm test` unless requested by the user.
+- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root:
+  - Vitest: `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/specific.test.ts`
+  - `packages/tui` (`node:test`): `node --test test/specific.test.ts`
+```
+
+### 5.5 test.sh：在空环境里跑测试
+
+`./test.sh` 解决上面的问题，办法是**从一个空环境开始**，只放进白名单里的变量：
+
+```bash title="test.sh:39-64"
+# Start from an empty environment and allow only required platform and test settings.
+test_env=(
+	"PATH=$PATH"
+	"PWD=$PWD"
+	"HOME=$test_root/home"
+	"USERPROFILE=$test_root/home"
+	"TMPDIR=$test_root/tmp"
+	"TMP=$test_root/tmp"
+	"TEMP=$test_root/tmp"
+	"XDG_CONFIG_HOME=$test_root/home/.config"
+	"XDG_CACHE_HOME=$test_root/cache"
+	"LANG=C"
+	"LC_ALL=C"
+	"TZ=UTC"
+	"GIT_CONFIG_NOSYSTEM=1"
+	"GIT_CONFIG_GLOBAL=/dev/null"
+	"GIT_TERMINAL_PROMPT=0"
+	"GIT_ASKPASS=$git_askpass"
+	"GIT_EDITOR=true"
+	"GIT_SEQUENCE_EDITOR=true"
+	"NPM_CONFIG_USERCONFIG=$test_root/npm-userconfig"
+	"NPM_CONFIG_GLOBALCONFIG=$test_root/npm-globalconfig"
+	"NPM_CONFIG_CACHE=$test_root/cache/npm"
+	"PI_NO_LOCAL_LLM=1"
+	"AWS_EC2_METADATA_DISABLED=true"
+)
+```
+
+```bash title="test.sh:83-84"
+echo "Running tests without API keys in isolated home: $test_root/home"
+env -i "${test_env[@]}" npm test
+```
+
+`env -i` 清空所有继承的环境变量。效果：
+
+- 没有任何 API key，所有 `skipIf` 的 e2e 测试被跳过。
+- `HOME` 指向一个临时目录，测试读不到用户的 `~/.pi` 配置、凭据和扩展。
+- 固定 `LANG=C`、`TZ=UTC`，排除语言和时区带来的差异。
+- 屏蔽全局 git 配置和交互提示，git 相关测试不会弹出编辑器或密码输入。
+- `PI_NO_LOCAL_LLM=1` 关掉本地模型探测，`AWS_EC2_METADATA_DISABLED` 阻止 AWS SDK 去探测云主机元数据。
+
+脚本对清理也很小心：临时目录里放一个 `.pi-test-owned` 标记文件，退出时只删除带标记、且路径形如 `$TMPDIR/pi-test.*` 的目录（[test.sh:15-37](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/test.sh#L15-L37)），避免一个变量为空时 `rm -rf` 删错地方。
+
+CONTRIBUTING.md 要求提 PR 前 `npm run check` 和 `./test.sh` 都通过（[CONTRIBUTING.md](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/CONTRIBUTING.md?plain=1)）。
+
+## 6. packages/evals：行为评测
+
+### 6.1 测试和评测的区别
+
+单元测试回答“代码是否按设计运行”，答案确定。评测回答“模型用这套 agent 能不能把事做成”，答案带随机性。比如：给模型 coding-agent 的文档，它能不能正确写出一个扩展？去掉文档，成功率会下降多少？这类问题只能用真实模型反复跑来回答。
+
+`packages/evals` 基于 `vitest-evals`，需要 `PI_PROVIDER` 和 `PI_MODEL` 指定真实模型：
+
+```json title="packages/evals/package.json:6-12"
+	"scripts": {
+		"clean": "shx rm -rf .eval",
+		"eval": "npm run eval:host && npm run eval:docs --",
+		"eval:host": "vitest run --config vitest.evals.config.ts --project host",
+		"eval:docs": "node --experimental-strip-types src/cli.ts",
+		"test": "vitest run --config vitest.test.config.ts"
+	},
+```
+
+根目录也有入口：`"eval": "npm run eval --workspace=@earendil-works/pi-evals --"`（[package.json:35](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/package.json#L35)）。注意 `test` 和 `eval` 是分开的：`npm test` 只跑 evals 包自己的运行器单元测试，不调用模型。
+
+评测分两类：
+
+| 类型 | 文件 | 运行方式 |
+|---|---|---|
+| 主机评测 | `evals/*.eval.ts` | 在本机用 vitest 跑，普通的 `describeEval` 套件 |
+| 文档增益评测 | `evals/*.docs.eval.ts` | 每个用例在 `without_docs` 和 `with_docs` 两个 Docker 容器里各跑一次，比较通过率差值 |
+
+### 6.2 一个最小评测
+
+```ts title="packages/evals/evals/smoke.eval.ts:1-18"
+import { expect } from "vitest";
+import { describeEval } from "vitest-evals";
+import { createPiCodingAgentHarness } from "../src/harness.ts";
+
+const harness = createPiCodingAgentHarness({ noTools: "all" });
+
+describeEval("Answer a basic prompt", { harness }, (it) => {
+	it("returns the expected answer", async ({ run }) => {
+		const result = await run("What's the capital of France? Respond with only the city name.");
+		expect(result.output.trim()).toBe("Paris");
+		expect(result.errors).toEqual([]);
+		expect(result.usage).toMatchObject({
+			provider: process.env.PI_PROVIDER,
+			model: process.env.PI_MODEL,
+		});
+		expect(result.usage.totalTokens).toBeGreaterThan(0);
+	});
+});
+```
+
+和 suite 测试相比，评测的 harness 走的是 pi 真正的启动链路（第 3 章的 `createAgentSessionServices`），而不是手工拼 `AgentSession`：
+
+```ts title="packages/evals/src/harness.ts:337-355"
+		const services = await createAgentSessionServices({
+			cwd: workspace,
+			modelRuntime,
+			resourceLoaderOptions: { extensionFactories },
+		});
+		signal?.throwIfAborted();
+		sessionManager = SessionManager.create(workspace, join(root, "sessions"));
+		setArtifact("runId", sessionManager.getSessionId());
+		session = (
+			await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				model,
+				thinkingLevel: "off",
+				tools: options.tools,
+				noTools: options.noTools,
+				customTools: options.customTools,
+			})
+		).session;
+```
+
+会话写成真实的 JSONL 文件，评测结束后可以回看模型每一步做了什么。
+
+### 6.3 文档增益评测
+
+`*.docs.eval.ts` 回答的问题是“文档有没有用”。README 描述了两个变体：`without_docs` 去掉 coding-agent 的 `README.md`、`CHANGELOG.md`、`docs/`、`examples/`，并从默认系统提示里删掉指向文档的段落；`with_docs` 保留它们。两个变体安装同一份本地打包的工作区包。每次运行用全新容器、全新 home 目录，评测定义文件在 harness 降权后对 agent 不可读，防止模型“偷看答案”。
+
+运行器先列出完整的 `(用例, 变体, 模型, 第几次)` 计划，再逐个执行，最后成对比较。任何一对里有缺失、重复或出错的结果，就不给出总的通过率差值（[packages/evals/README.md](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/evals/README.md?plain=1)）。这是在用统计上的谨慎对付模型输出的随机性。
+
+一个文档评测的例子：让模型给正在运行的 pi 加一个模型配置，再用结构化判定器严格比较结果：
+
+```ts title="packages/evals/evals/models.docs.eval.ts:25-40"
+const harness = createPiDocumentationEvalHarness({
+	output: ({ session }) => inspectAddedModel(session.modelRuntime, PROVIDER_ID, MODEL_ID),
+});
+const judge = StructuredOutputJudge({ expected, match: "strict", allowExtras: false });
+
+describeEval("Add model to existing provider", { harness, judges: [judge], judgeThreshold: null }, (it) => {
+	it("adds the model without replacing existing models", async ({ run }) => {
+		await run([
+			{
+				type: "prompt",
+				content: `Configure this running Pi installation with a new \`${PROVIDER_ID}/${MODEL_ID}\` model. Do not create project-local configuration. Show it as “${MODEL_NAME}”. It accepts text, supports reasoning, has a 32,768-token context window and a 4,096-token maximum output, and has no usage cost.`,
+			},
+			{ type: "reload" },
+		]);
+	});
+});
+```
+
+判定不看模型说了什么，而是读 `session.modelRuntime` 里实际注册的模型，这让评测结果客观可比。
+
+## 7. AGENTS.md：给贡献者（包括 AI agent）的工程约束
+
+pi 的 CONTRIBUTING.md 说：如果你用 agent 写代码，请从仓库根目录运行它，让它读到 `AGENTS.md`，并遵守其中的规则。所以 AGENTS.md 同时是给人和给 AI 的工程规范。按主题总结如下：
+
+| 主题 | 规则 | 原因 |
+|---|---|---|
+| 类型 | 不用 `any`，除非绝对必要；外部 API 的类型去 `node_modules` 查，不猜 | Biome 关了 `noExplicitAny`，靠人守 |
+| 导入 | 不用内联导入（`await import()`、`import("pkg").Type`），只用顶层 import | 依赖关系一眼可见，入口预算脚本也依赖静态 import |
+| 语法 | 只用可擦除语法 | 第 4 节 |
+| 资源路径 | coding-agent 里用 `src/config.ts` 的辅助函数解析资源，不直接用 `__dirname` | 源码运行、npm 安装、单文件二进制三种情况路径不同 |
+| 依赖 | 精确版本；`--ignore-scripts` 安装；升级 `undici` 必须先读变更日志 | 供应链安全 |
+| 快捷键 | 不硬编码按键判断，加到默认快捷键表里 | 保证可配置 |
+| 生成文件 | 不手改 `models.generated.ts`，改生成脚本再重新生成 | 手改会被下次生成覆盖 |
+| 命令 | 改完代码跑 `npm run check`；不跑全量 vitest；用 `./test.sh` 或单个测试文件 | 第 3、5 节 |
+| 测试 | 新建或修改测试必须跑通；suite 测试只用 harness + faux | 确定、免费、可在 CI 跑 |
+| 兼容 | 不保留向后兼容，除非用户要求；删除看起来有意为之的代码前先问 | 保持代码简洁，又避免误删 |
+| Git | 只提交自己改的文件；显式 `git add <path>`；禁止 `reset --hard`、`stash`、`add -A`、`--no-verify` | 多个 agent 会话可能同时在同一工作区改不同文件 |
+| 变更日志 | 只往 `## [Unreleased]` 下追加；已发布版本的段落不可改 | 发布记录不可变 |
+
+其中 Git 那一条很能说明 pi 的开发方式。AGENTS.md 的解释是：
+
+```md title="AGENTS.md:55"
+Multiple pi sessions may be running in this cwd at the same time, each modifying different files. Git operations that touch unstaged, staged, or untracked files outside your own changes will stomp on other sessions' work. Follow these rules:
+```
+
+也就是说，维护者会在同一个工作目录里同时开多个 pi 会话各改一部分代码。`git stash` 或 `git add -A` 会把别的会话还没完成的修改卷进来或弄丢，所以被列为禁止操作。
+
+还有几条是代码风格规则，也写在 AGENTS.md 的 Code Quality 一节：只有一个调用点的单行辅助函数要内联；类型错误来自过时依赖时，升级依赖，不要删代码迁就类型（[AGENTS.md:18-28](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/AGENTS.md?plain=1#L18-L28)）。
+
+## 小结
+
+- **构建**：根 `build` 按依赖拓扑顺序串行编译；各包的构建配置从下层包的 `dist/*.d.ts` 取类型，所以顺序不能乱。日常开发不需要 build。
+- **检查**：`npm run check` 依次跑 Biome、精确版本检查、运行时依赖声明、导入后缀、入口预算、安装锁、全仓库 `tsc --noEmit`、浏览器冒烟。pre-commit 钩子强制执行。
+- **可擦除语法**：`enum`、参数属性、带值的 namespace、`import =`、`export =` 会生成运行时代码，Node 的类型剥离处理不了。`erasableSyntaxOnly` 在编译期拦截；源码用 `.ts` 后缀导入，构建时改写成 `.js`。换来的是 `pi-test.sh`、pi-tui 测试、evals 运行器等直接跑源码。
+- **测试**：vitest 通过别名直接引用源码；faux provider 按队列返回回复，并模拟真实的流式事件；`test/suite/harness.ts` 搭一套真实的 AgentSession，只替换模型；`./test.sh` 用 `env -i` 在空环境里跑，自动跳过 e2e。
+- **评测**：`packages/evals` 用真实模型跑 `vitest-evals`，文档增益评测在成对容器里比较有无文档的通过率。
+- **AGENTS.md**：类型、导入、依赖安全、命令、测试和 Git 的规则，同时约束人和 AI agent。
+
+## 动手验证
+
+1. 在任意 `packages/*/src` 文件里临时加一行 `enum Tmp { A }`，运行 `npx tsc --noEmit -p tsconfig.json`，看 `erasableSyntaxOnly` 的报错；再用 `./pi-test.sh --help` 看 Node 直接运行时的报错。验证完撤销修改。
+2. 读 [packages/coding-agent/test/suite/agent-session-prompt.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/test/suite/agent-session-prompt.test.ts)，然后在 `packages/coding-agent` 下运行：`node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/suite/agent-session-prompt.test.ts`。试着把某个用例的 `setResponses` 少排一条，看 “No more faux responses queued” 怎么体现在断言失败里。
+3. 读 `test.sh`，然后对比 `env | grep -i api_key` 与 `env -i PATH="$PATH" env` 的输出，理解为什么 `./test.sh` 不会触发 e2e 测试。
+4. 读 [scripts/check-entry-graphs.mjs](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/scripts/check-entry-graphs.mjs) 里 `BUDGETS` 的定义，找出 pi-ai 的 `./models` 入口允许到达哪些模块，再对照第 1 章的懒加载设计。

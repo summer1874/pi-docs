@@ -1,0 +1,1601 @@
+---
+title: 第 5 章　会话与上下文管理
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 5 章　会话与上下文管理
+
+## 导读
+
+<Say id="k05-01">这一章回答两个问题：对话怎么存下来，以及每次调用模型时到底发了哪些消息。</Say>
+<Say id="k05-02">pi 把会话存成一个 JSONL 文件，每行一条 entry，用 id 和 parentId 连成一棵树。</Say>
+<Say id="k05-03">文件只追加，不修改。分支、回到旧节点、压缩上下文，都是追加新的 entry。</Say>
+<Say id="k05-04">发给模型的上下文，是从当前叶子沿 parent 走回根，得到的那一条路径。</Say>
+<Say id="k05-05">上下文快满时，compaction 把旧消息总结成摘要，再追加一条 compaction entry。</Say>
+<Say id="k05-06">投影时遇到 compaction，就只保留摘要和它之后的消息，旧消息仍留在文件里。</Say>
+<Say id="k05-07">在树上跳到别的位置时，pi 可以为离开的分支生成摘要，带到新分支里。</Say>
+<Say id="k05-08">读完这一章，你能讲清 buildSessionContext 怎样把一棵树变成一组消息。</Say>
+
+## 1. 问题：线性的消息数组不够用
+
+agent-core 的 `Agent` 只有一个 `state.messages` 数组。如果会话也只存一个数组，有三件事很难做：
+
+1. **回到旧位置重来。** 用户在第 5 条消息处觉得方向错了，想从第 3 条重新问。截断数组会丢掉第 4、5 条，以后想回去看就没了。
+2. **压缩上下文。** 上下文太长要把旧消息换成摘要。直接改数组会丢掉原始记录，出了问题无法追查。
+3. **崩溃安全。** 每次保存都重写整个文件，写到一半崩溃，整个会话就损坏了。
+
+pi 的方案是把会话做成**只追加的树**：
+
+- 文件是 JSONL（每行一个 JSON 对象），新内容只追加到文件末尾。
+- 每条 entry 有 `id` 和 `parentId`，所有 entry 组成一棵树。
+- 有一个“叶子指针” `leafId`，指向当前位置。新 entry 的 `parentId` 就是当前 `leafId`，追加后叶子前移。
+- 发给模型的上下文由“从叶子走回根”的路径计算出来。
+
+这三条规则决定了本章的所有机制：回到旧节点只是移动叶子指针，之后的追加自然形成新分支；compaction 只是追加一条特殊 entry，在计算路径时把旧消息替换成摘要；追加写入一行，崩溃最多丢最后一行。
+
+本章主要读三个文件：
+
+| 文件 | 行数 | 作用 |
+| --- | --- | --- |
+| [session-manager.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/session-manager.ts) | 2028 | entry 类型、读写 JSONL、树遍历、上下文投影 |
+| [compaction/compaction.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/compaction.ts) | 1104 | token 估算、触发判断、切点、摘要生成 |
+| [compaction/branch-summarization.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/branch-summarization.ts) | 386 | 树导航时为离开的分支生成摘要 |
+
+## 2. 数据模型：header 与 entry
+
+### 2.1 文件头和公共字段
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:41-67"
+export const CURRENT_SESSION_VERSION = 3;
+
+export interface SessionHeader {
+	type: "session";
+	version?: number; // v1 sessions don't have this
+	id: string;
+	timestamp: string;
+	cwd: string;
+	parentSession?: string;
+}
+
+export interface NewSessionOptions {
+	id?: string;
+	parentSession?: string;
+}
+
+export interface SessionEntryBase {
+	type: string;
+	id: string;
+	parentId: string | null;
+	timestamp: string;
+}
+
+export interface SessionMessageEntry extends SessionEntryBase {
+	type: "message";
+	message: AgentMessage;
+}
+```
+
+文件第一行永远是 `SessionHeader`：会话 id（uuidv7）、创建时间、工作目录 `cwd`、版本号，以及 fork 出来的会话指向父会话文件的 `parentSession`。header 不参与树结构，它没有 `parentId`。
+
+之后每一行都是一个 `SessionEntry`，公共字段只有四个：`type`、`id`、`parentId`、`timestamp`。根 entry 的 `parentId` 是 `null`。
+
+entry 的 `id` 是 8 位十六进制短 id，生成时检查是否冲突：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:276-284"
+/** Generate a unique short ID (8 hex chars, collision-checked) */
+function generateId(byId: { has(id: string): boolean }): string {
+	for (let i = 0; i < 100; i++) {
+		const id = randomUUID().slice(0, 8);
+		if (!byId.has(id)) return id;
+	}
+	// Fallback to full UUID if somehow we have collisions
+	return randomUUID();
+}
+```
+
+用短 id 是因为 id 会出现在 TUI 的树选择器、扩展 API 和日志里，8 位足够在一个会话内唯一，又便于人读。
+
+### 2.2 全部 entry 类型
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:182-197"
+/** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
+export type SessionEntry =
+	| SessionMessageEntry
+	| ThinkingLevelChangeEntry
+	| ModelChangeEntry
+	| UsageEntry
+	| CompactionEntry
+	| BranchSummaryEntry
+	| CustomEntry
+	| CustomMessageEntry
+	| ContextEditEntry
+	| LabelEntry
+	| SessionInfoEntry;
+
+/** Raw file entry (includes header) */
+export type FileEntry = SessionHeader | SessionEntry;
+```
+
+| type | 关键字段 | 进入模型上下文吗 | 用途 |
+| --- | --- | --- | --- |
+| `message` | `message: AgentMessage` | 是 | user、assistant、toolResult、system、bashExecution 等消息 |
+| `thinking_level_change` | `thinkingLevel` | 否，但决定思考级别 | 切换 thinking 级别 |
+| `model_change` | `provider`、`modelId` | 否，但决定模型 | 切换模型 |
+| `usage` | `kind`、`usage` | 否 | 记录不属于对话的 token 消耗，例如缓存预热 |
+| `compaction` | `summary`、`firstKeptEntryId`、`tokensBefore` | 是，变成摘要消息 | 上下文压缩检查点 |
+| `branch_summary` | `fromId`、`summary` | 是，变成摘要消息 | 离开分支时的摘要 |
+| `custom` | `customType`、`data` | 否 | 扩展存自己的状态 |
+| `custom_message` | `customType`、`content`、`display` | 是，变成 user 消息 | 扩展往上下文里注入内容 |
+| `context_edit` | `targetId`、`replacement` | 间接，修改目标 entry 的贡献 | 只追加地“编辑”早先的消息 |
+| `label` | `targetId`、`label` | 否 | 给 entry 打书签 |
+| `session_info` | `name` | 否 | 会话显示名 |
+
+几点说明：
+
+- `custom` 和 `custom_message` 的区别是“进不进上下文”。扩展保存内部状态用 `custom`，重新加载会话时扫描自己的 `customType` 恢复状态；要让模型看到的内容用 `custom_message`。
+- `context_edit` 是“只追加”原则下的编辑手段：不修改目标 entry，而是追加一条 edit，投影时用 `replacement` 替换目标的内容，`replacement` 为 `null` 表示从上下文里删掉。它只在当前分支上生效。
+- `label` 也是树上的普通节点（有 `parentId`），书签信息在加载时汇总到 `labelsById`。
+
+compaction entry 的结构是本章的重点之一：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:91-116"
+export interface CompactionEntry<T = unknown> extends SessionEntryBase {
+	type: "compaction";
+	summary: string;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
+	details?: T;
+	/** Usage from the LLM call(s) that generated this summary, if available */
+	usage?: Usage;
+	/** True if generated by an extension, undefined/false if pi-generated (backward compatible) */
+	fromHook?: boolean;
+	/** Complete prompt and tool state at this compaction boundary. */
+	systemMessage?: SystemMessage;
+}
+
+export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
+	type: "branch_summary";
+	fromId: string;
+	summary: string;
+	/** Extension-specific data (not sent to LLM) */
+	details?: T;
+	/** Usage from the LLM call that generated this summary, if available */
+	usage?: Usage;
+	/** True if generated by an extension, false if pi-generated */
+	fromHook?: boolean;
+}
+```
+
+`firstKeptEntryId` 记录“从哪条 entry 开始原样保留”，它之前的消息由 `summary` 代替。`systemMessage` 保存压缩那一刻的系统提示和工具状态，因为压缩后旧的 system 消息不再出现在上下文里，需要这里带过去。
+
+### 2.3 一个具体的文件
+
+下面是一个手写的示例（字段有删减），展示树结构在 JSONL 里的样子：
+
+```json
+{"type":"session","version":3,"id":"019a...","timestamp":"...","cwd":"/work/app"}
+{"type":"message","id":"a1","parentId":null,"message":{"role":"user","content":"实现登录"}}
+{"type":"message","id":"a2","parentId":"a1","message":{"role":"assistant","content":[...]}}
+{"type":"message","id":"a3","parentId":"a2","message":{"role":"toolResult","content":[...]}}
+{"type":"message","id":"a4","parentId":"a3","message":{"role":"assistant","content":[...]}}
+{"type":"message","id":"b1","parentId":"a4","message":{"role":"user","content":"改用 JWT"}}
+{"type":"message","id":"b2","parentId":"b1","message":{"role":"assistant","content":[...]}}
+{"type":"branch_summary","id":"c1","parentId":"a4","fromId":"b2","summary":"..."}
+{"type":"message","id":"c2","parentId":"c1","message":{"role":"user","content":"改用 session cookie"}}
+```
+
+文件是按时间顺序的一条直线，但 `parentId` 让它成为一棵树：
+
+```text
+a1 user "实现登录"
+└─ a2 assistant
+   └─ a3 toolResult
+      └─ a4 assistant
+         ├─ b1 user "改用 JWT"          旧分支
+         │  └─ b2 assistant
+         └─ c1 branch_summary            新分支，摘要了 b1-b2
+            └─ c2 user "改用 session cookie"   当前叶子
+```
+
+当前叶子是 `c2`，所以发给模型的上下文是 `a1 → a2 → a3 → a4 → c1 → c2`，b 分支不在其中，但它的要点通过 `c1` 的摘要带了过来。下面几节逐步说明这些是怎么发生的。
+
+## 3. 写入：追加一条 entry
+
+### 3.1 内存结构
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:987-998"
+export class SessionManager {
+	private sessionId: string = "";
+	private sessionFile: string | undefined;
+	private sessionDir: string;
+	private cwd: string;
+	private persist: boolean;
+	private flushed: boolean = false;
+	private fileEntries: FileEntry[] = [];
+	private byId: Map<string, SessionEntry> = new Map();
+	private labelsById: Map<string, string> = new Map();
+	private labelTimestampsById: Map<string, string> = new Map();
+	private leafId: string | null = null;
+```
+
+`fileEntries` 是文件内容在内存里的镜像（含 header），`byId` 是按 id 的索引，`leafId` 是叶子指针。加载文件时 `_buildIndex` 遍历所有 entry 建索引，并把 `leafId` 设为**文件里最后一条** entry（[session-manager.ts:1103-1122](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/session-manager.ts#L1103-L1122)）。这意味着重新打开会话时，会回到最后写入的那个位置，即使它在某个分支上。
+
+会话文件默认放在 `~/.pi/agent/sessions/--<cwd 编码>--/` 下，文件名是 `时间戳_会话id.jsonl`（[session-manager.ts:589-594](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/session-manager.ts#L589-L594)、[1078-1081](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/session-manager.ts#L1078-L1081)）。
+
+### 3.2 appendMessage 与 _appendEntry
+
+所有 `appendXxx` 方法都是同一个模式：构造 entry，`parentId` 取当前 `leafId`，交给 `_appendEntry`。
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1191-1224"
+	private _appendEntry(entry: SessionEntry): void {
+		const previousLeafId = this.leafId;
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this.leafId = entry.id;
+		try {
+			this._persist(entry);
+		} catch (error) {
+			// Keep memory in line with the file: an entry that was not written must not become the
+			// parent of later entries, or the file would hold entries pointing to a missing parent.
+			this.fileEntries.pop();
+			this.byId.delete(entry.id);
+			this.leafId = previousLeafId;
+			throw error;
+		}
+	}
+
+	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
+	 * Does not allow writing CompactionSummaryMessage and BranchSummaryMessage directly.
+	 * Reason: we want these to be top-level entries in the session, not message session entries,
+	 * so it is easier to find them.
+	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
+	 */
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			message,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+```
+
+`_appendEntry` 先更新内存再写盘，写盘失败就回滚内存。注释说明了原因：如果内存里留着一条没写进文件的 entry，后面的 entry 会把它当 parent，文件里就出现指向不存在节点的 `parentId`，树就断了。
+
+摘要类消息（`compactionSummary`、`branchSummary`）不能通过 `appendMessage` 写入，必须用专门的 `appendCompaction`、`branchWithSummary`，让它们成为独立的 entry 类型，便于查找。
+
+### 3.3 延迟创建文件
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1160-1189"
+	/**
+	 * A new session file is created only once the session contains a user or assistant message.
+	 * Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
+	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
+	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
+	 */
+	private _hasConversation(): boolean {
+		return this.fileEntries.some(
+			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+		);
+	}
+
+	_persist(entry: SessionEntry): void {
+		if (!this.persist || !this.sessionFile) return;
+
+		if (!this.flushed) {
+			if (!this._hasConversation()) return;
+			const fd = openSync(this.sessionFile, "wx");
+			try {
+				for (const e of this.fileEntries) {
+					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+				}
+			} finally {
+				closeSync(fd);
+			}
+			this.flushed = true;
+		} else {
+			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+		}
+	}
+```
+
+启动 pi 时会先写入模型、thinking 级别、系统提示等设置类 entry。如果用户什么都没说就退出，不应该留下一个空会话文件。所以在第一条 user 或 assistant 消息出现之前，entry 只留在内存里；出现之后，用 `"wx"`（文件已存在则失败）一次性写出所有已有 entry，此后每条 entry 都是 `appendFileSync` 追加一行。
+
+### 3.4 谁在什么时候写
+
+AgentSession 订阅 agent-core 的事件，在 `message_end` 时把消息写入会话：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1146-1168"
+		// Handle session persistence
+		if (event.type === "message_end") {
+			let entryId: string | undefined;
+			// Check if this is a custom message from extensions
+			if (event.message.role === "custom") {
+				// Persist as CustomMessageEntry
+				entryId = this.sessionManager.appendCustomMessageEntry(
+					event.message.customType,
+					event.message.content,
+					event.message.display,
+					event.message.details,
+				);
+			} else if (
+				event.message.role === "system" ||
+				event.message.role === "user" ||
+				event.message.role === "assistant" ||
+				event.message.role === "toolResult"
+			) {
+				// Regular LLM message - persist as SessionMessageEntry
+				entryId = this.sessionManager.appendMessage(event.message);
+			}
+			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
+			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+```
+
+每条消息在流式输出完成后才落盘，流式过程中的中间状态不写入。`_entryIdsByMessage` 记录消息对象和 entry id 的对应关系，后面判断“这条 assistant 消息是否还在上下文里”时要用。
+
+## 4. 上下文是树的投影
+
+### 4.1 第一步：从叶子走回根
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:390-416"
+function buildSessionPath(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionEntry[] {
+	const index = buildEntryIndex(entries, byId);
+	let leaf: SessionEntry | undefined;
+	if (leafId === null) {
+		return [];
+	}
+	if (leafId) {
+		leaf = index.get(leafId);
+	}
+	leaf ??= entries[entries.length - 1];
+	if (!leaf) {
+		return [];
+	}
+
+	const path: SessionEntry[] = [];
+	let current: SessionEntry | undefined = leaf;
+	while (current) {
+		path.push(current);
+		current = current.parentId ? index.get(current.parentId) : undefined;
+	}
+	path.reverse();
+	return path;
+}
+```
+
+从叶子开始沿 `parentId` 往上走，直到根（`parentId` 为 `null`），再反转成从根到叶子的顺序。`leafId === null` 表示叶子在“所有 entry 之前”（重新编辑第一条消息时会出现），路径为空。`SessionManager.getBranch()`（[session-manager.ts:1479-1489](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/session-manager.ts#L1479-L1489)）是同一个算法的方法版本。
+
+走一遍第 2.3 节的例子：叶子 `c2`，`c2.parentId = c1`，`c1.parentId = a4`，`a4 → a3 → a2 → a1`，`a1.parentId = null` 停止。反转后得到 `[a1, a2, a3, a4, c1, c2]`。`b1`、`b2` 不在任何一步的 parent 链上，自然被排除。
+
+### 4.2 第二步：处理 compaction
+
+路径上可能有 compaction entry。`buildContextEntries` 把“最新一次 compaction 之前、`firstKeptEntryId` 之前”的 entry 去掉：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:468-512"
+/**
+ * Build the active, compaction-aware session entry list.
+ *
+ * This follows the current leaf path. If the path contains compaction entries,
+ * the latest compaction is represented by the compaction entry itself, followed
+ * by the kept entries starting at firstKeptEntryId and all entries after the
+ * compaction entry. Older summarized entries are omitted.
+ */
+export function buildContextEntries(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionEntry[] {
+	const path = buildSessionPath(entries, leafId, byId);
+	let compaction: CompactionEntry | null = null;
+
+	for (const entry of path) {
+		if (entry.type === "compaction") {
+			compaction = entry;
+		}
+	}
+
+	if (!compaction) {
+		return path;
+	}
+
+	const compactionIdx = path.findIndex((entry) => entry.id === compaction.id);
+	if (compactionIdx < 0) {
+		return path;
+	}
+
+	const contextEntries: SessionEntry[] = [compaction];
+	let foundFirstKept = false;
+	for (let i = 0; i < compactionIdx; i++) {
+		const entry = path[i];
+		if (entry.id === compaction.firstKeptEntryId) {
+			foundFirstKept = true;
+		}
+		if (foundFirstKept && !(entry.type === "message" && entry.message.role === "system")) {
+			contextEntries.push(entry);
+		}
+	}
+	contextEntries.push(...path.slice(compactionIdx + 1));
+	return contextEntries;
+}
+```
+
+结果的顺序是：
+
+1. compaction entry 本身（之后会变成摘要消息）；
+2. 路径上从 `firstKeptEntryId` 到 compaction 之前的 entry（被保留的近期消息），跳过其中的 system 消息，因为 compaction entry 自己带了 `systemMessage`；
+3. compaction 之后的所有 entry。
+
+只看最新一次 compaction。更早的 compaction 已经被新的摘要吸收（新摘要是在旧摘要基础上更新的，见第 6.4 节），不需要再出现。
+
+注意 compaction entry 在**文件里**的位置是在被保留消息的后面（它是压缩时追加的），但在**上下文里**被挪到最前面。这就是“投影”的意思：文件保存发生了什么，上下文按需要重新排列。
+
+### 4.3 第三步：每条 entry 变成消息
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:435-466"
+/**
+ * Project one selected session entry into LLM/runtime messages.
+ * Plain custom entries are display/state entries and do not participate in context.
+ */
+export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	if (entry.type === "message") {
+		const message = entry.message;
+		// Session files are parsed without validation; old versions, forks, or
+		// hand-edited files can contain messages with null/missing content.
+		if (message.role === "system" && message.content == null) return [{ ...message, content: "" }];
+		if (
+			(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
+			message.content == null
+		) {
+			return [{ ...message, content: [] }];
+		}
+		return [message];
+	}
+	if (entry.type === "custom_message") {
+		return [
+			createCustomMessage(entry.customType, entry.content ?? [], entry.display, entry.details, entry.timestamp),
+		];
+	}
+	if (entry.type === "branch_summary" && entry.summary) {
+		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
+	}
+	if (entry.type === "compaction") {
+		const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+		return entry.systemMessage ? [entry.systemMessage, summary] : [summary];
+	}
+	return [];
+}
+```
+
+只有四种 entry 产生消息：`message`、`custom_message`、`branch_summary`、`compaction`。其余类型（模型切换、标签、usage 等）返回空数组，它们只影响状态，不进入对话。compaction 产生两条：先是保存的系统消息，然后是摘要消息。
+
+摘要消息是 coding-agent 自定义的 `AgentMessage` 角色（`compactionSummary`、`branchSummary`），到调用模型前才由 `convertToLlm` 转成 user 消息，加上说明性的前后缀：
+
+```ts title="packages/coding-agent/src/core/messages.ts:11-24"
+export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
+
+<summary>
+`;
+
+export const COMPACTION_SUMMARY_SUFFIX = `
+</summary>`;
+
+export const BRANCH_SUMMARY_PREFIX = `The following is a summary of a branch that this conversation came back from:
+
+<summary>
+`;
+
+export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
+```
+
+```ts title="packages/coding-agent/src/core/messages.ts:170-183"
+				case "branchSummary":
+					return {
+						role: "user",
+						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
+						timestamp: m.timestamp,
+					};
+				case "compactionSummary":
+					return {
+						role: "user",
+						content: [
+							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+						],
+						timestamp: m.timestamp,
+					};
+```
+
+这是第 2 章“消息只在边界转换”原则的应用：会话和 TUI 里摘要是一种独立消息（可以单独渲染、单独统计），只有发给模型时才变成普通的 user 文本。
+
+### 4.4 合起来：buildSessionProjection 与 buildSessionContext
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:542-583"
+/** Build provenance-preserving, compaction-aware model context. */
+export function buildSessionProjection(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionProjection {
+	const path = buildSessionPath(entries, leafId, byId);
+	const { thinkingLevel, model } = getSessionContextSettings(path);
+	const contextEntries = buildContextEntries(entries, leafId, byId);
+	const edits = new Map<string, ContextEditEntry>();
+	for (const entry of contextEntries) {
+		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
+	}
+	const projectedEntries = contextEntries.map(
+		(sourceEntry, index): ProjectedSessionEntry => ({
+			sourceEntry,
+			// buildContextEntries() may retain an older compaction entry because its
+			// raw ID lies inside the newest retained range. Only the newest compaction
+			// at index zero contributes a checkpoint and summary.
+			messages:
+				sourceEntry.type === "compaction" && index > 0
+					? []
+					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+		}),
+	);
+	return {
+		entries: projectedEntries,
+		messages: projectedEntries.flatMap((entry) => entry.messages),
+		thinkingLevel,
+		model,
+	};
+}
+
+/** Build the finalized model context from the canonical session projection. */
+export function buildSessionContext(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionContext {
+	const { messages, thinkingLevel, model } = buildSessionProjection(entries, leafId, byId);
+	return { messages, thinkingLevel, model };
+}
+```
+
+完整的投影流程：
+
+```text
+buildSessionPath           叶子 → 根，反转            [a1 ... c2]
+getSessionContextSettings  沿路径找最后的模型和思考级别
+buildContextEntries        按最新 compaction 裁剪
+收集 context_edit          targetId → 最新一条 edit
+projectContextEntry        每条 entry → 消息，应用 edit
+flatMap                    得到 AgentMessage[]
+```
+
+`ProjectedSessionEntry` 保留了“每条消息来自哪条 entry”（`sourceEntry`），所以叫“保留出处的投影”。compaction 需要这个信息来决定切点落在哪条 entry 上。`buildSessionContext` 只是丢掉出处，返回纯消息。
+
+模型和思考级别也是从路径上算出来的：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:418-433"
+function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
+	let thinkingLevel = "off";
+	let model: { provider: string; modelId: string } | null = null;
+
+	for (const entry of path) {
+		if (entry.type === "thinking_level_change") {
+			thinkingLevel = entry.thinkingLevel;
+		} else if (entry.type === "model_change") {
+			model = { provider: entry.provider, modelId: entry.modelId };
+		} else if (entry.type === "message" && entry.message.role === "assistant") {
+			model = { provider: entry.message.provider, modelId: entry.message.model };
+		}
+	}
+
+	return { thinkingLevel, model };
+}
+```
+
+这里用的是完整路径而不是 compaction 裁剪后的列表，所以压缩前切换的模型仍然有效。不同分支可以用不同的模型：在 A 分支切到另一个模型，跳回 B 分支时投影出来的是 B 分支上最后使用的模型。
+
+AgentSession 在需要时用投影整体替换 agent 的消息数组：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:938-944"
+	private _refreshFinalizedContext(): void {
+		const projection = this.sessionManager.buildSessionProjection();
+		for (const entry of projection.entries) {
+			for (const message of entry.messages) this._entryIdsByMessage.set(message, entry.sourceEntry.id);
+		}
+		this.agent.state.messages = projection.messages;
+	}
+```
+
+compaction 之后、树导航之后都会调用它。agent-core 不知道树的存在，它看到的永远是一个线性数组，这个数组由 SessionManager 根据当前叶子投影出来。
+
+## 5. 分支：在旧节点继续对话
+
+### 5.1 移动叶子指针
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1583-1635"
+	/**
+	 * Start a new branch from an earlier entry.
+	 * Moves the leaf pointer to the specified entry. The next appendXXX() call
+	 * will create a child of that entry, forming a new branch. Existing entries
+	 * are not modified or deleted.
+	 */
+	branch(branchFromId: string): void {
+		if (!this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		this.leafId = branchFromId;
+	}
+
+	/**
+	 * Reset the leaf pointer to null (before any entries).
+	 * The next appendXXX() call will create a new root entry (parentId = null).
+	 * Use this when navigating to re-edit the first user message.
+	 */
+	resetLeaf(): void {
+		this.leafId = null;
+	}
+
+	/**
+	 * Start a new branch with a summary of the abandoned path.
+	 * Same as branch(), but also appends a branch_summary entry that captures
+	 * context from the abandoned conversation path.
+	 */
+	branchWithSummary(
+		branchFromId: string | null,
+		summary: string,
+		details?: unknown,
+		fromHook?: boolean,
+		usage?: Usage,
+	): string {
+		if (branchFromId !== null && !this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		const fromId = this.leafId ?? "root";
+		this.leafId = branchFromId;
+		const entry: BranchSummaryEntry = {
+			type: "branch_summary",
+			id: generateId(this.byId),
+			parentId: branchFromId,
+			timestamp: new Date().toISOString(),
+			fromId,
+			summary,
+			details,
+			usage,
+			fromHook,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+```
+
+`branch()` 只做一件事：把 `leafId` 设成目标 id。它不写文件，不删除任何东西。下一次 `appendMessage` 时新 entry 的 `parentId` 就是目标 id，目标节点从此有两个孩子，树就分叉了。
+
+`resetLeaf()` 把叶子设为 `null`，下一条 entry 成为新的根。一个文件因此可以有多个根，`getTree()` 会把它们都返回。
+
+`branchWithSummary()` 在移动叶子的同时追加一条 `branch_summary`，`fromId` 记录离开时的叶子位置。注意 `parentId` 是新位置而不是旧叶子，摘要挂在新分支上，这样它才会出现在新分支的投影里。
+
+### 5.2 跳到不同类型节点的规则
+
+用户在 `/tree` 里选中一个节点时，AgentSession 的 `navigateTree` 决定新叶子放在哪：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:4148-4189"
+			// Determine the new leaf position based on target type
+			let newLeafId: string | null;
+			let editorText: string | undefined;
+
+			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+				// User message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.message.content, "");
+			} else if (targetEntry.type === "custom_message") {
+				// Custom message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.content, "");
+			} else {
+				// Non-user message: leaf = selected node
+				newLeafId = targetId;
+			}
+
+			// Switch leaf (with or without summary)
+			// Summary is attached at the navigation target position (newLeafId), not the old branch
+			let summaryEntry: BranchSummaryEntry | undefined;
+			if (summaryText) {
+				// Create summary at target position (can be null for root)
+				const summaryId = this.sessionManager.branchWithSummary(
+					newLeafId,
+					summaryText,
+					summaryDetails,
+					fromExtension,
+					summaryUsage,
+				);
+				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
+
+				// Attach label to the summary entry
+				if (label) {
+					this.sessionManager.appendLabelChange(summaryId, label);
+				}
+			} else if (newLeafId === null) {
+				// No summary, navigating to root - reset leaf
+				this.sessionManager.resetLeaf();
+			} else {
+				// No summary, navigating to non-root
+				this.sessionManager.branch(newLeafId);
+			}
+```
+
+区分两种目标：
+
+- **选中 user 消息**：意思是“我想重新问这个问题”。叶子放到它的**父节点**，原问题文本放回编辑器，用户可以修改后重新发送。新消息会成为原问题的兄弟节点。第 2.3 节的例子里，选中 `b1` 后叶子移到 `a4`，编辑器里出现“改用 JWT”，用户改成“改用 session cookie”发送，得到 `c2`。
+- **选中其他消息**（例如 assistant 回复）：意思是“从这里接着聊”。叶子就放在它上面，下一条消息成为它的孩子。
+
+最后调用 `_refreshFinalizedContext()` 重新投影，agent 的消息数组立刻变成新分支的内容。
+
+### 5.3 导出成独立文件：createBranchedSession
+
+如果想把某条分支拿出来作为独立会话（`/fork` 一类操作），`createBranchedSession` 只复制根到指定叶子的路径，写进一个新文件：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1642-1692"
+	createBranchedSession(leafId: string): string | undefined {
+		const previousSessionFile = this.sessionFile;
+		const path = this.getBranch(leafId);
+		if (path.length === 0) {
+			throw new Error(`Entry ${leafId} not found`);
+		}
+
+		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
+		// Because labels are real tree entries, later entries can be children of labels;
+		// removing labels requires re-chaining the retained path to avoid orphaned subtrees.
+		const pathWithoutLabels: SessionEntry[] = [];
+		const replacementByLabelId = new Map<string, string>();
+		const pendingLabelIds: string[] = [];
+		let pathParentId: string | null = null;
+		for (const entry of path) {
+			if (entry.type === "label") {
+				pendingLabelIds.push(entry.id);
+				continue;
+			}
+			// ...
+			pathWithoutLabels.push(
+				entry.type === "compaction"
+					? {
+							...entry,
+							parentId: pathParentId,
+							// ...
+						}
+					: { ...entry, parentId: pathParentId },
+			);
+			pathParentId = entry.id;
+		}
+
+		const newSessionId = createSessionId();
+		// ...
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: newSessionId,
+			timestamp,
+			cwd: this.cwd,
+			parentSession: this.persist ? previousSessionFile : undefined,
+		};
+```
+
+新文件的 header 用 `parentSession` 指回原文件，entry 的 id 保持不变。label entry 被去掉后重新链接 `parentId`，再把仍然有效的标签作为新的 label entry 追加到末尾。这和树内分支不同：树内分支共享一个文件，`createBranchedSession` 是复制出一个新文件。
+
+## 6. Compaction：上下文压缩
+
+### 6.1 什么时候触发
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:120-130"
+export interface CompactionSettings {
+	enabled: boolean;
+	reserveTokens: number;
+	keepRecentTokens: number;
+}
+
+export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+	enabled: true,
+	reserveTokens: 16384,
+	keepRecentTokens: 20000,
+};
+```
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:264-270"
+/**
+ * Check if compaction should trigger based on context usage.
+ */
+export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+	if (!settings.enabled) return false;
+	return contextTokens > contextWindow - settings.reserveTokens;
+}
+```
+
+阈值是“窗口大小减去预留量”。以 200k 窗口为例：`200000 − 16384 = 183616`，上下文超过 183616 个 token 就压缩。预留 16384 是给下一次回复和工具结果留的空间：如果等到真正溢出才压缩，下一次请求就会失败。
+
+两个参数的含义：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `reserveTokens` | 16384 | 触发阈值 = 窗口 − 它 |
+| `keepRecentTokens` | 20000 | 压缩后原样保留的近期消息大约有多少 token |
+
+两者都可以在设置里配置，并且支持按模型覆盖（`compaction.modelOverrides["provider/id"]`，见 [settings-manager.ts:833-880](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/settings-manager.ts#L833-L880)）。
+
+### 6.2 token 数从哪里来
+
+最准确的数据是 provider 返回的 `usage`：上一次 assistant 回复的 `input + output + cacheRead + cacheWrite` 就是当时整个上下文的大小。之后新增的消息（工具结果、用户输入）还没有 usage，只能估算：
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:192-224"
+/**
+ * Estimate context tokens from messages, using the last assistant usage when available.
+ * If there are messages after the last usage, estimate their tokens with estimateTokens.
+ */
+export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	const usageInfo = getLastAssistantUsageInfo(messages);
+
+	if (!usageInfo) {
+		let estimated = 0;
+		for (const message of messages) {
+			estimated += estimateTokens(message);
+		}
+		return {
+			tokens: estimated,
+			usageTokens: 0,
+			trailingTokens: estimated,
+			lastUsageIndex: null,
+		};
+	}
+
+	const usageTokens = calculateContextTokens(usageInfo.usage);
+	let trailingTokens = 0;
+	for (let i = usageInfo.index + 1; i < messages.length; i++) {
+		trailingTokens += estimateTokens(messages[i]);
+	}
+
+	return {
+		tokens: usageTokens + trailingTokens,
+		usageTokens,
+		trailingTokens,
+		lastUsageIndex: usageInfo.index,
+	};
+}
+```
+
+估算方法是“字符数除以 4”：
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:294-330"
+/**
+ * Estimate token count for a message using chars/4 heuristic.
+ * This is conservative (overestimates tokens).
+ */
+export function estimateTokens(message: AgentMessage): number {
+	let chars = 0;
+
+	switch (message.role) {
+		// ...
+		case "user": {
+			chars = estimateTextAndImageContentChars(
+				(message as { content: string | Array<{ type: string; text?: string }> }).content,
+			);
+			return Math.ceil(chars / 4);
+		}
+		case "assistant": {
+			const assistant = message as AssistantMessage;
+			for (const block of assistant.content) {
+				if (block.type === "text") {
+					chars += block.text.length;
+				} else if (block.type === "thinking") {
+					chars += block.thinking.length;
+				} else if (block.type === "toolCall") {
+					chars += block.name.length + JSON.stringify(block.arguments).length;
+				}
+			}
+			return Math.ceil(chars / 4);
+		}
+```
+
+英文大约 4 个字符一个 token，这个估算偏保守（倾向于多估），宁可早一点压缩。图片按固定 4800 字符计（`ESTIMATED_IMAGE_CHARS`）。
+
+### 6.3 三种自动触发
+
+`_checkCompaction` 在 agent 一次运行结束后（`_handlePostAgentRun`，[agent-session.ts:2008](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L2008)）和新一次运行开始前（`_prepareRun`，[agent-session.ts:1931](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L1931)）被调用，区分三种情况：
+
+| 情况 | 判断条件 | 压缩后 |
+| --- | --- | --- |
+| 溢出 | provider 返回上下文溢出错误 | 自动重试刚才的请求（最多一次） |
+| 可恢复的截断 | 因 `length` 停止，且输出没到模型自身的上限 | 自动重试（最多一次） |
+| 超过阈值 | `shouldCompact` 为真 | 不重试，只压缩 |
+
+阈值情况的代码：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3109-3144"
+		// Case 3: threshold compaction without retry.
+		// For error messages or all-zero usage messages, estimate from the last valid response.
+		// This ensures sessions that hit persistent API errors (e.g. 529) or malformed zero-usage
+		// responses can still compact and do not reset context accounting.
+		let contextTokens: number;
+		const projection = currentProjection;
+		const hasContextEdits = projection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
+		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
+		if (hasContextEdits) {
+			contextTokens = estimateProjectedContextTokens(projection, branch).tokens;
+		} else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
+			const messages = this.agent.state.messages;
+			const estimate = estimateContextTokens(messages);
+			// Without provider usage, estimate.tokens is the pure message-size estimate.
+			// Only usage-backed estimates need the stale pre-compaction check.
+			if (estimate.lastUsageIndex !== null) {
+				// Verify the usage source is post-compaction. Kept pre-compaction messages
+				// have stale usage reflecting the old (larger) context and would falsely
+				// trigger compaction right after one just finished.
+				const usageMsg = messages[estimate.lastUsageIndex];
+				if (
+					compactionEntry &&
+					usageMsg.role === "assistant" &&
+					(usageMsg as AssistantMessage).timestamp <= new Date(compactionEntry.timestamp).getTime()
+				) {
+					return false;
+				}
+			}
+			contextTokens = estimate.tokens;
+		} else {
+			contextTokens = directContextTokens;
+		}
+		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			return await this._runAutoCompaction("threshold", false);
+		}
+		return false;
+```
+
+一个容易踩的坑写在注释里：压缩后保留的近期消息里，有些 assistant 消息带着压缩**之前**的 usage（当时上下文很大）。如果用它来判断，刚压缩完就会又触发一次。所以要检查 usage 来源的时间戳是否晚于最新的 compaction。
+
+### 6.4 findCutPoint：从哪里切
+
+压缩要决定“哪些消息总结掉、哪些原样保留”。规则是从最新的消息往回累加 token，攒够 `keepRecentTokens` 就切。但切点不能随便落：
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:351-379"
+function isCutPointMessage(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "assistant":
+		case "bashExecution":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return true;
+		case "toolResult":
+			return false;
+	}
+	return false;
+}
+
+function isTurnStartMessage(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "bashExecution":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return true;
+		case "assistant":
+		case "toolResult":
+			return false;
+	}
+	return false;
+}
+```
+
+**不能切在 toolResult 上。** provider 要求每个 toolResult 前面必须有对应的 toolCall。如果保留部分以一条 toolResult 开头，它的 toolCall 在被总结掉的部分里，请求会被拒绝。切在 assistant 上没问题：它的 toolResult 跟在后面，会一起保留。
+
+`isTurnStartMessage` 定义“一个 turn 的开头”：用户输入类的消息。assistant 不算 turn 开头，切在 assistant 上意味着把一个 turn 从中间切开（split turn），这种情况要特殊处理（见 6.6）。
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:446-501"
+export function findCutPoint(
+	entries: SessionEntry[],
+	startIndex: number,
+	endIndex: number,
+	keepRecentTokens: number,
+): CutPointResult {
+	const cutPoints = findValidCutPoints(entries, startIndex, endIndex);
+
+	if (cutPoints.length === 0) {
+		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+	}
+
+	// Walk backwards from newest, accumulating estimated message sizes
+	let accumulatedTokens = 0;
+	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
+
+	for (let i = endIndex - 1; i >= startIndex; i--) {
+		const entry = entries[i];
+		const messageTokens = sessionEntryToContextMessages(entry).reduce(
+			(sum, message) => sum + estimateTokens(message),
+			0,
+		);
+		if (messageTokens === 0) continue;
+		accumulatedTokens += messageTokens;
+
+		// Check if we've exceeded the budget
+		if (accumulatedTokens >= keepRecentTokens) {
+			// Prefer the closest valid cut point at or after this entry. If trailing
+			// tool results exceed the budget by themselves, keep their preceding
+			// assistant tool call instead of falling back to the first message.
+			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+			break;
+		}
+	}
+
+	// Scan backwards from cutIndex to include adjacent metadata entries that do not affect context.
+	while (cutIndex > startIndex) {
+		const prevEntry = entries[cutIndex - 1];
+		// Stop at compaction boundaries or context-visible entries.
+		if (prevEntry.type === "compaction" || sessionEntryToContextMessages(prevEntry).length > 0) {
+			break;
+		}
+		cutIndex--;
+	}
+
+	// Determine if this is a split turn
+	const cutEntry = entries[cutIndex];
+	const startsTurn = isTurnStartEntry(cutEntry);
+	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+
+	return {
+		firstKeptEntryIndex: cutIndex,
+		turnStartIndex,
+		isSplitTurn: !startsTurn && turnStartIndex !== -1,
+	};
+}
+```
+
+逐步走一个例子，`keepRecentTokens = 20000`：
+
+```text
+idx  entry                 估算 token   从后累加
+ 0   user      "需求"         200
+ 1   assistant (toolCall)     300
+ 2   toolResult             30000      46900  超过 20000，停
+ 3   assistant               800       16900
+ 4   user      "继续"         100       16100
+ 5   assistant (toolCall)     400       16000
+ 6   toolResult             15000      15600
+ 7   assistant               600         600
+```
+
+从 7 往回加：7 → 600，6 → 15600，5 → 16000，4 → 16100，3 → 16900，2 → 46900，超过 20000，停在 `i = 2`。合法切点是 `[0, 1, 3, 4, 5, 7]`（2、6 是 toolResult），找 `>= 2` 的第一个，得到 `cutIndex = 3`。
+
+然后向前扩展：如果 3 前面紧挨着模型切换、标签这类不产生消息的 entry，把它们也纳入保留范围，免得它们孤零零地被总结掉。
+
+最后判断是否切开了 turn：entry 3 是 assistant，不是 turn 开头，往前找到 turn 开头 entry 0，所以 `isSplitTurn = true`、`turnStartIndex = 0`。
+
+这里有两个“偏向保留”的选择：累加超额后选的是 `>= i` 的切点（往新的方向靠），所以实际保留的可能略少于预算；而当最后的 toolResult 自己就超过预算时，也会保留它前面的 toolCall，而不是退回到第一条消息。
+
+实际的压缩流程用的是 `findProjectedCutPoint`（[compaction.ts:789-857](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/compaction.ts#L789-L857)），算法相同，但作用在 `ProjectedSessionEntry` 上，这样应用过 `context_edit` 之后的内容大小才是准的。它还多一条规则：如果切点之后只剩一次被省略的溢出重试尝试，切点再往后移一格。`findCutPoint` 作为公共 API 从包入口导出（[index.ts:41](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/index.ts#L41)）。
+
+### 6.5 prepareCompaction：决定总结哪些消息
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:859-923"
+export function prepareCompaction(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+): CompactionPreparation | undefined {
+	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
+		return undefined;
+	}
+
+	const projection = buildSessionProjection(pathEntries);
+	const projectedEntries = projection.entries;
+	const sourceEntries = projectedEntries.map((entry) => entry.sourceEntry);
+	// The newest compaction is projected first. Older compaction entries can still
+	// occur in its retained raw range, but their projected contribution is empty.
+	const prevCompactionIndex = projectedEntries.findIndex(
+		(entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
+	);
+
+	let previousSummary: string | undefined;
+	let boundaryStart = 0;
+	if (prevCompactionIndex >= 0) {
+		previousSummary = (projectedEntries[prevCompactionIndex].sourceEntry as CompactionEntry).summary;
+		// The canonical projection has already selected the previous compaction's retained tail.
+		boundaryStart = prevCompactionIndex + 1;
+	}
+	const boundaryEnd = projectedEntries.length;
+	const tokensBefore = estimateProjectedContextTokens(projection, pathEntries).tokens;
+	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+
+	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
+	if (!firstKeptEntry?.id) return undefined;
+	const firstKeptEntryId = firstKeptEntry.id;
+	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
+
+	const messagesToSummarize = projectedEntries
+		.slice(boundaryStart, historyEnd)
+		.flatMap(getMessagesFromProjectedEntryForCompaction);
+	const turnPrefixMessages = cutPoint.isSplitTurn
+		? projectedEntries
+				.slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
+				.flatMap(getMessagesFromProjectedEntryForCompaction)
+		: [];
+
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) return undefined;
+
+	// Extract file operations from edited model-visible messages and the previous compaction.
+	const fileOps = extractFileOperations(messagesToSummarize, sourceEntries, prevCompactionIndex);
+	// ...
+	return {
+		firstKeptEntryId,
+		messagesToSummarize,
+		turnPrefixMessages,
+		isSplitTurn: cutPoint.isSplitTurn,
+		tokensBefore,
+		previousSummary,
+		fileOps,
+		settings,
+	};
+}
+```
+
+几个要点：
+
+- **输入是当前分支的路径**（AgentSession 传入 `sessionManager.getBranch()`），先做一次投影。
+- **增量压缩**。如果投影里已经有一次 compaction（它在投影的第 0 位），就把它的摘要作为 `previousSummary`，并且只在它之后的范围里找切点。新摘要是“旧摘要 + 新消息”合并出来的，所以旧的 compaction 不需要再进入上下文。
+- **三段划分**。以前面的例子来说，`[boundaryStart, turnStartIndex)` 是 `messagesToSummarize`（历史），`[turnStartIndex, firstKeptEntryIndex)` 是 `turnPrefixMessages`（被切开的 turn 的前半段），`firstKeptEntryIndex` 之后原样保留。
+- **路径末尾已经是 compaction 就不做**，避免连续压缩两次。
+- 返回 `undefined` 表示没什么可压缩的，调用方直接放弃。
+
+`CompactionPreparation` 这个中间结构会通过 `session_before_compact` 事件交给扩展，扩展可以取消压缩，或者自己生成摘要替换默认实现（[agent-session.ts:3184-3204](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L3184-L3204)）。
+
+### 6.6 生成摘要：提示词与调用
+
+首次摘要的提示词要求固定格式：
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:507-538"
+const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+```
+
+摘要的读者是“另一个接着干活的模型”，所以按“目标、约束、进度、决策、下一步、关键上下文”组织，并要求保留确切的文件路径、函数名和错误信息，这些一旦被改写成泛泛的描述就没法用了。已有旧摘要时改用 `UPDATE_SUMMARIZATION_PROMPT`（[compaction.ts:540-579](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/compaction.ts#L540-L579)），规则是保留旧信息、添加新进展、把完成的项从 In Progress 移到 Done。
+
+调用过程：
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:713-752"
+	// Use update prompt if we have a previous summary, otherwise initial prompt
+	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+
+	// Serialize conversation to text so model doesn't try to continue it
+	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
+	const llmMessages = convertToLlm(currentMessages);
+	const conversationText = serializeConversation(llmMessages);
+
+	// Build the prompt with conversation wrapped in tags
+	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+	if (previousSummary) {
+		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+	}
+	promptText += basePrompt;
+
+	const completionOptions = createSummarizationOptions(model, apiKey, headers, env, signal, thinkingLevel, sessionId);
+
+	const response = await completeSummarization(
+		model,
+		buildSummarizationContext(promptText),
+		completionOptions,
+		streamFn,
+		retry,
+		callbacks,
+	);
+
+	const failure = getSummarizationFailure(response, "Summarization");
+	if (failure) {
+		throw new Error(failure);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Summarization attempted to call a tool");
+	}
+
+	const textContent = contentText(response.content);
+
+	return { text: textContent, usage: response.usage };
+```
+
+关键的一步是**把对话序列化成纯文本**，而不是作为多轮消息发过去。如果把原始的 user/assistant 消息直接发给模型，模型会以为自己在这场对话里，倾向于接着回答最后一个问题。序列化后整段对话都在一条 user 消息里，包在 `<conversation>` 标签中，模型只能把它当作材料来总结。系统提示也明确禁止继续对话：
+
+```ts title="packages/coding-agent/src/core/compaction/utils.ts:120-163"
+export function serializeConversation(messages: Message[]): string {
+	const parts: string[] = [];
+
+	for (const msg of messages) {
+		if (msg.role === "user") {
+			const content = contentText(msg.content, "");
+			if (content) parts.push(`[User]: ${content}`);
+		} else if (msg.role === "assistant") {
+			const toolCalls: string[] = [];
+
+			for (const block of msg.content) {
+				if (block.type === "toolCall") {
+					const args = block.arguments as Record<string, unknown>;
+					const argsStr = Object.entries(args)
+						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+						.join(", ");
+					toolCalls.push(`${block.name}(${argsStr})`);
+				}
+			}
+
+			if (msg.content.some((block) => block.type === "text")) {
+				parts.push(`[Assistant]: ${contentText(msg.content)}`);
+			}
+			if (toolCalls.length > 0) {
+				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+			}
+		} else if (msg.role === "toolResult") {
+			const content = contentText(msg.content, "");
+			if (content) {
+				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+			}
+		}
+	}
+
+	return parts.join("\n\n");
+}
+
+// ...
+
+export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
+
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+```
+
+序列化时做了两处删减：每条工具结果截到 2000 字符（摘要不需要完整的文件内容），thinking 块整个省略（注释说明 provider 返回的思考内容往往只是摘要，带上会让总结请求比被总结的上下文还大）。
+
+其他防护：
+
+- 结果因 `length` 停止（被截断）时视为失败，不能把半截摘要存成检查点（`getSummarizationFailure`，[compaction.ts:585-593](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/compaction.ts#L585-L593)）。
+- 模型试图调用工具也视为失败。
+- `completeSummarization` 设置 `cacheRetention: "none"`，一次性的总结请求不写 prompt 缓存；并用 `retryAssistantCall` 包装，网络中断等临时错误按重试策略重试（[compaction.ts:618-638](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/compaction.ts#L618-L638)）。
+
+### 6.7 split turn：两份摘要合成一份
+
+如果切点切开了一个 turn，`compact()` 分别生成两份摘要：
+
+```ts title="packages/coding-agent/src/core/compaction/compaction.ts:980-1019"
+	if (isSplitTurn && turnPrefixMessages.length > 0) {
+		let historyText = previousSummary ?? "No prior history.";
+		let historyUsage: Usage | undefined;
+		if (messagesToSummarize.length > 0) {
+			const historyResult = await generateSummaryWithUsage(
+				messagesToSummarize,
+				model,
+				undefined,
+				apiKey,
+				headers,
+				signal,
+				customInstructions,
+				previousSummary,
+				thinkingLevel,
+				streamFn,
+				env,
+				retry,
+				callbacks,
+				sessionId,
+			);
+			historyText = historyResult.text;
+			historyUsage = historyResult.usage;
+		}
+		const turnPrefixResult = await generateTurnPrefixSummary(
+			turnPrefixMessages,
+			// ...
+		);
+		// Merge into single summary
+		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
+		summaryUsage = historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage;
+	} else {
+```
+
+为什么要单独总结 turn 前缀？回到 6.4 的例子：保留部分从 entry 3（assistant）开始，模型看到的是一个没头没尾的回复，不知道用户当初要求了什么。turn 前缀摘要（`TURN_PREFIX_SUMMARIZATION_PROMPT`，[compaction.ts:929-942](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/compaction.ts#L929-L942)）专门回答“原始请求是什么、这一段做到了哪”，接在历史摘要后面，为保留的后半段补上开头。
+
+两种情况最后都会附上文件清单：从被总结消息的 read、write、edit 工具调用参数里收集文件路径，加上前一次 compaction 的 `details` 里记录的列表，格式化成 `<read-files>`、`<modified-files>` 两段追加到摘要末尾（[compaction.ts:1042-1056](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/compaction.ts#L1042-L1056)）。文件清单同时存进 entry 的 `details`，下一次压缩可以接着累加。这样即使对话细节被总结掉，模型仍然知道动过哪些文件。
+
+### 6.8 追加 compaction entry，不删除任何东西
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1270-1297"
+	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */
+	appendCompaction<T = unknown>(
+		summary: string,
+		firstKeptEntryId: string | null,
+		tokensBefore: number,
+		details?: T,
+		fromHook?: boolean,
+		usage?: Usage,
+	): string {
+		const timestamp = new Date().toISOString();
+		const systemMessage = getCurrentSystemMessage(this.buildSessionProjection().messages);
+		const id = generateId(this.byId);
+		const entry: CompactionEntry<T> = {
+			type: "compaction",
+			id,
+			parentId: this.leafId,
+			timestamp,
+			summary,
+			firstKeptEntryId: firstKeptEntryId ?? id,
+			tokensBefore,
+			details,
+			usage,
+			fromHook,
+			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+```
+
+和其他 entry 一样，compaction 只是挂在当前叶子下的一个新节点。被总结的消息仍然在文件里、仍然在树上，`/tree` 里能看到，导出 HTML 也能看到。它们只是不再出现在投影出来的上下文里，因为 `buildContextEntries` 遇到 compaction 时只取 `firstKeptEntryId` 之后的部分。
+
+`firstKeptEntryId` 为 `null` 时用 compaction 自己的 id，表示“之前的全部总结掉，什么都不保留”。
+
+AgentSession 中的调用顺序：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3170-3180"
+			const pathEntries = this.sessionManager.getBranch();
+			const preparation = prepareCompaction(pathEntries, settings);
+			if (!preparation) {
+				return false;
+			}
+
+			abortController = new AbortController();
+			this._autoCompactionAbortController = abortController;
+			started = true;
+			this._emit({ type: "compaction_start", reason });
+			abortController.signal.throwIfAborted();
+```
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:3237-3240"
+			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			const newEntries = this.sessionManager.getEntries();
+			this._refreshFinalizedContext();
+			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
+```
+
+`getBranch` → `prepareCompaction` →（扩展钩子）→ `compact` → `appendCompaction` → `_refreshFinalizedContext`。最后一步重新投影，agent 的消息数组变成“系统消息 + 摘要 + 保留的近期消息”。
+
+整个压缩用一个具体数字串起来：200k 窗口的会话，最近一次回复的 usage 是 185000 token，超过 183616 触发。从最新消息往回攒约 20000 token 找到切点，之前的约 165000 token 内容变成一份几千 token 的摘要。追加 compaction entry 后，投影出来的上下文约 2 万多 token，文件多了一行，原有的行一行都没变。
+
+## 7. 分支摘要：离开时带上要点
+
+### 7.1 问题
+
+5.2 节的导航只是移动叶子。离开的那条分支里可能已经做了很多探索：读过哪些文件、试过什么方案、为什么放弃。跳到新分支后这些全都不在上下文里了。分支摘要在离开时把这些要点总结一下，挂到新位置上。
+
+### 7.2 收集要总结的 entry
+
+```ts title="packages/coding-agent/src/core/compaction/branch-summarization.ts:110-148"
+export function collectEntriesForBranchSummary(
+	session: ReadonlySessionManager,
+	oldLeafId: string | null,
+	targetId: string,
+): CollectEntriesResult {
+	// If no old position, nothing to summarize
+	if (!oldLeafId) {
+		return { entries: [], commonAncestorId: null };
+	}
+
+	// Find common ancestor (deepest node that's on both paths)
+	const oldPath = new Set(session.getBranch(oldLeafId).map((e) => e.id));
+	const targetPath = session.getBranch(targetId);
+
+	// targetPath is root-first, so iterate backwards to find deepest common ancestor
+	let commonAncestorId: string | null = null;
+	for (let i = targetPath.length - 1; i >= 0; i--) {
+		if (oldPath.has(targetPath[i].id)) {
+			commonAncestorId = targetPath[i].id;
+			break;
+		}
+	}
+
+	// Collect entries from old leaf back to common ancestor
+	const entries: SessionEntry[] = [];
+	let current: string | null = oldLeafId;
+
+	while (current && current !== commonAncestorId) {
+		const entry = session.getEntry(current);
+		if (!entry) break;
+		entries.push(entry);
+		current = entry.parentId;
+	}
+
+	// Reverse to get chronological order
+	entries.reverse();
+
+	return { entries, commonAncestorId };
+}
+```
+
+要总结的是“新位置看不到、旧位置看得到”的部分，也就是从旧叶子往上走到两条路径的最近公共祖先之间的 entry。公共祖先及以上的部分两边共享，不需要总结。
+
+第 2.3 节的例子里，旧叶子是 `b2`，用户在树上选中 `b1`。`b2` 的路径是 `a1..a4, b1, b2`，`b1` 的路径是 `a1..a4, b1`，最深的公共节点就是 `b1` 本身，所以只收集 `b2`。`b1` 没有被收集，因为它是 user 消息：导航后新叶子落在它的父节点 `a4`，`b1` 的文本被放回编辑器，用户修改后重新发送，它的内容不会丢。
+
+### 7.3 按预算挑选消息
+
+```ts title="packages/coding-agent/src/core/compaction/branch-summarization.ts:220-248"
+	// Second pass: walk from newest to oldest, adding messages until token budget
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		const message = getMessageFromEntry(entry);
+		if (!message) continue;
+
+		// Extract file ops from assistant messages (tool calls)
+		extractFileOpsFromMessage(message, fileOps);
+
+		const tokens = estimateTokens(message);
+
+		// Check budget before adding
+		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
+			// If this is a summary entry, try to fit it anyway as it's important context
+			if (entry.type === "compaction" || entry.type === "branch_summary") {
+				if (totalTokens < tokenBudget * 0.9) {
+					messages.unshift(message);
+					totalTokens += tokens;
+				}
+			}
+			// Stop - we've hit the budget
+			break;
+		}
+
+		messages.unshift(message);
+		totalTokens += tokens;
+	}
+```
+
+分支可能很长，总结请求本身也受上下文窗口限制。预算是 `contextWindow − reserveTokens`（`branchSummary.reserveTokens` 默认 16384），从最新往最旧加，超预算就停，保证最近的内容一定被总结到。遇到旧的摘要类 entry 时，只要已用量不到预算的 90%，就尽量把它塞进去，因为摘要本身信息密度高。
+
+和 compaction 不同，这里直接跳过 toolResult（[branch-summarization.ts:158-163](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/branch-summarization.ts#L158-L163)），只看 assistant 的工具调用：分支摘要只需要知道“做了什么”，不需要结果细节。
+
+### 7.4 生成与挂载
+
+```ts title="packages/coding-agent/src/core/compaction/branch-summarization.ts:314-357"
+	// Token budget = context window minus reserved space for prompt + response
+	const contextWindow = model.contextWindow || 128000;
+	const tokenBudget = contextWindow - reserveTokens;
+
+	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
+
+	if (messages.length === 0) {
+		return { summary: "No content to summarize" };
+	}
+
+	// Transform to LLM-compatible messages, then serialize to text
+	// Serialization prevents the model from treating it as a conversation to continue
+	const llmMessages = convertToLlm(messages);
+	const conversationText = serializeConversation(llmMessages);
+
+	// Build prompt
+	let instructions: string;
+	if (replaceInstructions && customInstructions) {
+		instructions = customInstructions;
+	} else if (customInstructions) {
+		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+	} else {
+		instructions = BRANCH_SUMMARY_PROMPT;
+	}
+	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
+	// ...
+	const context = normalizeContext({ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages });
+	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal };
+	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
+		requestOptions.reasoning = thinkingLevel;
+	}
+	const response = await completeSummarization(model, context, requestOptions, streamFn, retry, callbacks);
+```
+
+调用路径和 compaction 共用：同样的序列化、同样的系统提示、同样的 `completeSummarization`。区别在提示词 `BRANCH_SUMMARY_PROMPT`（[branch-summarization.ts:260-287](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/compaction/branch-summarization.ts#L260-L287)）：它没有 Critical Context 一节，强调“这个分支想做什么、做到哪了”。结果前面加上一段说明（“用户在回到这里之前探索了另一个分支”），后面附上文件清单。用户还可以给出自定义指令，选择追加到默认提示后面或完全替换它。
+
+`navigateTree` 把这些串起来（[agent-session.ts:4024-4216](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L4024-L4216)）：
+
+1. 正在流式输出或压缩时拒绝导航。
+2. `collectEntriesForBranchSummary` 收集要总结的 entry。
+3. 发出 `session_before_tree` 事件，扩展可以取消、提供自己的摘要、修改指令或标签。
+4. 用户选择总结时调用 `generateBranchSummary`。
+5. 按目标类型算出新叶子（5.2 节）。有摘要时 `branchWithSummary(newLeafId, ...)`，摘要成为新叶子；没有摘要时 `branch` 或 `resetLeaf`。
+6. `_refreshFinalizedContext()` 重新投影，发出 `session_tree` 事件。
+
+摘要只是让模型知道发生过什么。被离开的分支原封不动地留在树上，随时可以再跳回去。
+
+## 8. 加载与版本迁移
+
+最后看文件读进来的过程。`loadEntriesFromFile`（[session-manager.ts:627-670](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/session-manager.ts#L627-L670)）按 1MB 一块流式读取，逐行 `JSON.parse`，解析失败的行直接跳过。这是 JSONL 只追加格式的另一个好处：崩溃时最后一行写了一半，只损失这一行，前面的都能读。如果文件最后一行没有换行符（被截断的残行），加载后会补一个 `\n`，保证下一次追加从新的一行开始。第一行不是合法 header 的文件被视为不是 pi 会话。
+
+旧格式在加载时就地迁移：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:286-313"
+/** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
+function migrateV1ToV2(entries: FileEntry[]): void {
+	const ids = new Set<string>();
+	let prevId: string | null = null;
+
+	for (const entry of entries) {
+		if (entry.type === "session") {
+			entry.version = 2;
+			continue;
+		}
+
+		entry.id = generateId(ids);
+		entry.parentId = prevId;
+		prevId = entry.id;
+
+		// Convert firstKeptEntryIndex to firstKeptEntryId for compaction
+		if (entry.type === "compaction") {
+			const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
+			if (typeof comp.firstKeptEntryIndex === "number") {
+				const targetEntry = entries[comp.firstKeptEntryIndex];
+				if (targetEntry && targetEntry.type !== "session") {
+					comp.firstKeptEntryId = targetEntry.id;
+				}
+				delete comp.firstKeptEntryIndex;
+			}
+		}
+	}
+}
+```
+
+v1 会话是一个线性列表，没有 `id/parentId`。迁移时给每条 entry 生成 id，`parentId` 指向前一条，线性列表就变成了一棵只有一根枝的树；compaction 原来用数组下标 `firstKeptEntryIndex` 记录切点，改成 id。这段迁移代码反映了设计的演进：先有线性会话和 compaction，后来为了支持分支才引入树。迁移后的文件通过 `_rewriteFile` 整体重写一次，这是 SessionManager 里少数会重写文件的地方。
+
+## 小结
+
+- 会话是 JSONL 文件，第一行是 header，之后每行一条 entry。entry 有 11 种类型，公共字段只有 `type`、`id`、`parentId`、`timestamp`。
+- `parentId` 把 entry 连成树，`leafId` 指向当前位置。新 entry 总是挂在叶子下面，然后叶子前移。写盘失败时内存回滚，保证文件里不出现悬空的 `parentId`。
+- 上下文是树的投影：`buildSessionPath` 从叶子走回根，`buildContextEntries` 按最新 compaction 裁剪，`sessionEntryToContextMessages` 把 entry 变成消息，`buildSessionProjection` 再应用 `context_edit`。模型和思考级别也沿路径计算。
+- 在旧节点继续对话等于移动叶子指针。选中 user 消息时叶子落在它的父节点，原文本放回编辑器；选中其他消息时叶子落在它本身。
+- `shouldCompact` 的阈值是“窗口 − reserveTokens（默认 16384）”。token 数优先用最近一次 usage，之后的消息按字符数除以 4 估算。
+- `findCutPoint` 从最新往回累加到 `keepRecentTokens`（默认 20000），切点只落在非 toolResult 的消息上；切在 assistant 上时是 split turn，要额外总结 turn 前缀。
+- 摘要把对话序列化成纯文本放进一条 user 消息，用固定格式的提示词，已有摘要时做增量更新，附带读过和改过的文件清单。
+- compaction 和 branch summary 都只追加 entry，不修改不删除；被总结的内容仍在文件和树上，只是不再进入投影。
+- 树导航时 `collectEntriesForBranchSummary` 找到最近公共祖先，总结旧叶子到祖先之间的部分，`branchWithSummary` 把摘要挂到新位置。
+
+## 动手验证
+
+1. 看一个真实的会话文件。用 `./pi-test.sh` 聊几轮，然后打开 `~/.pi/agent/sessions/` 下对应目录里最新的 `.jsonl` 文件，对照第 2.2 节的表格认出每一行的类型，手动画出 `id/parentId` 的树。
+
+2. 在 pi 里输入 `/tree`，选中一条较早的 user 消息，修改后重新发送。再看 JSONL 文件：原来的行都还在，末尾多出的新行的 `parentId` 指向你选中消息的父节点。如果导航时选择了总结，还会看到一条 `branch_summary`。
+
+3. 读投影和树的测试：`packages/coding-agent/test/session-manager/build-context.test.ts` 和 `tree-traversal.test.ts`，然后在 `packages/coding-agent` 下运行：
+
+   ```bash
+   node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/session-manager/build-context.test.ts
+   ```
+
+4. 读 compaction 的单元测试 `test/compaction.test.ts`，找到覆盖 `findCutPoint` 和 split turn 的用例，对照第 6.4 节的例子手算一遍切点。想看 AgentSession 层面的完整流程，读 `test/suite/agent-session-compaction.test.ts`，它用 faux provider 模拟模型，不需要真实 API。

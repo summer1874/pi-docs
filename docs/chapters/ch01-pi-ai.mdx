@@ -1,0 +1,1725 @@
+---
+title: 第 1 章　pi-ai：统一 LLM 层
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 1 章　pi-ai：统一 LLM 层
+
+## 导读
+
+<Diagram src="/diagrams/stream.html" title="一次 streamSimple：从统一请求到统一事件" />
+
+<Say id="k01-01">各家模型的接口各不相同，pi-ai 要把它们统一成一种消息和一种事件流。</Say>
+<Say id="k01-02" cue="call">对上层来说，入口只有 streamSimple：给模型和上下文，立刻拿回一个事件流。</Say>
+<Say id="k01-03" cue="norm,auth,dispatch">内部先整理上下文、解析凭据，再按模型的 api 字段找到协议实现。</Say>
+<Say id="k01-04" cue="lazy">协议实现按需加载，用到哪家才 import 哪家的 SDK。</Say>
+<Say id="k01-05" cue="build,http">协议实现把统一消息翻译成这家的请求格式，发出 HTTP 请求。</Say>
+<Say id="k01-06" cue="map,forward">回来的 SSE 事件被逐条翻译成统一事件，一层层转发到外层流。</Say>
+<Say id="k01-07" cue="consume">调用方用 for await 读事件，最后用 result 拿到完整的回复。</Say>
+<Say id="k01-08">读完你应该能讲清一次请求怎么变成 HTTP 流，又怎么还原成统一事件。</Say>
+
+## 1. 要解决的问题
+
+同样是“让模型调用一个工具”，各家的写法完全不同：
+
+| 方面 | Anthropic Messages | OpenAI Chat Completions | 
+| --- | --- | --- |
+| 系统提示 | 顶层 `system` 字段 | 第一条 `role: "system"` 消息 |
+| 工具调用 | assistant 内容里的 `tool_use` 块 | assistant 消息上的 `tool_calls` 数组 |
+| 工具结果 | 下一条 user 消息里的 `tool_result` 块 | 单独一条 `role: "tool"` 消息 |
+| 流式参数 | `input_json_delta` 事件 | `tool_calls[i].function.arguments` 增量 |
+| 结束原因 | `end_turn` / `max_tokens` / `tool_use` | `stop` / `length` / `tool_calls` |
+
+上层的 agent 循环（第 2 章）只关心“模型说了什么、要调用哪些工具、为什么停下”。如果它直接面对这些差异，每加一家模型就要改一遍循环。pi-ai 的任务就是在中间加一层：上层只写一种消息格式、只读一种事件流，差异全部关在 `packages/ai/src/api/` 下的协议实现里。
+
+这一层由几块组成，本章按顺序讲：
+
+1. **数据模型** `types.ts`：统一的消息、内容块、用量、停止原因和流事件。
+2. **注册表** `models.ts`：`createModels()` 管理一组 provider，`createProvider()` 把一个 provider 拼起来，`streamSimple()` 是请求入口。
+3. **provider 与 api 分离**：42 个 provider 负责鉴权和模型列表，共用 15 种协议实现，后者按需动态加载。
+4. **事件流** `utils/event-stream.ts`：一个 push 式的异步可迭代对象，带 `result()`。
+5. **鉴权** `auth/`、**工具参数校验** `utils/validation.ts`、**流式 partial JSON** `utils/streaming-json.ts`、**测试用 provider** `providers/faux.ts`。
+6. 最后以 `anthropic-messages` 为例，把一次请求从头到尾完整追一遍。
+
+## 2. 数据模型：types.ts
+
+[types.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/types.ts) 是整个 pi 的“通用语”。agent 循环、会话文件、扩展 API 里看到的消息，追根溯源都是这里定义的类型。
+
+### 2.1 四种内容块
+
+消息的内容由“内容块”（content block）组成。一共四种：
+
+```ts title="packages/ai/src/types.ts:422-457"
+export interface TextContent {
+	type: "text";
+	text: string;
+	textSignature?: string; // e.g., for OpenAI responses, message metadata (legacy id string or TextSignatureV1 JSON)
+}
+
+export interface ThinkingContent {
+	type: "thinking";
+	thinking: string;
+	thinkingSignature?: string; // Provider-specific opaque or serialized reasoning replay data
+	/** When true, the thinking content was redacted by safety filters. The opaque
+	 *  encrypted payload is stored in `thinkingSignature` so it can be passed back
+	 *  to the API for multi-turn continuity. */
+	redacted?: boolean;
+}
+
+export interface ImageContent {
+	type: "image";
+	data: string; // base64 encoded image data
+	mimeType: string; // e.g., "image/jpeg", "image/png"
+}
+
+export interface ToolCall {
+	type: "toolCall";
+	id: string;
+	name: string;
+	arguments: JsonObject;
+	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
+	/** OpenAI Responses namespace for calls to dynamically loaded or namespaced tools. */
+	namespace?: string;
+	/**
+	 * Set when the model's complete arguments text was not a valid JSON object. `arguments` is then `{}`.
+	 * Describes the problem and includes the text the model sent; tool argument validation fails with it.
+	 */
+	argumentsError?: string;
+}
+```
+
+几个字段值得注意：
+
+- **各种 `*Signature` 字段**。模型的“思考”内容通常带一个厂商私有的签名或加密载荷，下一轮请求必须原样传回，否则厂商会拒绝或丢失推理上下文。pi-ai 不理解这些签名，只负责保存和回传。`textSignature`、`thinkingSignature`、`thoughtSignature` 分别服务 OpenAI Responses、Anthropic 等、Google。统一格式不等于抹掉差异：它把差异装进可选字段，由对应的协议实现自己读写。
+- **`ToolCall.arguments` 是已解析的对象**，不是 JSON 字符串。各家流式传回来的都是字符串片段，拼接和解析由协议实现完成（见第 7 节）。
+- **`argumentsError`**。模型偶尔会生成不合法的 JSON 参数。pi-ai 不抛异常，而是把 `arguments` 设成 `{}`、把错误和原文写进这个字段。后面工具校验时会把这段错误回报给模型，让它自己改正。
+
+### 2.2 四种消息
+
+```ts title="packages/ai/src/types.ts:659"
+export type Message = SystemMessage | UserMessage | AssistantMessage | ToolResultMessage;
+```
+
+user 和 toolResult 消息比较简单：
+
+```ts title="packages/ai/src/types.ts:579-583"
+export interface UserMessage {
+	role: "user";
+	content: string | (TextContent | ImageContent)[];
+	timestamp: number; // Unix timestamp in milliseconds
+}
+```
+
+```ts title="packages/ai/src/types.ts:640-657"
+export type ToolResultMessage<TDetails = JsonValue> = IsJsonCompatible<TDetails> extends true
+	? {
+			role: "toolResult";
+			toolCallId: string;
+			toolName: string;
+			content: (TextContent | ImageContent)[]; // Supports text and images
+			details?: JsonRepresentation<TDetails>;
+			/** Usage from the tool execution itself, if available. Not part of main LLM context accounting. */
+			usage?: Usage;
+			/** Calls this tool made to other tools. Kept for the session record; not sent to the model. */
+			nestedCalls?: NestedToolCalls;
+			isError: boolean;
+			/** Unix timestamp in milliseconds when the result was created. */
+			timestamp: number;
+			/** Milliseconds the tool's execution took, measured with a monotonic clock. Absent for legacy results. */
+			durationMs?: number;
+		}
+	: never;
+```
+
+`ToolResultMessage` 用了一个条件类型：`details` 是工具附带的结构化数据（比如 edit 工具的 diff），它要写进 JSONL 会话文件，所以必须能序列化成 JSON。`IsJsonCompatible<TDetails>` 在编译期检查这一点，传入函数之类无法序列化的类型时整个类型会变成 `never`，直接编译报错。注意 `details`、`usage`、`nestedCalls` 都标注了“不发给模型”，它们只是会话记录的一部分。
+
+assistant 消息是最重的一种，因为它要记录这次回复是哪个 provider、哪个模型、用了多少 token、为什么停下：
+
+```ts title="packages/ai/src/types.ts:585-616"
+export interface AssistantMessage {
+	role: "assistant";
+	content: (TextContent | ThinkingContent | ToolCall)[];
+	api: Api;
+	provider: ProviderId;
+	model: string;
+	responseModel?: string; // Concrete model reported by the provider, when reported. May equal the requested `model`
+	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	// ...
+	usage: Usage;
+	stopReason: StopReason;
+	deferred?: DeferredHandle;
+	errorMessage?: string;
+	rawStopReason?: string;
+	// ...
+	/** Unix timestamp in milliseconds when the request started. */
+	timestamp: number;
+	// ...
+	durationMs?: number;
+}
+```
+
+`api`、`provider`、`model` 三个字段不只是元数据。下一轮请求时，协议实现靠它们判断“这条历史回复是不是同一个模型产生的”，从而决定签名能否回传（见 9.3 节的 `transformMessages`）。这就是 pi 能在一个会话里中途切换模型的基础。
+
+system 消息的设计比较特别：
+
+```ts title="packages/ai/src/types.ts:551-577"
+/**
+ * System instructions and tool declarations at one point in the transcript.
+ *
+ * The leading system message is the system prompt. Later system messages change it:
+ * `content` adds instructions from that point on, `sections` replace or remove named
+ * prompt sections, and `toolsAdded`/`toolsRemoved` change the tool set. Replaying
+ * every system message in order yields the current prompt and tools. Providers that
+ * accept system messages mid-conversation send each one in place; other providers
+ * rebuild the leading system message from the replayed state.
+ */
+export interface SystemMessage {
+	role: "system";
+	/** Instruction text. On the leading message this is the base prompt; later, additional instructions. */
+	content: string | TextContent[];
+	// ...
+	sections?: Record<string, string | null>;
+	/** Complete definitions of tools that become available at this point. */
+	toolsAdded?: Tool[];
+	/** Tools that stop being available at this point. */
+	toolsRemoved?: ToolReference[];
+	timestamp: number; // Unix timestamp in milliseconds
+}
+```
+
+工具定义不挂在请求上，而是作为 system 消息的一部分出现在消息序列里。第一条 system 消息是初始系统提示和工具集；对话中途可以插入新的 system 消息，增删工具或修改某段提示。把所有 system 消息按顺序“回放”一遍，就得到当前的提示和工具。
+
+为什么要这么设计？因为扩展和工具搜索（第 6 章）会在对话中途加载新工具。如果工具列表挂在请求顶层，每次变化都会改动请求前缀，导致厂商的 prompt cache（提示缓存，命中后输入 token 便宜很多）全部失效。放进消息序列后，旧的前缀不变，变化只追加在末尾。支持中途 system 消息的厂商原地发送；不支持的，协议实现再把它们折叠回第一条（见 2.4 节）。
+
+### 2.3 用量与停止原因
+
+```ts title="packages/ai/src/types.ts:459-489"
+export interface Usage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Subset of `cacheWrite` written with 1h retention. Only Anthropic reports this split. */
+	cacheWrite1h?: number;
+	// ...
+	reasoning?: number;
+	totalTokens: number;
+	cost: {
+		/** Catalog-derived input cost. */
+		input: number;
+		// ...
+		/** Best available total: provider-reported billed cost when supported, otherwise the catalog estimate. */
+		total: number;
+		/** True when `total` is the billed cost reported by the provider. False when it is a catalog estimate; absent also means false. */
+		totalFromProvider?: boolean;
+	};
+}
+
+export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
+```
+
+`StopReason` 把各家五花八门的结束原因收拢成 7 种。对 agent 循环来说最重要的是三种：`toolUse`（要执行工具）、`length`（被 token 上限截断，第 2 章会看到截断回复里的工具调用一律判失败）、`error` / `aborted`（结束本次运行）。`pending` 只出现在流式过程中的半成品消息上。
+
+`cost` 默认由模型目录里的单价算出（`calculateCost`，[models.ts:1236-1257](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/models.ts#L1236-L1257)），只有 OpenRouter 这类会回报实际账单的 provider 才会覆盖成真实值，并把 `totalFromProvider` 设为 `true`。
+
+### 2.4 Context 与 TranscriptContext
+
+调用方传入的上下文叫 `Context`，可以用 `systemPrompt` 和 `tools` 两个便捷字段：
+
+```ts title="packages/ai/src/types.ts:786-803"
+export interface Context {
+	systemPrompt?: string;
+	messages: Message[];
+	tools?: Tool[];
+}
+
+declare const transcriptContextBrand: unique symbol;
+
+/**
+ * Normalized request context passed to providers and API implementations. The
+ * prompt and tool declarations are carried by the transcript's system messages.
+ * Only `normalizeContext()` produces this type, so a raw `Context` cannot reach
+ * provider code by accident.
+ */
+export type TranscriptContext = {
+	messages: Message[];
+	readonly [transcriptContextBrand]: true;
+};
+```
+
+`TranscriptContext` 是一个“品牌类型”（branded type）：它多了一个只在类型层面存在的 `unique symbol` 属性，运行时根本没有这个字段。效果是除了 `normalizeContext()` 内部的类型断言，没有任何代码能凭空造出它。协议实现的参数类型写成 `TranscriptContext`，就从编译期保证了“到达这里的上下文一定已经规范化过”。
+
+```ts title="packages/ai/src/utils/transcript.ts:30-34"
+export function normalizeContext(context: Context): TranscriptContext {
+	const initialMessage = createInitialSystemMessage(context.systemPrompt, context.tools);
+	const messages = initialMessage ? [initialMessage, ...context.messages] : context.messages;
+	return { messages } as TranscriptContext;
+}
+```
+
+规范化只做一件事：把 `systemPrompt` 和 `tools` 折叠成开头的一条 system 消息。到了协议实现那边，再根据模型是否支持中途 system 消息决定要不要合并：
+
+```ts title="packages/ai/src/utils/transcript.ts:114-120"
+/** Keep later system messages in place when the model accepts them; otherwise collapse them. */
+export function resolveTranscript(
+	context: TranscriptContext,
+	supportsMidConvoSystemMessages: boolean | undefined,
+): TranscriptContext {
+	return supportsMidConvoSystemMessages ? context : collapseSystemMessages(context);
+}
+```
+
+### 2.5 流事件协议
+
+流式回复被拆成一串 `AssistantMessageEvent`：
+
+```ts title="packages/ai/src/types.ts:821-837"
+export type AssistantMessageEvent =
+	| { type: "start"; partial: AssistantMessage }
+	| { type: "text_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "text_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "text_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
+	| {
+			type: "done";
+			reason: Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">;
+			message: AssistantMessage;
+	  }
+	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage };
+```
+
+结构很规整：一个 `start`，然后每个内容块各有 `*_start`、若干 `*_delta`、一个 `*_end`，最后以 `done` 或 `error` 收尾。`contentIndex` 指向 `partial.content` 里的下标，所以文本和工具调用交错出现时，消费方也能知道每个增量属于哪个块。
+
+类型上方的注释给出了几条必须遵守的约定：
+
+| 约定 | 含义 |
+| --- | --- |
+| 成功的流先发 `start`，最后发 `done` | 更新事件和 `done` 不能出现在 `start` 之前 |
+| 请求准备阶段失败可以直接发 `error` | 例如鉴权失败、模块加载失败，此时没有 `start` |
+| `partial` 是同一个活对象 | 不是事件发生时的快照，后续事件会继续修改它 |
+| 文本和思考块在 `*_start` 时为空 | 只通过 `*_delta` 增长，`*_end` 给出权威的完整内容 |
+
+第三条容易踩坑：如果你把每个事件的 `partial` 存进数组，最后会发现它们全是同一个对象。agent 循环转发时会做一次浅拷贝 `{ ...partialMessage }`（见 9.6 节）。
+
+`done` 和 `error` 的 `reason` 用 `Extract` 收窄了取值：`done` 只可能是 `stop` / `length` / `toolUse` / `deferred`，`error` 只可能是 `aborted` / `error`。这样消费方在 `switch` 里分支时，TypeScript 能帮你检查有没有漏掉情况。
+
+### 2.6 StreamFunction 的契约
+
+所有协议实现都遵守同一个函数签名：
+
+```ts title="packages/ai/src/types.ts:387-402"
+// Generic StreamFunction with typed options.
+//
+// Contract:
+// - Receives a normalized transcript: the system prompt and tools live in the
+//   leading system message, never on the context itself.
+// - Must return an AssistantMessageEventStream.
+// - Direct streamSimple() calls may throw synchronously when request auth is
+//   missing. Once a stream is returned, request/model/runtime failures should
+//   be encoded in that stream.
+// - Error termination must produce an AssistantMessage with stopReason
+//   "error" or "aborted" and errorMessage, emitted via the stream protocol.
+export type StreamFunction<TApi extends Api = Api, TOptions extends StreamOptions = StreamOptions> = (
+	model: Model<TApi>,
+	context: TranscriptContext,
+	options?: TOptions,
+) => AssistantMessageEventStream;
+```
+
+关键是第三、四条：**一旦返回了流，错误就必须编码在流里**，不能抛异常。这样调用方只需要一种错误处理方式：读到 `error` 事件。网络断开、厂商返回 500、JSON 解析失败，最终都表现为一条 `stopReason: "error"` 的 assistant 消息。这条消息会照常写进会话，用户能看到错误，也能重试。
+
+每个协议模块都导出两个函数：`stream` 接受该协议的完整选项（例如 Anthropic 的 `thinkingBudgetTokens`、`effort`），`streamSimple` 只接受通用选项 `SimpleStreamOptions`，其中用一个抽象的 `reasoning` 级别（`minimal` 到 `max`）表达“想让模型思考多少”，再由各协议自己翻译成厂商参数。上层几乎总是用 `streamSimple`。
+
+## 3. 注册表：models.ts
+
+### 3.1 Provider：最小的运行单元
+
+[models.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/models.ts) 里的 `Provider` 接口描述“一个模型服务商”：
+
+```ts title="packages/ai/src/models.ts:158-226"
+export interface Provider<TApi extends Api = Api> {
+	readonly id: string;
+	readonly name: string;
+
+	readonly baseUrl?: string;
+	readonly headers?: ProviderHeaders;
+
+	// ...
+	readonly auth: ProviderAuth;
+
+	// ...
+	getModels(): readonly Model<TApi>[];
+
+	// ...
+	refreshModels?(context: RefreshModelsContext): Promise<void>;
+
+	// ...
+	/** Stream a normalized transcript. `Models` normalizes the caller's `Context` before dispatching here. */
+	stream<T extends TApi>(
+		model: Model<T>,
+		context: TranscriptContext,
+		options?: ApiStreamOptions<T>,
+	): AssistantMessageEventStream;
+
+	streamSimple(
+		model: Model<TApi>,
+		context: TranscriptContext,
+		options?: SimpleStreamOptions,
+	): AssistantMessageEventStream;
+```
+
+一个 provider 有三类职责：**鉴权**（`auth`）、**模型列表**（`getModels`，动态 provider 还有 `refreshModels`）、**请求**（`stream` / `streamSimple`）。注意它的 `streamSimple` 收的已经是 `TranscriptContext`。
+
+### 3.2 createModels：一组 provider 加上鉴权
+
+上层不直接调 provider，而是通过 `Models` 集合。`createModels()` 返回一个 `ModelsImpl`：
+
+```ts title="packages/ai/src/models.ts:400-415"
+class ModelsImpl implements MutableModels {
+	private providers = new Map<string, Provider>();
+	private credentials: CredentialStore;
+	private modelsStore: ModelsStore;
+	private authContext: AuthContext;
+	private identity: ClientIdentity | undefined;
+	private refreshGenerations = new Map<string, number>();
+	private refreshControllers = new Map<string, AbortController>();
+	private publicationChains = new Map<string, Promise<unknown>>();
+
+	constructor(options?: CreateModelsOptions) {
+		this.credentials = options?.credentials ?? new InMemoryCredentialStore();
+		this.modelsStore = options?.modelsStore ?? new InMemoryModelsStore();
+		this.authContext = options?.authContext ?? defaultAuthContext();
+		this.identity = options?.identity;
+	}
+```
+
+它持有的东西说明了分工：provider 表、凭据存储（`CredentialStore`，存 API key 或 OAuth token）、模型列表缓存（`ModelsStore`，给需要联网拉模型列表的动态 provider 用）、环境访问（`AuthContext`，读环境变量和文件）。后三者都是可注入的接口，默认实现全在内存里。pi CLI 会注入写 `~/.pi/agent/auth.json` 的持久实现；浏览器里运行时，`AuthContext` 读不到 `process.env`，也不会出错。
+
+一句话概括分工：**provider 拥有请求行为，`Models` 解析鉴权，再把请求委托给拥有该模型的 provider**。这正是 `Models` 接口注释的原话：“Providers own request behavior; `Models` resolves auth and delegates each request to the provider that owns the model.”
+
+内置的 42 个 provider 由 [providers/all.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/providers/all.ts) 一次性注册：
+
+```ts title="packages/ai/src/providers/all.ts:183-190"
+/** A `Models` collection with every built-in provider registered. */
+export function builtinModels(options?: CreateModelsOptions): MutableModels {
+	const models = createModels(options);
+	for (const provider of builtinProviders()) {
+		models.setProvider(provider);
+	}
+	return models;
+}
+```
+
+`index.ts` 刻意不导出它。包入口的注释写着 “Core only, side-effect free: no generated catalogs, no provider factories”。只用一两家 provider 的应用可以从 `@earendil-works/pi-ai/providers/anthropic` 单独引入，打包时就不会把 42 家的模型目录都带进来。
+
+### 3.3 streamSimple：入口
+
+```ts title="packages/ai/src/models.ts:929-940"
+	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+		const transcript = normalizeContext(context);
+		return lazyStream(
+			model,
+			async () => {
+				const provider = this.requireChatProvider(model);
+				const { requestModel, requestOptions } = await this.applyAuth(model, options);
+				return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
+			},
+			observeModelRequest(model, options, false),
+		);
+	}
+```
+
+这十来行是本章的主线，三件事：
+
+1. **同步规范化**：`normalizeContext` 把 `Context` 变成 `TranscriptContext`。
+2. **异步准备包在 `lazyStream` 里**：查找 provider、解析鉴权都需要 `await`（读凭据文件、可能要刷新 OAuth token），但 `streamSimple` 的返回类型是同步的事件流。`lazyStream`（第 5 节）先同步返回一个空流，再在后台跑这个 `async` 函数，把内层流的事件转发出来。
+3. **准备失败也进流**：找不到 provider 时 `requireChatProvider` 会抛 `ModelsError`，这个异常被 `lazyStream` 捕获，变成一条 `error` 事件。这就兑现了 2.6 节的契约。
+
+`observeModelRequest` 是遥测观察者，记录请求的 span（第 8 章讲 pi-telemetry）。
+
+### 3.4 applyAuth：把凭据合并进请求
+
+```ts title="packages/ai/src/models.ts:866-898"
+		this.requireProvider(model);
+		const resolution = await this.getAuth(model, {
+			apiKey: options?.apiKey,
+			env: options?.env,
+			signal: options?.signal,
+		});
+		if (!resolution) {
+			throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+		}
+		const auth = resolution.auth;
+
+		// Explicit request options win per-field; the Models-only transform runs last.
+		const apiKey = options?.apiKey ?? auth.apiKey;
+		const requestModel: TModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+		const sessionId =
+			options && "sessionId" in options && typeof options.sessionId === "string" ? options.sessionId : undefined;
+		let headers = mergeHeaders(
+			mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), auth.headers),
+			options?.headers,
+		);
+		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
+		const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
+		const identity = mergeClientIdentity(this.identity, options?.identity);
+		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
+		const requestOptions = {
+			...providerOptions,
+			apiKey,
+			headers,
+			env,
+			...(identity === undefined ? {} : { identity }),
+		} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
+
+		return { requestModel, requestOptions };
+```
+
+鉴权结果 `ModelAuth` 只有三个字段：`apiKey`、`headers`、`baseUrl`（[auth/types.ts:7-11](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/auth/types.ts#L7-L11)）。类型注释说得很干脆：“If a value cannot be expressed as `apiKey`, `headers`, or `baseUrl`, it is provider config, not auth.” 合并规则是“调用方显式传入的值逐字段优先”。`baseUrl` 能被鉴权改写，是因为有的服务（GitHub Copilot）每个账号的接入地址不同。
+
+`mergeHeaders` 处理了一个细节：HTTP 头名大小写不敏感，覆盖时要先删掉大小写不同的同名键（[models.ts:384-398](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/models.ts#L384-L398)）。
+
+### 3.5 createProvider：把零件拼成 provider
+
+内置 provider 和用户在 `models.json` 里自定义的 provider 都通过 `createProvider()` 构造。看 Anthropic 和 Groq 两个例子：
+
+```ts title="packages/ai/src/providers/anthropic.ts:74-90"
+export function anthropicProvider(): Provider<"anthropic-messages"> {
+	return createProvider({
+		id: "anthropic",
+		name: "Anthropic",
+		baseUrl: "https://api.anthropic.com",
+		auth: {
+			apiKey: anthropicApiKeyAuth(),
+			oauth: lazyOAuth({
+				name: "Anthropic (Claude Pro/Max)",
+				isSubscription: true,
+				load: loadAnthropicOAuth,
+			}),
+		},
+		models: Object.values(ANTHROPIC_MODELS),
+		api: anthropicMessagesApi(),
+	});
+}
+```
+
+```ts title="packages/ai/src/providers/groq.ts:6-15"
+export function groqProvider(): Provider<"openai-completions"> {
+	return createProvider({
+		id: "groq",
+		name: "Groq",
+		baseUrl: "https://api.groq.com/openai/v1",
+		auth: { apiKey: envApiKeyAuth("Groq API key", ["GROQ_API_KEY"]) },
+		models: Object.values(GROQ_MODELS),
+		api: openAICompletionsApi(),
+	});
+}
+```
+
+一个 provider 就是四样零件：**id 和地址**、**鉴权方式**、**模型列表**、**协议实现**。Groq 的全部特殊之处只有地址和环境变量名，协议直接复用 `openai-completions`。
+
+有些 provider 背后的模型分属不同协议，比如 OpenCode Zen 既转发 Claude 也转发 GPT 和 Gemini。这时 `api` 传一个按 `model.api` 索引的表：
+
+```ts title="packages/ai/src/providers/opencode.ts:19-24"
+		api: {
+			"anthropic-messages": withOpenCodeSessionHeader(anthropicMessagesApi()),
+			"google-generative-ai": withOpenCodeSessionHeader(googleGenerativeAIApi()),
+			"openai-completions": withOpenCodeSessionHeader(openAICompletionsApi()),
+			"openai-responses": withOpenCodeSessionHeader(openAIResponsesApi()),
+		},
+```
+
+`createProvider` 里的分发逻辑：
+
+```ts title="packages/ai/src/models.ts:1106-1119"
+	const apiFor = (model: Model<Api>): ProviderStreams | undefined => single ?? byApi?.[model.api];
+
+	const dispatch = (
+		model: Model<Api>,
+		run: (streams: ProviderStreams) => AssistantMessageEventStream,
+	): AssistantMessageEventStream => {
+		const streams = apiFor(model);
+		if (!streams) {
+			return lazyStream(model, async () => {
+				throw new ModelsError("stream", `Provider ${input.id} has no API implementation for "${model.api}"`);
+			});
+		}
+		return run(streams);
+	};
+```
+
+单一实现时总是用它；表形式时按 `model.api` 查。查不到也不抛异常，而是用 `lazyStream` 包一个立即失败的 setup，变成 `error` 事件。这个“把同步错误包进流”的写法在 pi-ai 里随处可见。
+
+`createProvider` 还负责动态模型列表的合并：静态目录（`models`）是基线，`fetchModels` 拉到的同 id 模型覆盖基线，新 id 追加在后（[models.ts:1095-1105](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/models.ts#L1095-L1105)）。
+
+### 3.6 模型目录从哪来
+
+`ANTHROPIC_MODELS` 来自自动生成的 `anthropic.models.ts`：
+
+```ts title="packages/ai/src/providers/anthropic.models.ts:1-8"
+// This file is auto-generated by scripts/generate-models.ts
+// Do not edit manually - run 'npm run generate-models' to update
+
+import values from "./data/anthropic.json" with { type: "json" };
+import { flattenChatModelCatalog, flattenClassifierModelCatalog, flattenImageModelCatalog, type ChatModelCatalog, type ClassifierModelCatalog, type ImageModelCatalog } from "../model-catalog.ts";
+
+export const ANTHROPIC_MODELS: ChatModelCatalog<typeof values, "anthropic"> =
+	flattenChatModelCatalog("anthropic", values);
+```
+
+真正的数据在 `providers/data/*.json`，由 `scripts/generate-models.ts` 从各家公开目录抓取生成，这个目录被 gitignore。`ChatModelCatalog<typeof values, "anthropic">` 用 JSON 的字面量类型推出每个模型 id 和它的 `api`，所以 `getBuiltinModel("anthropic", "某个 id")` 拼错 id 会直接编译报错。
+
+一个 `Model` 条目里，除了 `id`、`api`、`provider`、`baseUrl`，还有 `contextWindow`、`maxTokens`、`cost`、`reasoning`（是否支持思考）、`thinkingLevelMap`（pi 的思考级别到厂商参数的映射）和 `compat`（兼容性开关，见 9.2 节）。
+
+## 4. Provider 与 API 分离
+
+### 4.1 为什么分开
+
+把“谁家的服务”（provider）和“说哪种协议”（api）分开，是 pi-ai 最核心的设计。`KnownApi` 列出了 10 种聊天协议（[types.ts:64-74](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/types.ts#L64-L74)），再加 1 种图片生成协议和 4 种分类器协议，共 15 种。而 `KnownProvider` 有 42 个。
+
+大量厂商提供“OpenAI 兼容”接口，所以协议的复用度极高。按 `providers/*.ts` 里实际调用的协议工厂统计：
+
+| 协议（`api/` 下的模块） | 使用它的 provider |
+| --- | --- |
+| `openai-completions` | groq、cerebras、deepseek、together、fireworks、nvidia、huggingface、zai、moonshotai、xiaomi、openrouter 等约 28 个 |
+| `anthropic-messages` | anthropic、minimax、minimax-cn、vercel-ai-gateway、openrouter、github-copilot、opencode 等 10 个 |
+| `openai-responses` | openai、xai、meta、github-copilot、opencode 等 7 个 |
+| `google-generative-ai` | google、opencode、opencode-go |
+| `bedrock-converse-stream`、`google-vertex`、`mistral-conversations`、`openai-codex-responses`、`azure-openai-responses`、`pi-messages` | 各自 1 个专用 provider |
+
+如果按 provider 写实现，“OpenAI 兼容”的流解析代码要复制 28 份；按协议写，只写一份，各家差异用 `Model.compat` 开关描述。provider 文件因此都非常短：大部分只有 15 行左右。
+
+### 4.2 lazy 加载
+
+协议实现会依赖厂商 SDK：`@anthropic-ai/sdk`、`openai`、`@google/genai`、`@aws-sdk/client-bedrock-runtime`。这些 SDK 体积不小，AWS 的尤其大。pi 启动时注册了全部 42 个 provider，如果每个都静态 import 自己的协议实现，启动就要加载所有 SDK。
+
+解决办法是 `*.lazy.ts` 包装：
+
+```ts title="packages/ai/src/api/anthropic-messages.lazy.ts:1-4"
+import type { ProviderStreams } from "../types.ts";
+import { lazyApi } from "./lazy.ts";
+
+export const anthropicMessagesApi = (): ProviderStreams => lazyApi(() => import("./anthropic-messages.ts"));
+```
+
+provider 文件只 import 这个 4 行的包装。真正的 `anthropic-messages.ts`（以及它 import 的 Anthropic SDK）要等第一次发请求时才通过 `import()` 加载：
+
+```ts title="packages/ai/src/api/lazy.ts:98-104"
+export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
+	const api: ProviderStreams = {
+		stream: (model, context, options) =>
+			lazyStream(model, async () => (await load()).stream(model, context, options)),
+		streamSimple: (model, context, options) =>
+			lazyStream(model, async () => (await load()).streamSimple(model, context, options)),
+	};
+```
+
+`lazyApi` 返回的对象和真实模块形状完全相同（都满足 `ProviderStreams`），调用方察觉不到区别。`load()` 每次都调用 `import()`，但运行时有模块缓存，只有第一次真正加载。加载失败（比如 SDK 没装）同样被 `lazyStream` 变成 `error` 事件。
+
+顺带一提，仓库的 AGENTS.md 一般禁止 `await import()` 这类内联 import。延迟加载的需求被集中在这十几个 4 行的 `*.lazy.ts` 文件里，其余代码仍然只用顶层 import。
+
+Bedrock 的包装更进一步：
+
+```ts title="packages/ai/src/api/bedrock-converse-stream.lazy.ts:4-13"
+/**
+ * Loads the bedrock implementation through a variable specifier so bundlers
+ * (browser smoke, Bun compile) cannot follow the import into the Node-only
+ * AWS SDK. The `.ts`/`.js` rewrite keeps the trick working from both source
+ * and built output.
+ */
+const importNodeOnlyApi = (specifier: string): Promise<unknown> => {
+	const runtimeSpecifier = import.meta.url.endsWith(".js") ? specifier.replace(/\.ts$/, ".js") : specifier;
+	return import(runtimeSpecifier);
+};
+```
+
+`import("./x.ts")` 写成字面量时，打包工具会顺着它把模块打进 bundle。写成变量 `import(runtimeSpecifier)`，打包工具就无法静态分析，只能留到运行时。AWS SDK 只能在 Node 里跑，这样做可以避免浏览器构建时被它拖累。
+
+`test/lazy-module-load.test.ts` 专门验证这一点：它在子进程里用 `registerHooks` 监听模块解析，断言 import pi-ai 入口时没有加载任何厂商 SDK。
+
+## 5. 事件流：event-stream.ts
+
+### 5.1 为什么要自己写
+
+协议实现的工作方式是“推”：SSE 数据到一块，解析出一个事件，就推出去。调用方的工作方式是“拉”：`for await (const event of stream)`。中间需要一个能把推转成拉的缓冲。Node 的 `ReadableStream` 可以做，但 pi-ai 还需要两个额外能力：一是能直接 `await stream.result()` 拿到最终消息，不必遍历事件；二是要在浏览器和各种运行时里行为一致。于是有了 [event-stream.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/utils/event-stream.ts)，只有 135 行。
+
+### 5.2 EventStream
+
+```ts title="packages/ai/src/utils/event-stream.ts:26-58"
+export class EventStream<T, R = T> implements AsyncIterable<T> {
+	private queue = new FifoQueue<T>();
+	private waiting = new FifoQueue<(value: IteratorResult<T>) => void>();
+	protected done = false;
+	private finalResultPromise: Promise<R>;
+	private resolveFinalResult!: (result: R) => void;
+	private isComplete: (event: T) => boolean;
+	private extractResult: (event: T) => R;
+
+	constructor(isComplete: (event: T) => boolean, extractResult: (event: T) => R) {
+		this.isComplete = isComplete;
+		this.extractResult = extractResult;
+		this.finalResultPromise = new Promise((resolve) => {
+			this.resolveFinalResult = resolve;
+		});
+	}
+
+	push(event: T): void {
+		if (this.done) return;
+
+		if (this.isComplete(event)) {
+			this.done = true;
+			this.resolveFinalResult(this.extractResult(event));
+		}
+
+		// Deliver to waiting consumer or queue it
+		const waiter = this.waiting.dequeue();
+		if (waiter) {
+			waiter({ value: event, done: false });
+		} else {
+			this.queue.enqueue(event);
+		}
+	}
+```
+
+两个队列：`queue` 存“已产生但还没人读”的事件，`waiting` 存“已经在等但还没事件”的消费者。`push` 时如果有人在等，直接交给他；否则入队。
+
+`isComplete` 和 `extractResult` 两个回调让这个类保持通用：它不知道什么是 `done` 事件，只知道“遇到某种事件就结束，并从中提取结果”。结束后再 `push` 会被忽略（第 44 行），所以协议实现即使在 `done` 之后多推了事件，也不会破坏流。
+
+```ts title="packages/ai/src/utils/event-stream.ts:60-88"
+	end(result?: R): void {
+		this.done = true;
+		if (result !== undefined) {
+			this.resolveFinalResult(result);
+		}
+		// Notify all waiting consumers that we're done
+		while (this.waiting.length > 0) {
+			const waiter = this.waiting.dequeue()!;
+			waiter({ value: undefined as any, done: true });
+		}
+	}
+
+	async *[Symbol.asyncIterator](): AsyncIterator<T> {
+		while (true) {
+			if (this.queue.length > 0) {
+				yield this.queue.dequeue()!;
+			} else if (this.done) {
+				return;
+			} else {
+				const result = await new Promise<IteratorResult<T>>((resolve) => this.waiting.enqueue(resolve));
+				if (result.done) return;
+				yield result.value;
+			}
+		}
+	}
+
+	result(): Promise<R> {
+		return this.finalResultPromise;
+	}
+```
+
+迭代器的顺序是：先把队列里的事件吐完，再看是否结束，都不满足才挂起等待。这保证了“先 `end()` 再开始读”的场景下事件也不会丢。`result()` 返回的 Promise 在构造时就创建好了，所以调用方可以完全不读事件、只等结果，`complete()` 和 `completeSimple()` 就是这么实现的：`this.streamSimple(model, context, options).result()`。
+
+`FifoQueue`（第 3-23 行）是一个双栈队列：入队压 `incoming`，出队时如果 `outgoing` 空了，就把 `incoming` 整个倒过去。这样出队是均摊 O(1)，比数组的 `shift()`（O(n)）快。流式回复动辄上千个事件，这个优化有意义。
+
+### 5.3 AssistantMessageEventStream
+
+```ts title="packages/ai/src/utils/event-stream.ts:97-130"
+export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
+	readonly #startedAt = Date.now();
+	readonly #startedAtMonotonic = performance.now();
+
+	constructor() {
+		super(
+			(event) => event.type === "done" || event.type === "error",
+			(event) => {
+				if (event.type === "done") {
+					return event.message;
+				} else if (event.type === "error") {
+					return event.error;
+				}
+				throw new Error("Unexpected event type for final result");
+			},
+		);
+	}
+
+	override push(event: AssistantMessageEvent): void {
+		if (event.type === "done") this.#time(event.message);
+		else if (event.type === "error") this.#time(event.error);
+		super.push(event);
+	}
+
+	override end(result?: AssistantMessage): void {
+		if (result !== undefined) this.#time(result);
+		super.end(result);
+	}
+
+	#time(message: AssistantMessage): void {
+		if (this.done || message.durationMs !== undefined || message.timestamp < this.#startedAt) return;
+		message.durationMs = Math.max(0, Math.round(performance.now() - this.#startedAtMonotonic));
+	}
+}
+```
+
+特化版做两件事：规定 `done` / `error` 是结束事件，并给最终消息记录耗时 `durationMs`。计时用 `performance.now()` 这种单调时钟，不受系统时间调整影响。`message.durationMs !== undefined` 的判断保证了“流套流”时只有最内层计时生效：内层流先写入 `durationMs`，外层转发时看到已有值就不覆盖。
+
+### 5.4 lazyStream：流套流
+
+第 3、4 节已经出现三次 `lazyStream`。它解决的问题是：返回类型必须同步，但准备工作是异步的。
+
+```ts title="packages/ai/src/api/lazy.ts:37-86"
+async function forwardStream(
+	target: AssistantMessageEventStream,
+	source: AsyncIterable<AssistantMessageEvent>,
+	observer: LazyStreamObserver | undefined,
+	observeResult: (result: AssistantMessage | undefined) => void,
+): Promise<void> {
+	let result: AssistantMessage | undefined;
+	for await (const event of source) {
+		target.push(event);
+		observer?.onEvent?.(event);
+		if (event.type === "done") result = event.message;
+		else if (event.type === "error") result = event.error;
+	}
+	if (hasResult(source)) result = await source.result();
+	target.end(result);
+	observeResult(result);
+}
+
+/**
+ * Returns a stream synchronously while running async setup (auth resolution,
+ * lazy module loading) behind it. Setup failures terminate the stream with an
+ * error event.
+ */
+export function lazyStream(
+	model: Model<Api>,
+	setup: () => Promise<AsyncIterable<AssistantMessageEvent>>,
+	observer?: LazyStreamObserver,
+): AssistantMessageEventStream {
+	const startedAt = Date.now();
+	const outer = new AssistantMessageEventStream();
+	let observedResult = false;
+	const observeResult = (result: AssistantMessage | undefined): void => {
+		if (observedResult) return;
+		observedResult = true;
+		observer?.onResult?.(result);
+	};
+
+	setup()
+		.then((inner) => forwardStream(outer, inner, observer, observeResult))
+		.catch((error) => {
+			const message = createSetupErrorMessage(model, error, startedAt);
+			const event: AssistantMessageEvent = { type: "error", reason: "error", error: message };
+			outer.push(event);
+			observer?.onEvent?.(event);
+			outer.end(message);
+			observeResult(message);
+		});
+
+	return outer;
+}
+```
+
+`setup()` 成功后得到内层流，`forwardStream` 把它的事件逐个推到外层。`setup()` 失败时，`createSetupErrorMessage`（第 4-23 行）构造一条空内容、`stopReason: "error"` 的 assistant 消息推出去。
+
+一次 `models.streamSimple()` 调用 Anthropic 时，实际上有三层流：
+
+```text
+Models.streamSimple 的 lazyStream            ← 调用方拿到的
+  └─ lazyApi 的 lazyStream（加载模块）
+       └─ anthropic-messages.ts 的 stream()   ← 真正 push 事件的
+```
+
+每层都是一个 `AssistantMessageEventStream`，事件原样向外转发。多出来的转发开销是每个事件几次函数调用，换来的是每一层都可以独立处理自己的异步准备和错误，而对调用方来说依然是一个流。
+
+## 6. 鉴权：auth/
+
+### 6.1 两种鉴权方式
+
+```ts title="packages/ai/src/auth/types.ts:251-259"
+/**
+ * Provider auth. At least one of `apiKey`/`oauth` must be present: even
+ * ambient-credential providers and keyless local servers provide `apiKey`
+ * auth whose `resolve()` reports whether the provider is configured.
+ */
+export interface ProviderAuth {
+	apiKey?: ApiKeyAuth;
+	oauth?: OAuthAuth;
+}
+```
+
+`apiKey` 方式覆盖一切“非 OAuth”的情况：存储的 key、环境变量、AWS profile、Google ADC 文件，甚至不需要 key 的本地服务器（它的 `resolve()` 直接返回成功）。`oauth` 方式用于订阅登录，例如 Claude Pro/Max、ChatGPT 订阅、GitHub Copilot。
+
+最常见的 `apiKey` 实现是 `envApiKeyAuth`：
+
+```ts title="packages/ai/src/auth/helpers.ts:9-31"
+export function envApiKeyAuth(name: string, envVars: readonly string[]): ApiKeyAuth {
+	return {
+		name,
+		login: async (interaction) => {
+			interaction.signal.throwIfAborted();
+			const key = await interaction.prompt({ type: "secret", message: `Enter ${name}` });
+			interaction.signal.throwIfAborted();
+			return { type: "api_key", key };
+		},
+		resolve: async ({ ctx, credential, signal }) => {
+			signal.throwIfAborted();
+			if (credential?.key) {
+				return { auth: { apiKey: credential.key }, env: credential.env, source: "stored credential" };
+			}
+			for (const envVar of envVars) {
+				const value = await ctx.env(envVar);
+				signal.throwIfAborted();
+				if (value) return { auth: { apiKey: value }, source: envVar };
+			}
+			return undefined;
+		},
+	};
+}
+```
+
+`login` 通过 `interaction.prompt` 向用户要 key。pi-ai 不关心界面长什么样，TUI、Web 或测试都可以实现 `AuthInteraction`。`resolve` 返回的 `source` 是给状态栏显示的人类可读来源（如 `GROQ_API_KEY`）。
+
+OAuth 的实现代码较重（回调服务器、PKCE、设备码），所以同样被 `lazyOAuth` 延迟加载（[auth/helpers.ts:40-59](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/auth/helpers.ts#L40-L59)），和 4.2 节的 `lazyApi` 是一个思路。
+
+### 6.2 解析顺序
+
+```ts title="packages/ai/src/auth/resolve.ts:56-92"
+	if (overrides?.apiKey !== undefined && provider.auth.apiKey) {
+		return resolveApiKey(
+			requestAuthContext,
+			provider.auth.apiKey,
+			provider.id,
+			{
+				type: "api_key",
+				key: overrides.apiKey,
+				env: overrides.env,
+			},
+			signal,
+		);
+	}
+
+	const stored = await readCredential(credentials, provider.id, signal);
+	if (stored) {
+		if (stored.type === "oauth" && provider.auth.oauth) {
+			return resolveStoredOAuth(
+				credentials,
+				provider.id,
+				provider.auth.oauth,
+				stored,
+				signal,
+				overrides?.minOAuthValidityMs,
+			);
+		}
+		if (stored.type === "api_key" && provider.auth.apiKey) {
+			const credential = overrides?.env ? { ...stored, env: { ...stored.env, ...overrides.env } } : stored;
+			return resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, credential, signal);
+		}
+		return undefined;
+	}
+
+	// Ambient (env vars, AWS profiles, ADC files).
+	return provider.auth.apiKey
+		? resolveApiKey(requestAuthContext, provider.auth.apiKey, provider.id, undefined, signal)
+		: undefined;
+```
+
+优先级是：**请求显式传入的 key，其次是存储的凭据，最后才是环境变量等环境来源**。文件顶部的注释强调了一个原则：“A stored credential owns the provider: ambient/env is consulted only when nothing is stored. No silent env fallback after a failed refresh.” 已经 `/login` 过的 provider，即使 OAuth 刷新失败，也不会悄悄改用环境变量里的另一个 key。悄悄切换会让用户以为在用订阅额度，实际却在按 API key 付费，这种错误很难察觉。
+
+### 6.3 OAuth 刷新与锁
+
+OAuth 的 access token 会过期，需要用 refresh token 换新的。很多厂商在刷新时会“轮换” refresh token：旧的立刻作废。如果两个请求（或两个 pi 进程）同时发现 token 快过期、同时去刷新，后到的那个会拿着已作废的 refresh token 失败，甚至把凭据写坏。
+
+pi-ai 用“双重检查加锁”解决：
+
+```ts title="packages/ai/src/auth/resolve.ts:132-146"
+		post = await credentials.modify(
+			providerId,
+			async (current) => {
+				signal.removeEventListener("abort", cancelLockWait);
+				signal.throwIfAborted();
+				if (current?.type !== "oauth") return undefined; // logged out meanwhile
+				if (!needsRefresh(current)) return undefined; // another process/request refreshed
+				try {
+					return await oauth.refresh(current, AbortSignal.timeout(DEFAULT_OAUTH_REFRESH_TIMEOUT_MS));
+				} catch (error) {
+					throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error });
+				}
+			},
+			{ signal: lockWait.signal },
+		);
+```
+
+`CredentialStore.modify` 是唯一的写入口，它按 provider 串行执行“读-改-写”（pi CLI 的实现跨进程加文件锁）。进锁之前先粗查一次“是否快过期”（剩余不足 5 分钟），进锁之后用最新的凭据再查一次 `needsRefresh(current)`。前一个请求已经刷新过，第二个请求在锁里就会看到新 token，直接返回。
+
+还有一个细节：刷新调用用的是 `AbortSignal.timeout(...)`，而不是调用方的 `signal`。注释解释了原因：一旦刷新请求发出，厂商可能已经轮换了 refresh token。如果这时因为用户取消而中断，新 token 没写进存储，旧 token 又已作废，用户就只能重新登录。所以调用方的取消信号只能取消“等锁”，不能取消“刷新”本身。
+
+## 7. 工具参数：流式 partial JSON 与 schema 校验
+
+### 7.1 问题
+
+模型调用工具时，参数是一段 JSON 文本，流式地一小段一小段传回来：
+
+```text
+{"pa
+th": "src/ma
+in.ts", "con
+tent": "export const x = 1;\n
+```
+
+两个需求互相矛盾：
+
+- 界面想**边生成边显示**。用户在 TUI 里应该能看到 write 工具正在写的文件路径和内容逐渐增长，这需要在 JSON 还没写完时就解析出 `{ path: "src/main.ts", content: "export const x = 1;\n" }`。
+- 执行工具时要**严格**。完整文本必须是合法的 JSON 对象，否则应该报错让模型重来。
+
+### 7.2 ToolCallArgumentsStream
+
+[streaming-json.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/utils/streaming-json.ts) 用两套机制分别满足两个需求：
+
+```ts title="packages/ai/src/utils/streaming-json.ts:446-500"
+/**
+ * The arguments of one streaming tool call: the raw text, for the one full parse when the call ends, and a
+ * `StreamingJsonParser` for the partial arguments in between. Providers keep one per call in their own stream state,
+ * never on the content block, so the raw text never reaches partial messages or transcripts.
+ */
+export class ToolCallArgumentsStream {
+	#text = "";
+	#parser = new StreamingJsonParser();
+	#snapshot: JsonValue | undefined = undefined;
+	#arguments: ToolCall["arguments"] = {};
+
+	// ...
+	/** Append a piece of argument text; returns the partial arguments, a new object whenever they changed. */
+	append(delta: string): ToolCall["arguments"] {
+		this.#text += delta;
+		this.#parser.append(delta);
+		return this.#partial();
+	}
+
+	// ...
+	/** The final arguments: one full parse of the complete text, which reports malformed arguments. */
+	finish(): Pick<ToolCall, "arguments" | "argumentsError"> {
+		return parseToolCallArguments(this.#text);
+	}
+```
+
+- **流式阶段**：`append()` 把每段增量喂给 `StreamingJsonParser`，返回当前能解析出的部分对象。
+- **结束时**：`finish()` 对完整原文做一次严格解析。
+
+`StreamingJsonParser` 是一个增量的、宽容的 JSON 解析器（文件开头有一大段注释说明规则）。“增量”指每个字符只读一次，总代价和文本长度成线性关系。如果每来一段增量就对整段文本重新 `JSON.parse`，一个 10KB 的 write 参数分 2000 段到达，总工作量就是平方级别。“宽容”指不完整的文本也能给出合理的值：没闭合的字符串显示已读到的部分，没闭合的对象显示已有的成员，键已出现但值还没开始的成员直接省略。
+
+它还有一个“信用”机制（第 30-33 行注释）：每次 `append` 按长度攒信用，`snapshot()` 复制当前打开的容器要花信用，信用不够就返回上一份快照。这样即使参数里有一个上千元素的大数组一直不闭合，快照的复制开销也不会失控，代价只是预览稍微滞后一点。
+
+注意类注释里那句 “never on the content block”：原始文本只保存在协议实现自己的状态里，不会出现在 `partial` 消息上，因此也不会被写进会话文件。
+
+### 7.3 严格解析：parseToolCallArguments
+
+```ts title="packages/ai/src/utils/json-parse.ts:106-120"
+export function parseToolCallArguments(json: string | undefined): Pick<ToolCall, "arguments" | "argumentsError"> {
+	if (!json?.trim()) return { arguments: {} };
+	try {
+		const parsed = parseJsonWithRepair<ToolCall["arguments"] | null>(json);
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			throw new Error("Tool arguments must be a JSON object");
+		}
+		return { arguments: parsed };
+	} catch (error) {
+		return {
+			arguments: {},
+			argumentsError: `${error instanceof Error ? error.message : String(error)}\n\nReceived arguments:\n${json}`,
+		};
+	}
+}
+```
+
+`parseJsonWithRepair` 先尝试标准 `JSON.parse`，失败后做一次有限的修复再试（[json-parse.ts:33-96](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/utils/json-parse.ts#L33-L96)）。修复只针对模型最常犯的两种错误：字符串里出现未转义的换行等控制字符，以及非法转义（比如 Windows 路径里的 `\d`）。修完还不行，就把错误和原文放进 `argumentsError`。
+
+### 7.4 schema 校验：validateToolArguments
+
+工具的参数 schema 用 TypeBox 定义（`Tool.parameters: TSchema`）。TypeBox 是一个用 TypeScript 写 JSON Schema 的库，同一份定义既是运行时的 JSON Schema，又能推出静态类型。校验发生在 agent 循环执行工具之前（[agent-loop.ts:737](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/src/agent-loop.ts#L737)），函数本身在 pi-ai 里：
+
+```ts title="packages/ai/src/utils/validation.ts:317-353"
+export function validateToolArguments(tool: Tool, toolCall: ToolCall): any {
+	if (toolCall.argumentsError) {
+		throw new Error(`Invalid arguments for tool "${toolCall.name}": ${toolCall.argumentsError}`);
+	}
+	const args = structuredClone(toolCall.arguments);
+	normalizeOptionalNulls(args, tool.parameters as JsonSchemaObject);
+	Value.Convert(tool.parameters, args);
+
+	const validator = getValidator(tool.parameters);
+	if (!Object.getOwnPropertySymbols(tool.parameters).includes(TYPEBOX_KIND)) {
+		const coerced = coerceWithJsonSchema(args, tool.parameters as JsonSchemaObject);
+		// ...
+	}
+
+	if (validator.Check(args)) {
+		return args;
+	}
+
+	const errors =
+		validator
+			.Errors(args)
+			.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
+			.join("\n") || "Unknown validation error";
+
+	const errorMessage = `Validation failed for tool "${toolCall.name}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(toolCall.arguments, null, 2)}`;
+
+	throw new Error(errorMessage);
+}
+```
+
+校验前先做几步“宽容化”：
+
+1. `argumentsError` 存在就直接失败，把 7.3 节的解析错误交给模型。
+2. `normalizeOptionalNulls`：模型常对可选参数传 `null` 表示“不填”，但 schema 不允许 `null`。可选字段的 `null` 直接删掉。
+3. `Value.Convert`：TypeBox 的类型转换，例如 schema 要数字而模型给了字符串 `"10"`，就转成 `10`。
+4. 对不是 TypeBox 构造的普通 JSON Schema（比如 MCP 服务器提供的工具），用自己写的 `coerceWithJsonSchema` 做同类转换。
+
+校验器用 `WeakMap` 按 schema 对象缓存（[validation.ts:271-280](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/utils/validation.ts#L271-L280)），每个工具的 schema 只编译一次。
+
+失败时抛出的错误信息是写给模型看的：列出每个字段路径和原因，再附上收到的参数。agent 循环把它作为 `isError: true` 的工具结果返回，模型读到后通常能自己修正参数重试。
+
+## 8. 测试用的 faux provider
+
+调用真实模型既慢又花钱，而且回复不确定。[providers/faux.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/providers/faux.ts) 提供一个“假 provider”：你预先排好它要说的话，它按真实 provider 的事件协议流式吐出来。pi 的 agent 循环测试和 coding-agent 的测试套件（`test/suite/harness.ts`）都基于它。
+
+```ts title="packages/ai/src/providers/faux.ts:699-721"
+/**
+ * Faux provider for tests built on explicit `Models` collections:
+ *
+ * ```ts
+ * const faux = fauxProvider();
+ * const models = createModels();
+ * models.setProvider(faux.provider);
+ * faux.setResponses([fauxAssistantMessage("hi")]);
+ * ```
+ */
+export function fauxProvider(options: RegisterFauxProviderOptions = {}): FauxProviderHandle {
+	const core = createFauxCore(options);
+	const provider = createProvider({
+		id: core.provider,
+		auth: { apiKey: { name: "Faux", resolve: async () => ({ auth: {} }) } },
+		models: core.models,
+		api: {
+			stream: core.stream,
+			streamSimple: core.streamSimple,
+			fetchDeferred: core.fetchDeferred,
+			cancelDeferred: core.cancelDeferred,
+		},
+	});
+```
+
+faux provider 也是用 `createProvider` 拼出来的，和真实 provider 走完全相同的 `Models` 路径。鉴权的 `resolve` 永远成功，返回空的 `auth`。
+
+用法是排一个“剧本”：`setResponses([...])` 放入一组预设回复，每次请求取出一条。剧本里的每一项可以是固定的 `AssistantMessage`，也可以是一个函数，根据当前上下文动态决定回复（类型 `FauxResponseFactory`），这样测试可以断言“模型收到的上下文里有没有某条工具结果”。剧本用完后再请求，会得到 `"No more faux responses queued"` 错误，测试能立刻发现多发了请求。
+
+关键在于它真的会“流”：
+
+```ts title="packages/ai/src/providers/faux.ts:427-443"
+		partial.content = [...partial.content, { type: "toolCall", id: block.id, name: block.name, arguments: {} }];
+		stream.push({ type: "toolcall_start", contentIndex: index, partial: { ...partial } });
+		// Partial arguments come from the same parser real providers use, so consumers see them grow.
+		const toolArguments = new ToolCallArgumentsStream();
+		for (const chunk of splitStringByTokenSize(JSON.stringify(block.arguments), minTokenSize, maxTokenSize)) {
+			await scheduleChunk(chunk, tokensPerSecond);
+			if (signal?.aborted) {
+				const aborted = createAbortedMessage(partial);
+				stream.push({ type: "error", reason: "aborted", error: aborted });
+				stream.end(aborted);
+				return;
+			}
+			(partial.content[index] as ToolCall).arguments = toolArguments.append(chunk);
+			stream.push({ type: "toolcall_delta", contentIndex: index, delta: chunk, partial: { ...partial } });
+		}
+		(partial.content[index] as ToolCall).arguments = block.arguments;
+		stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: { ...partial } });
+```
+
+预设的工具参数被 `JSON.stringify` 后切成随机大小的片段（默认每片 3 到 5 个“token”，按 4 字符一个 token 估算），用和真实 provider 相同的 `ToolCallArgumentsStream` 逐段解析。每段之间检查 `signal`，所以测试也能覆盖“流到一半被中止”的路径。设置 `tokensPerSecond` 还能模拟真实的输出速度。
+
+它还会估算用量：按字符数除以 4 估 token，传了 `sessionId` 时还模拟 prompt cache，按本次和上次提示的公共前缀长度算出 `cacheRead` 和 `cacheWrite`（[faux.ts:246-287](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/providers/faux.ts#L246-L287)）。这让依赖用量的逻辑，比如 compaction 的触发判断，也能在不联网的情况下测试。
+
+## 9. 完整追踪：一次 Anthropic 请求
+
+现在把前面的零件串起来。场景：pi 的 agent 循环要求 Claude 回复，上下文里有系统提示、一个 `read` 工具、一条用户消息，思考级别为 `medium`。
+
+### 9.1 第一步：agent 循环发起调用
+
+```ts title="packages/agent/src/agent-loop.ts:403-417"
+	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
+	const llmMessages = await config.convertToLlm(messages);
+
+	const llmContext = normalizeContext({ messages: llmMessages });
+
+	// Resolve API key (important for expiring tokens)
+	const resolvedApiKey =
+		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+
+	const response = await streamFunction(config.model, llmContext, {
+		...config,
+		apiKey: resolvedApiKey,
+		identity: mergeClientIdentity(DEFAULT_AGENT_IDENTITY, config.identity),
+		signal,
+	});
+```
+
+agent 循环内部的消息类型是可扩展的 `AgentMessage`，在这里经 `convertToLlm` 转成 pi-ai 的 `Message[]`（第 2 章讲）。`streamFunction` 在 pi CLI 里是 `sdk.ts` 注入的函数，最终调用 `modelRuntime.streamSimple()`（[sdk.ts:412-423](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/sdk.ts#L412-L423)）。`ModelRuntime` 是 coding-agent 对 `Models` 的封装，多了虚拟模型路由等功能（第 3 章），但核心路径和 3.3 节的 `Models.streamSimple` 一样：规范化、解析鉴权、调用 `provider.streamSimple`。
+
+provider 是 `anthropicProvider()`，它的 `api` 是 `lazyApi` 包装。第一次请求时 `import("./anthropic-messages.ts")` 加载模块，然后调用模块导出的 `streamSimple`。
+
+### 9.2 第二步：streamSimple 把抽象级别翻译成厂商参数
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:954-1002"
+export const streamSimple: StreamFunction<"anthropic-messages", SimpleStreamOptions> = (
+	model: Model<"anthropic-messages">,
+	context: TranscriptContext,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream => {
+	if (!getAnthropicFederation(model, options?.apiKey, options?.headers, options?.env)) {
+		assertRequestAuth(model.provider, options?.apiKey, options?.headers);
+	}
+
+	const base = {
+		...buildBaseOptions(model, context, options, options?.apiKey),
+		toolChoice: options?.toolChoice,
+	} satisfies AnthropicOptions;
+	if (!options?.reasoning) {
+		return stream(model, context, {
+			...base,
+			thinkingEnabled: false,
+		} satisfies AnthropicOptions);
+	}
+
+	// For models with adaptive thinking: use an effort level.
+	// For older models: use budget-based thinking.
+	if (model.compat?.forceAdaptiveThinking === true) {
+		const effort = mapThinkingLevelToEffort(model, options.reasoning);
+		return stream(model, context, {
+			...base,
+			thinkingEnabled: true,
+			effort,
+		} satisfies AnthropicOptions);
+	}
+
+	// Undefined means the caller did not request an output cap; let the helper use the model cap.
+	// Do not coerce to 0 here, or the thinking budget would become the entire max_tokens value.
+	const adjusted = adjustMaxTokensForThinking(
+		base.maxTokens,
+		model.maxTokens,
+		options.reasoning,
+		options.thinkingBudgets,
+	);
+
+	const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);
+
+	return stream(model, context, {
+		...base,
+		maxTokens,
+		thinkingEnabled: true,
+		thinkingBudgetTokens: Math.min(adjusted.thinkingBudget, Math.max(0, maxTokens - 1024)),
+	} satisfies AnthropicOptions);
+};
+```
+
+这是“通用选项”到“协议选项”的翻译层。Claude 有两代思考控制方式：
+
+| 模型类型 | 判断依据 | `medium` 翻译成 |
+| --- | --- | --- |
+| 自适应思考（较新的模型） | `model.compat?.forceAdaptiveThinking === true` | `effort: "medium"`，模型自己决定思考多少 |
+| 预算制思考（较旧的模型） | 其余情况 | `thinkingBudgetTokens`，默认 `medium` 为 8192 |
+
+预算表在 `simple-options.ts`：`minimal` 1024、`low` 2048、`medium` 8192、`high` 16384（[simple-options.ts:71-76](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/api/simple-options.ts#L71-L76)）。思考 token 和回答 token 共用 `max_tokens`，所以 `thinkingBudgetTokens` 最多取 `maxTokens - 1024`，至少给回答留 1024 个 token。`clampMaxTokensToContext` 再按“上下文窗口 − 估算的输入 − 4096 安全余量”压一次，避免输入加输出超过窗口导致 400 错误。
+
+注意开头的 `assertRequestAuth`：没有 key 时它**同步抛异常**，这正是 2.6 节契约里 “Direct streamSimple() calls may throw synchronously when request auth is missing” 的那种情况。在 `Models` 路径下，这个异常发生在 `lazyStream` 的 setup 里，依然会变成 `error` 事件。
+
+### 9.3 第三步：统一消息转成 Anthropic 消息
+
+`stream()` 里调用 `buildParams()` 组装请求体。第一件事是用 `transformMessages` 做跨模型的清洗：
+
+```ts title="packages/ai/src/api/transform-messages.ts:120-138"
+		if (msg.role === "assistant") {
+			const assistantMsg = msg as AssistantMessage;
+			const isSameModel =
+				assistantMsg.provider === model.provider &&
+				assistantMsg.api === model.api &&
+				assistantMsg.model === model.id;
+
+			const transformedContent = assistantMsg.content.flatMap((block) => {
+				if (block.type === "thinking") {
+					// Thinking from another model is dropped. Signatures and encrypted reasoning are
+					// only valid for the model that produced them, and sending readable thinking as
+					// plain text makes the new model treat it as part of the visible reply.
+					if (!isSameModel) return [];
+					// Keep redacted and signed blocks even if the thinking text is empty
+					// (OpenAI encrypted reasoning); they are needed for replay.
+					if (block.redacted || block.thinkingSignature) return block;
+					if (!block.thinking || block.thinking.trim() === "") return [];
+					return block;
+				}
+```
+
+这里用上了 2.2 节说的 `provider` / `api` / `model` 三元组。假设会话前半段用的是 GPT，后半段切到 Claude：GPT 的思考块被丢弃（签名对 Claude 无效，当成普通文本发过去又会被误认为是回复内容），工具调用 id 被规范化成 Anthropic 要求的 `^[a-zA-Z0-9_-]+$`、最长 64 字符的格式（OpenAI Responses 的 id 可能长达 450 多字符并含 `|`）。
+
+`transformMessages` 的第二遍处理两种“残缺历史”：
+
+```ts title="packages/ai/src/api/transform-messages.ts:212-233"
+		if (msg.role === "assistant") {
+			// If we have pending orphaned tool calls from a previous assistant, insert synthetic results now
+			closePendingToolCalls();
+
+			// Skip errored/aborted assistant messages entirely.
+			// These are incomplete turns that shouldn't be replayed:
+			// - May have partial content (reasoning without message, incomplete tool calls)
+			// - Replaying them can cause API errors (e.g., OpenAI "reasoning without following item")
+			// - The model should retry from the last valid state
+			const assistantMsg = msg as AssistantMessage;
+			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+				continue;
+			}
+
+			// Track tool calls from this assistant message
+			const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
+			if (toolCalls.length > 0) {
+				pendingToolCalls = toolCalls;
+				existingToolResultIds = new Set();
+			}
+
+			result.push(msg);
+```
+
+出错或被中止的 assistant 消息整条跳过。有工具调用却没有对应结果的（比如用户在工具执行时按了 Escape），补一条内容为 `"No result provided"`、`isError: true` 的合成结果。各家 API 都要求每个工具调用后面必须紧跟它的结果，否则直接 400。会话文件里保存的是真实发生的事，发给模型前再修补成合法序列。
+
+然后 `convertMessages` 逐条翻译。最能体现协议差异的是工具结果：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:1497-1521"
+		} else if (msg.role === "toolResult") {
+			// Collect all consecutive toolResult messages, needed for z.ai Anthropic endpoint.
+			const toolResults: ContentBlockParam[] = [];
+			// Anthropic rejects error tool results that contain anything but text, so their images follow
+			// all tool results of the turn, which must come first in the user message (#10794).
+			const errorImages: ContentBlockParam[] = [];
+			let j = i;
+			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
+				const toolMsg = transformedMessages[j] as ToolResultMessage;
+				const split = splitErrorToolResultImages(toolMsg);
+				toolResults.push(convertToolResult(toolMsg, split?.content));
+				if (split) {
+					errorImages.push({ type: "text", text: split.caption }, ...split.images.map(convertImageBlock));
+				}
+				j++;
+			}
+
+			// Skip the messages we've already processed.
+			i = j - 1;
+
+			params.push({
+				role: "user",
+				content: [...toolResults, ...errorImages],
+			});
+		}
+```
+
+pi 的统一格式里，三个工具结果是三条独立的 `toolResult` 消息。Anthropic 要求它们合并成**一条** user 消息里的多个 `tool_result` 块。这段代码把连续的 `toolResult` 收集起来一起转换。注释里还记录了一个 Anthropic 的限制：出错的工具结果里只能有文本，所以图片被挪到所有 `tool_result` 之后。
+
+`convertMessages` 最后还会在最后一条 user 消息的最后一个块上加 `cache_control`（[anthropic-messages.ts:1526-1552](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/api/anthropic-messages.ts#L1526-L1552)），告诉 Anthropic “到这里为止的前缀可以缓存”。系统提示和最后一个工具定义上也各有一个缓存断点。
+
+### 9.4 第四步：组装请求体，发出 HTTP
+
+`buildParams` 的主体：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:1209-1217"
+	const activeEffort = options?.effort ?? "high";
+	const betaFeatures = getBetaFeatures(model, context, isOAuthToken, nativeToolChanges, options);
+	const params: MessageCreateParamsStreaming = {
+		model: model.id,
+		messages: effortMessages ? insertThinkingLevelMessages(converted, activeEffort) : converted.messages,
+		max_tokens: options?.maxTokens ?? model.maxTokens,
+		stream: true,
+		...(betaFeatures.length > 0 ? { betas: betaFeatures } : {}),
+	};
+```
+
+后面依次填 `system`、`temperature`、`tools`、`thinking`、`tool_choice`。思考参数对应 9.2 节的两种翻译：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:1286-1304"
+	} else if (model.reasoning && options?.thinkingEnabled) {
+		// Default to "summarized" so Opus 4.7 and Mythos Preview behave like
+		// older Claude 4 models (whose API default is also "summarized").
+		const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? "summarized";
+		if (model.compat?.forceAdaptiveThinking === true) {
+			// Adaptive thinking: Claude decides when and how much to think.
+			params.thinking = { type: "adaptive", display };
+			if (options.effort) {
+				params.output_config = { effort: options.effort };
+			}
+		} else {
+			// Budget-based thinking for older models
+			params.thinking = {
+				type: "enabled",
+				budget_tokens: options.thinkingBudgetTokens || 1024,
+				display,
+			};
+		}
+	}
+```
+
+然后发请求：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:651-669"
+			for (;;) {
+				options?.signal?.throwIfAborted();
+				const built = buildParams(model, normalizedContext, isOAuth, options, disablePreferredStrictTools);
+				if (built.providerThinkingLevel) output.providerThinkingLevel = built.providerThinkingLevel;
+				let params = built.params;
+				const nextParams = await options?.onPayload?.(params, model);
+				if (nextParams !== undefined) {
+					params = { ...(nextParams as MessageCreateParamsStreaming), stream: true };
+				}
+				try {
+					response = await retryProviderRequest(
+						() => client.beta.messages.create(params, requestOptions).asResponse(),
+						{
+							maxRetries: options?.maxRetries,
+							maxRetryDelayMs: options?.maxRetryDelayMs,
+							signal: options?.signal,
+						},
+					);
+					break;
+```
+
+有四个值得注意的地方：
+
+1. **`onPayload` 钩子**：调用方可以在发送前查看或替换请求体。pi CLI 在 `sdk.ts` 里把它接到扩展事件 `before_provider_request` 上，调试时也可以用它打印最终请求体。
+2. **`.asResponse()`**：这里用 Anthropic SDK 构造请求（鉴权头、beta 头、超时都由 SDK 处理），但拿的是原始 `Response`，不用 SDK 自带的流解析。原因见下一步。
+3. **重试自己做**：`requestOptions` 里把 SDK 的 `maxRetries` 设成 0（第 647 行），再用 `retryProviderRequest` 包一层。它的注释说明了原因：SDK 内置的重试等待不响应 `AbortSignal`，用户按 Escape 后还要干等退避结束。自己实现的版本用可中断的 `abortableSleep`，并且服务器要求等待超过 60 秒时直接失败，交给上层带界面提示的重试逻辑（[provider-retry.ts:99-128](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/utils/provider-retry.ts#L99-L128)）。
+4. **`for (;;)` 降级重试**：如果请求因为“strict 工具太多”被拒（400），就关掉偏好性的 strict 模式再发一次，并在消息上记一条诊断。注释特别强调 “Only downgrade a rejected request, never an already-started stream”：只有请求被拒时才降级，流已经开始后绝不重发。
+
+### 9.5 第五步：解析 SSE
+
+拿到 `Response` 后，先推出 `start` 事件，然后读取 SSE（Server-Sent Events，服务器推送事件：一种基于 HTTP 的文本协议，每个事件由若干 `event:` / `data:` 行组成，以空行分隔）：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:536-575"
+async function* iterateAnthropicEvents(
+	response: Response,
+	signal?: AbortSignal,
+): AsyncGenerator<RawMessageStreamEvent> {
+	if (!response.body) {
+		throw new Error("Attempted to iterate over an Anthropic response with no body");
+	}
+
+	let sawMessageStart = false;
+	let sawMessageEnd = false;
+
+	for await (const sse of iterateSseMessages(response.body, signal)) {
+		if (sse.event === "error") {
+			throw new Error(sse.data);
+		}
+
+		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
+			continue;
+		}
+
+		try {
+			const event = parseJsonWithRepair<RawMessageStreamEvent>(sse.data);
+			if (event.type === "message_start") {
+				sawMessageStart = true;
+			} else if (event.type === "message_stop") {
+				sawMessageEnd = true;
+			}
+			yield event;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(
+				`Could not parse Anthropic SSE event ${sse.event}: ${message}; data=${sse.data}; raw=${sse.raw.join("\\n")}`,
+			);
+		}
+	}
+
+	if (sawMessageStart && !sawMessageEnd) {
+		throw new Error("Anthropic stream ended before message_stop");
+	}
+}
+```
+
+这就是不用 SDK 流解析的原因，自己写可以控制三件事：
+
+- **JSON 修复**：用 `parseJsonWithRepair` 而不是 `JSON.parse`。一些兼容 Anthropic 协议的第三方服务会在 JSON 里塞未转义的控制字符。
+- **错误信息带原文**：解析失败时把事件名、数据和原始行都放进错误消息，排查兼容服务的问题时非常有用。
+- **检测流被截断**：收到了 `message_start` 却没收到 `message_stop` 就结束，说明连接中途断了，抛错而不是当作正常结束。
+
+底层的 `iterateSseMessages`（[anthropic-messages.ts:477-534](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/api/anthropic-messages.ts#L477-L534)）是一个标准的 SSE 行解析器：用 `TextDecoder` 的 `stream: true` 模式解码字节（避免一个多字节 UTF-8 字符被切在两个网络包之间时出现乱码），按 `\r`、`\n`、`\r\n` 切行，空行时把累积的 `event` 和 `data` 打包成一个事件。
+
+### 9.6 第六步：Anthropic 事件映射成统一事件
+
+这是“还原”的核心。Anthropic 的流事件有 6 种，映射关系如下：
+
+| Anthropic 事件 | pi-ai 动作 | 推出的统一事件 |
+| --- | --- | --- |
+| `message_start` | 记录 `responseId`、初始 `usage` | 无 |
+| `content_block_start`（text / thinking / tool_use） | 向 `output.content` 追加空块，记录块下标映射 | `text_start` / `thinking_start` / `toolcall_start` |
+| `content_block_delta`（`text_delta` / `thinking_delta` / `input_json_delta`） | 追加到对应块 | `text_delta` / `thinking_delta` / `toolcall_delta` |
+| `content_block_delta`（`signature_delta`） | 追加到 `thinkingSignature` | 无 |
+| `content_block_stop` | 工具调用做最终解析 | `text_end` / `thinking_end` / `toolcall_end` |
+| `message_delta` | 设置 `stopReason`、更新 `usage` 和费用 | 无 |
+| `message_stop` | 无（由循环结束后统一处理） | 循环结束后推 `done` |
+
+先看块的开始：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:735-770"
+					if (event.content_block.type === "text") {
+						output.content.push({ type: "text", text: event.content_block.text ?? "" });
+						openBlocks.set(event.index, { contentIndex: output.content.length - 1 });
+						stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+					} else if (event.content_block.type === "thinking") {
+						output.content.push({
+							type: "thinking",
+							thinking: event.content_block.thinking ?? "",
+							thinkingSignature: event.content_block.signature ?? "",
+						});
+						openBlocks.set(event.index, { contentIndex: output.content.length - 1 });
+						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+					} else if (event.content_block.type === "redacted_thinking") {
+						output.content.push({
+							type: "thinking",
+							thinking: "[Reasoning redacted]",
+							thinkingSignature: event.content_block.data,
+							redacted: true,
+						});
+						openBlocks.set(event.index, { contentIndex: output.content.length - 1 });
+						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+					} else if (event.content_block.type === "tool_use") {
+						output.content.push({
+							type: "toolCall",
+							id: event.content_block.id,
+							name: isOAuth
+								? fromClaudeCodeName(event.content_block.name, currentTools)
+								: event.content_block.name,
+							arguments: (event.content_block.input as Record<string, any>) ?? {},
+						});
+						openBlocks.set(event.index, {
+							contentIndex: output.content.length - 1,
+							arguments: new ToolCallArgumentsStream(),
+						});
+						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+					}
+```
+
+`openBlocks` 是一个 `Map`，键是 Anthropic 的块下标 `event.index`，值是 pi-ai 的 `contentIndex` 以及（工具调用时）一个 `ToolCallArgumentsStream`。为什么需要映射？因为两边的下标不一定一致：比如 Anthropic 的 `fallback` 块不会进入 `output.content`（第 729-734 行）。参数解析器放在这个 `Map` 里而不是内容块上，就是 7.2 节说的 “never on the content block”。
+
+`redacted_thinking`（被安全过滤器遮蔽的思考）被映射成 `redacted: true` 的思考块，加密载荷存进 `thinkingSignature`，下一轮原样回传（9.3 节 `convertMessages` 里有对应的反向处理）。
+
+增量的处理：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:793-808"
+					} else if (event.delta.type === "input_json_delta") {
+						if (open?.block.type === "toolCall" && open.arguments !== undefined) {
+							open.block.arguments = open.arguments.append(event.delta.partial_json);
+							stream.push({
+								type: "toolcall_delta",
+								contentIndex: open.contentIndex,
+								delta: event.delta.partial_json,
+								partial: output,
+							});
+						}
+					} else if (event.delta.type === "signature_delta") {
+						if (open?.block.type === "thinking") {
+							open.block.thinkingSignature = open.block.thinkingSignature || "";
+							open.block.thinkingSignature += event.delta.signature;
+						}
+					}
+```
+
+每段 `partial_json` 喂给 `ToolCallArgumentsStream.append()`，返回的部分对象直接赋给 `block.arguments`。于是 `partial` 上的工具调用参数随着流逐渐变完整，TUI 能实时显示。
+
+块结束：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:809-837"
+				} else if (event.type === "content_block_stop") {
+					const open = openBlock(event.index);
+					openBlocks.delete(event.index);
+					if (open) {
+						const { block, contentIndex: index } = open;
+						if (block.type === "text") {
+							stream.push({
+								type: "text_end",
+								contentIndex: index,
+								content: block.text,
+								partial: output,
+							});
+						} else if (block.type === "thinking") {
+							stream.push({
+								type: "thinking_end",
+								contentIndex: index,
+								content: block.thinking,
+								partial: output,
+							});
+						} else if (block.type === "toolCall" && open.arguments !== undefined) {
+							Object.assign(block, open.arguments.finish());
+							stream.push({
+								type: "toolcall_end",
+								contentIndex: index,
+								toolCall: block,
+								partial: output,
+							});
+						}
+					}
+```
+
+工具调用块结束时调用 `finish()`，对完整原文做一次严格解析，结果（`arguments`，可能还有 `argumentsError`）覆盖到块上。流式阶段宽容、结束时严格，两个需求在这里汇合。
+
+停止原因来自 `message_delta`，经 `mapStopReason` 翻译：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:1660-1686"
+function mapStopReason(
+	reason: BetaStopReason | string,
+	stopDetails?: RefusalStopDetails | null,
+): { stopReason: StopReason; errorMessage?: string } {
+	switch (reason) {
+		case "end_turn":
+			return { stopReason: "stop" };
+		case "max_tokens":
+			return { stopReason: "length" };
+		case "tool_use":
+			return { stopReason: "toolUse" };
+		case "refusal":
+			return {
+				stopReason: "error",
+				errorMessage: stopDetails?.explanation || `The model refused to complete the request`,
+			};
+		case "pause_turn": // Stop is good enough -> resubmit
+			return { stopReason: "stop" };
+		case "stop_sequence":
+			return { stopReason: "stop" }; // We don't supply stop sequences, so this should never happen
+		case "sensitive": // Content flagged by safety filters (not yet in SDK types)
+			return { stopReason: "error", errorMessage: "Provider stopped with: sensitive" };
+		default:
+			// Handle unknown stop reasons gracefully (API may add new values)
+			throw new Error(`Unhandled stop reason: ${reason}`);
+	}
+}
+```
+
+原始值也保留在 `output.rawStopReason` 里。模型拒绝回答（`refusal`）被归为 `error`，带上厂商给的解释。
+
+用量方面，`message_start` 给出输入 token，`message_delta` 给出输出 token。Anthropic 不提供总数，pi 自己累加，每次更新后调用 `calculateCost` 重算费用（[anthropic-messages.ts:851-880](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/api/anthropic-messages.ts#L851-L880)）。在 `message_start` 就记录输入 token 是有意的：注释说 “This ensures we have input token counts even if the stream is aborted early”，即使流中途被中止，这次请求的输入用量也不会丢。
+
+### 9.7 第七步：收尾
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:892-923"
+			if (options?.signal?.aborted) {
+				throw new Error("Request was aborted");
+			}
+
+			if (output.stopReason === "pending") {
+				throw new Error("Anthropic stream ended without a stop reason");
+			}
+			if (output.stopReason === "aborted" || output.stopReason === "error") {
+				throw new Error(output.errorMessage || "An unknown error occurred");
+			}
+			// ...
+			stream.push({ type: "done", reason: output.stopReason, message: output });
+			stream.end();
+		} catch (error) {
+			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			stream.push({ type: "error", reason: output.stopReason, error: output });
+			stream.end();
+		}
+```
+
+整个 `stream()` 的主体是一个 `async` 立即执行函数（第 586 行），外面包一个 `try/catch`。不论在哪一步出错（鉴权、HTTP 4xx/5xx、SSE 解析、流被截断、未知停止原因），都汇集到这个 `catch`，推出一个 `error` 事件。被中止时 `stopReason` 是 `aborted`，否则是 `error`。这就是 2.6 节契约的具体落实。
+
+注意出错时推出的 `output` 仍然保留着已经收到的内容。用户中止时已经生成的半段回复不会丢，会话里能看到它。下一轮请求时 `transformMessages` 会跳过这条消息（9.3 节）。
+
+最内层流推出的 `done` 事件经过 `lazyApi` 的 `lazyStream`、`Models` 的 `lazyStream` 两次转发，到达 agent 循环：
+
+```ts title="packages/agent/src/agent-loop.ts:424-460"
+	for await (const event of response) {
+		switch (event.type) {
+			case "start":
+				partialMessage = event.partial;
+				context.messages.push(partialMessage);
+				addedPartial = true;
+				await emit({ type: "message_start", message: { ...partialMessage } });
+				break;
+
+			case "text_start":
+			case "text_delta":
+			case "text_end":
+			case "thinking_start":
+			case "thinking_delta":
+			case "thinking_end":
+			case "toolcall_start":
+			case "toolcall_delta":
+			case "toolcall_end":
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+
+			case "done":
+			case "error": {
+				const finalMessage = await result();
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = finalMessage;
+				} else {
+					context.messages.push(finalMessage);
+				}
+```
+
+agent 循环把 9 种增量事件统一转成一个 `message_update`，原始事件放在 `assistantMessageEvent` 里给需要细节的界面用。`done` 和 `error` 走同一个分支：都用 `result()` 拿最终消息替换掉半成品。agent 循环不需要区分“成功的回复”和“出错的回复”，后续的 `stopReason === "error"` 判断（第 2 章）决定是否结束本次运行。
+
+到这里，一次请求的往返就完整了。回顾一下数据形态的变化：
+
+```text
+Context（systemPrompt + tools + messages）
+  → TranscriptContext（开头一条 system 消息）              normalizeContext
+  → Message[]（清洗：丢异模型思考、补孤儿工具结果）         transformMessages
+  → MessageCreateParamsStreaming（Anthropic 请求体）       buildParams / convertMessages
+  → HTTP POST + SSE 字节流                                SDK .asResponse()
+  → RawMessageStreamEvent（Anthropic 事件）               iterateAnthropicEvents
+  → AssistantMessageEvent（统一事件）+ AssistantMessage    事件映射
+```
+
+## 10. 换一个协议会怎样
+
+理解了 Anthropic 的实现，再看其他协议就容易了。每个 `api/*.ts` 模块都是同样的骨架：
+
+1. `streamSimple` 把 `reasoning` 等通用选项翻译成本协议的选项，调用 `stream`。
+2. `stream` 创建 `AssistantMessageEventStream`，启动一个 `async` 立即执行函数，同步返回流。
+3. `transformMessages` 清洗历史，`convertMessages` 转成本协议的消息格式。
+4. 发请求，解析流，按本协议的事件推出统一事件。
+5. 所有错误汇集到一个 `catch`，推 `error` 事件。
+
+差异集中在第 3、4 步。例如 `openai-completions` 要服务约 28 个 provider，每家对“OpenAI 兼容”的理解都有出入：有的不支持 `developer` 角色（`supportsDeveloperRole`），有的不接受 `store` 参数（`supportsStore`），思考参数的格式也五花八门（`thinkingFormat`）。这些差异不写成 `if (provider === "xxx")`，而是写进 `Model.compat`（类型定义在 `providers/compat-schema.ts`）。模型目录可以为每个模型声明兼容开关，没声明时按 `baseUrl` 自动探测。新接入一家“基本兼容”的服务，通常只需要写一个 15 行的 provider 文件，必要时在模型数据里加几个 `compat` 开关。
+
+## 小结
+
+- pi-ai 用 `types.ts` 定义了一套通用语：四种消息（system / user / assistant / toolResult）、四种内容块（text / thinking / image / toolCall）、`Usage`、7 种 `StopReason`、以 `start` 开头 `done` / `error` 结尾的 `AssistantMessageEvent`。厂商私有数据（签名、加密思考）装在可选字段里原样回传。
+- 工具定义放在 system 消息里随对话演进，而不是挂在请求顶层，目的是在中途增删工具时保住 prompt cache。`TranscriptContext` 用品牌类型保证到达协议实现的上下文都经过规范化。
+- `StreamFunction` 契约要求“返回流之后，错误只能编码在流里”。`lazyStream` 把异步准备（鉴权、加载模块）和准备失败都包进一个同步返回的流，形成“流套流”。
+- `Models` 负责鉴权并把请求委托给 provider；`createProvider` 把 id、鉴权、模型列表、协议实现四样零件拼成 provider，按 `model.api` 分发。42 个 provider 共享 15 种协议，协议实现通过 `*.lazy.ts` 按需 import。
+- `EventStream` 用两个 FIFO 队列把“推”转成“拉”，并提供 `result()`；`AssistantMessageEventStream` 额外记录耗时。
+- 鉴权优先级是显式 key、存储的凭据、环境变量；存储的凭据“拥有”该 provider，不静默回退。OAuth 刷新在凭据存储的锁里做双重检查，且刷新本身不响应取消。
+- 工具参数在流式阶段用增量宽容的 `StreamingJsonParser` 预览，结束时用 `parseToolCallArguments` 严格解析；执行前 `validateToolArguments` 做宽容转换再按 TypeBox schema 校验，错误信息写给模型看。
+- faux provider 用剧本驱动、按真实事件协议流式输出，让上层不联网也能测试。
+- Anthropic 的完整路径：`streamSimple` 翻译思考级别 → `transformMessages` 清洗历史 → `buildParams` 组装请求 → SDK `.asResponse()` 拿原始响应 → 自写 SSE 解析 → `openBlocks` 映射块下标并推出统一事件 → `mapStopReason` → `done` 或 `error`。
+
+## 动手验证
+
+1. **用 faux provider 观察事件序列**。在 `packages/ai` 下写一个临时脚本（放在 `/tmp`），`import { createModels, fauxProvider, fauxAssistantMessage, fauxText, fauxToolCall } from "./src/index.ts"`，注册 faux provider，`setResponses` 放一条同时含文本和工具调用的回复，然后 `for await` 打印每个事件的 `type` 和 `contentIndex`。对照 2.5 节的事件协议，再观察 `toolcall_delta` 期间 `partial.content[i].arguments` 如何逐步变完整。用 `node` 直接运行即可，不需要构建。
+2. **读 SSE 解析测试**。`packages/ai/test/anthropic-sse-parsing.test.ts` 用 `new Response(body)` 构造假的 SSE 响应，通过 `fetch` 选项注入，不联网就能测试 9.5、9.6 节的完整映射。运行：在 `packages/ai` 下执行 `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/anthropic-sse-parsing.test.ts`。
+3. **验证懒加载**。运行 `test/lazy-module-load.test.ts`，它断言 import pi-ai 入口时不会加载任何厂商 SDK。读它的 `runProbe` 函数，看它如何用 `registerHooks` 记录模块解析。
+4. **跨模型清洗与参数解析**。`test/transform-messages-cross-model-thinking.test.ts` 覆盖 9.3 节“丢弃异模型思考块”，`test/streaming-json.test.ts` 和 `test/validation.test.ts` 覆盖第 7 节的流式解析和 schema 校验。挑一个读，再试着改一个断言看它失败。

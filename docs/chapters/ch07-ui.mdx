@@ -1,0 +1,1387 @@
+---
+title: 第 7 章　界面层
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 7 章　界面层：pi-tui 与三种运行模式
+
+## 导读
+
+<Say id="k07-01">这一章讲 pi 怎样把 agent 的事件显示出来，以及怎样接收你的输入。</Say>
+<Say id="k07-02">终端界面来自 pi-tui。它的组件只有一个核心方法：render，给定宽度，返回若干行字符串。</Say>
+<Say id="k07-03">每帧渲染后，pi-tui 和上一帧逐行比较，只重写变化的那几行。</Say>
+<Say id="k07-04">写入时用 CSI 2026 同步输出把整帧包起来，终端一次性刷新，避免闪烁。</Say>
+<Say id="k07-05">交互模式订阅 AgentSession 的事件，把消息和工具调用变成组件挂进聊天区。</Say>
+<Say id="k07-06">你按回车时它调用 session.prompt；模型正在输出时，带上 steer 或 followUp。</Say>
+<Say id="k07-07">print 模式、RPC 模式和 SDK 用的是同一个 AgentSession，区别只在输入从哪来、事件送到哪。</Say>
+<Say id="k07-08">读完你能说清一行字符如何上屏，以及一个外部程序如何通过 JSONL 驱动 pi。</Say>
+
+## 1. 问题：界面层要解决什么
+
+第 3 章讲过，pi 的核心是 AgentSession：它包装 Agent，负责 prompt、排队、compaction、扩展和持久化，对外只暴露两样东西：方法（`prompt`、`steer`、`abort` 等）和事件（`subscribe`）。界面层要做的事情可以归结为两条：
+
+1. 把用户输入变成 AgentSession 的方法调用。
+2. 把 AgentSession 的事件变成用户能看到的输出。
+
+不同场景对“输入从哪来、输出到哪去”的要求不同：
+
+| 模式 | 输入 | 输出 | 入口 |
+| --- | --- | --- | --- |
+| 交互模式 | 终端键盘 | 终端界面（pi-tui） | [interactive-mode.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts) |
+| print 模式 | 命令行参数、stdin | 最后一条回复的文本，或 JSON 事件流 | [print-mode.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/print-mode.ts) |
+| RPC 模式 | stdin 上的 JSONL 命令 | stdout 上的 JSONL 响应和事件 | [modes/rpc/](https://github.com/earendil-works/pi/tree/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/rpc) |
+| SDK | TypeScript 函数调用 | `session.subscribe` 回调 | `createAgentSession()` |
+
+[main.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/main.ts#L112-L123) 按参数和终端状态选模式：
+
+```ts title="packages/coding-agent/src/main.ts:112-123"
+function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
+	if (parsed.mode === "rpc") {
+		return "rpc";
+	}
+	if (parsed.mode === "json") {
+		return "json";
+	}
+	if (parsed.print || !stdinIsTTY || !stdoutIsTTY) {
+		return "print";
+	}
+	return "interactive";
+}
+```
+
+注意第三个分支：stdin 或 stdout 不是终端（比如被管道连接）时，即使没写 `-p` 也自动进入 print 模式。所以 `echo "hi" | pi` 和 `pi "hi" > out.txt` 都不会启动 TUI。
+
+选定模式后，三种模式拿到的都是同一个 `runtime`（`AgentSessionRuntime`，它持有当前 AgentSession，会话替换时换掉它）：
+
+```ts title="packages/coding-agent/src/main.ts:950-993"
+	if (appMode === "rpc") {
+		printTimings();
+		await runRpcMode(runtime);
+	} else if (appMode === "interactive") {
+		const interactiveMode = new InteractiveMode(runtime, {
+			migratedProviders,
+			startupDiagnostics,
+			modelFallbackMessage,
+			autoTrustOnReloadCwd,
+			initialMessage,
+			initialImages,
+			initialMessages: parsed.messages,
+			verbose: parsed.verbose,
+			tuiMode: parsed.tuiMode,
+			initialThemeSetting: parsed.useTheme,
+		});
+		// ...
+		printTimings();
+		await interactiveMode.run();
+	} else {
+		printTimings();
+		const exitCode = await runPrintMode(runtime, {
+			mode: toPrintOutputMode(appMode),
+			messages: parsed.messages,
+			initialMessage,
+			initialImages,
+		});
+```
+
+本章先讲 pi-tui（第 2–4 节），再讲交互模式怎样用它（第 5–6 节），最后讲 print、RPC 和 SDK（第 7–9 节）。
+
+## 2. pi-tui 的组件模型
+
+### 2.1 render(width) → string[]
+
+pi-tui（`packages/tui`）是一个独立的终端 UI 库。它的组件接口非常小：
+
+```ts title="packages/tui/src/tui.ts:117-142"
+export interface Component {
+	/**
+	 * Render the component to lines for the given viewport width
+	 * @param width - Current viewport width
+	 * @returns Array of strings, each representing a line
+	 */
+	render(width: number): string[];
+
+	/** Optional handler for keyboard input when component has focus. */
+	handleInput?(data: string): void;
+
+	/** Optional normalized mouse handler. */
+	handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined;
+
+	/**
+	 * If true, component receives key release events (Kitty protocol).
+	 * Default is false - release events are filtered out.
+	 */
+	wantsKeyRelease?: boolean;
+
+	/**
+	 * Invalidate any cached rendering state.
+	 * Called when theme changes or when component needs to re-render from scratch.
+	 */
+	invalidate(): void;
+}
+```
+
+`render(width)` 拿到可用宽度，返回一个字符串数组，每个元素是终端上的一行。字符串里可以带 ANSI 转义序列（控制颜色、粗体等的不可见字符），但**可见宽度**不能超过 `width`。没有布局引擎，没有虚拟 DOM，也没有坐标：组件只回答“在这个宽度下我长什么样”。
+
+这个设计的好处是组件很容易写、很容易测试：给一个宽度，断言返回的行就行。代价是性能完全靠组件自己缓存，以及渲染器在下游做差分（第 3 节）。
+
+最简单的组件 `Text`：
+
+```ts title="packages/tui/src/components/text.ts:50-112"
+	render(width: number): string[] {
+		// Check cache
+		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
+			return this.cachedLines;
+		}
+		// ...
+		// Replace tabs with 3 spaces
+		const normalizedText = this.text.replace(/\t/g, "   ");
+
+		// Reduce margins when necessary so content and padding fit within the available width.
+		const paddingX = Math.min(this.paddingX, Math.max(0, Math.floor((width - 1) / 2)));
+		const contentWidth = Math.max(1, width - paddingX * 2);
+
+		// Wrap text (this preserves ANSI codes but does NOT pad)
+		const wrappedLines = wrapTextWithAnsi(normalizedText, contentWidth);
+
+		// Add margins and background to each line
+		const leftMargin = " ".repeat(paddingX);
+		const rightMargin = " ".repeat(paddingX);
+		const contentLines: string[] = [];
+
+		for (const line of wrappedLines) {
+		// ...
+		const result = [...emptyLines, ...contentLines, ...emptyLines];
+		flattenLines(result);
+
+		// Update cache
+		this.cachedText = this.text;
+		this.cachedWidth = width;
+		this.cachedLines = result;
+
+		return result.length > 0 ? result : [""];
+	}
+```
+
+两个要点：
+
+- **缓存**：文本和宽度都没变时直接返回上次的数组。交互模式里聊天记录可能有几百个组件，每帧都会对它们调用 `render`，缓存让没变化的组件几乎零开销。`invalidate()` 清缓存，主题切换时会对所有组件调用它。
+- **补齐宽度**：每行用空格补到 `width`。这样新内容覆盖旧内容时，不会留下上一帧更长那一行的残字。
+
+### 2.2 Container：把子组件的行拼起来
+
+```ts title="packages/tui/src/tui.ts:405-417"
+	render(width: number): string[] {
+		const lines: string[] = [];
+		const mouseChildren: Array<{ component: Component; height: number }> = [];
+		for (const child of this.children) {
+			const childLines = child.render(width);
+			mouseChildren.push({ component: child, height: childLines.length });
+			for (const line of childLines) {
+				lines.push(line);
+			}
+		}
+		this.mouseLayout = { width, children: mouseChildren };
+		return lines;
+	}
+```
+
+`Container` 依次渲染子组件，把行首尾相接。整个界面就是一棵 Container 树，根节点 `TUI` 本身也继承自 `Container`（`TuiBase extends Container`，[tui.ts:506](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/tui/src/tui.ts#L506)）。所谓布局就是“从上往下排”。顺便记下每个子组件占几行，供鼠标事件按行号找到目标组件。
+
+### 2.3 焦点、光标与输入
+
+键盘输入只发给一个组件：`tui.setFocus(component)` 指定的那个，调用它的 `handleInput(data)`。`data` 是终端发来的原始字节序列，比如回车是 `"\r"`，上箭头是 `"\x1b[A"`。
+
+光标位置也用字符串表达。获得焦点的组件在输出里光标所在位置插入一个零宽标记：
+
+```ts title="packages/tui/src/tui.ts:174-196"
+/**
+ * Interface for components that can receive focus and display a hardware cursor.
+ * When focused, the component should emit CURSOR_MARKER at the cursor position
+ * in its render output. TUI will find this marker and position the hardware
+ * cursor there for proper IME candidate window positioning.
+ */
+export interface Focusable {
+	/** Set by TUI when focus changes. Component should emit CURSOR_MARKER when true. */
+	focused: boolean;
+}
+
+/** Type guard to check if a component implements Focusable */
+export function isFocusable(component: Component | null): component is Component & Focusable {
+	return component !== null && "focused" in component;
+}
+
+/**
+ * Cursor position marker - APC (Application Program Command) sequence.
+ * This is a zero-width escape sequence that terminals ignore.
+ * Components emit this at the cursor position when focused.
+ * TUI finds and strips this marker, then positions the hardware cursor there.
+ */
+export const CURSOR_MARKER = "\x1b_pi:c\x07";
+```
+
+APC（Application Program Command）是一类终端会忽略的转义序列，所以这个标记不会显示出来。渲染器在最终输出里找到它，算出行列号，删掉标记，再把真实的终端光标移过去。为什么要移动真实光标？因为中文、日文输入法的候选窗口跟随硬件光标，光标位置不对，候选窗就会出现在屏幕角落。编辑器里的用法：
+
+```ts title="packages/tui/src/components/editor.ts:577-592"
+			// Add cursor if this line has it
+			if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
+				const before = displayText.slice(0, layoutLine.cursorPos);
+				const after = displayText.slice(layoutLine.cursorPos);
+
+				// Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
+				const marker = emitCursorMarker ? CURSOR_MARKER : "";
+
+				if (after.length > 0) {
+					// Cursor is on a character (grapheme) - replace it with highlighted version
+					// Get the first grapheme from 'after'
+					const afterGraphemes = [...this.segment(after, "grapheme")];
+					const firstGrapheme = afterGraphemes[0]?.segment || "";
+					const restAfter = after.slice(firstGrapheme.length);
+					const cursor = renderFakeCursor(firstGrapheme);
+					displayText = before + marker + cursor + restAfter;
+```
+
+`marker` 放在“假光标”（一个反色显示的字符）前面：用户看到的是假光标，输入法看到的是硬件光标，两者在同一个位置。
+
+## 3. 差分渲染
+
+### 3.1 什么时候渲染
+
+组件状态变了就调用 `tui.requestRender()`。它不立即渲染，而是合并到下一帧：
+
+```ts title="packages/tui/src/tui.ts:1027-1079"
+	requestRender(force = false): void {
+		if (force) {
+			this.resetRenderState();
+			this.requestImmediateRender();
+			return;
+		}
+		if (this.renderRequested) return;
+		this.renderRequested = true;
+		process.nextTick(() => this.scheduleRender());
+	}
+	// ...
+	private scheduleRender(): void {
+		if (this.stopped || this.renderTimer || !this.renderRequested) {
+			return;
+		}
+		const elapsed = performance.now() - this.lastRenderAt;
+		const delay = Math.max(0, TuiBase.MIN_RENDER_INTERVAL_MS - elapsed);
+		this.renderTimer = setTimeout(() => {
+			this.renderTimer = undefined;
+			if (this.stopped || !this.renderRequested) {
+				return;
+			}
+			this.renderRequested = false;
+			this.lastRenderAt = performance.now();
+			this.doRender();
+			if (this.renderRequested) {
+				this.scheduleRender();
+			}
+		}, delay);
+	}
+```
+
+- 同一个 tick 内多次 `requestRender()` 只算一次（`renderRequested` 标志）。
+- 两帧之间至少间隔 16ms（`MIN_RENDER_INTERVAL_MS`），约 60 帧每秒。模型每秒推几十个 token，每个 token 一次 `message_update`，如果每次都写终端，终端会被刷爆；节流后多个 token 合并成一帧。
+- `force` 参数清空渲染状态，立即全量重绘。
+
+### 3.2 两种渲染器
+
+`TuiBase` 的 `doRender()` 是抽象方法，有两个实现：
+
+| 实现 | 模式 | 特点 |
+| --- | --- | --- |
+| `TuiMainScreen` | 默认（regular） | 在终端主屏上输出，历史进入终端自己的回滚缓冲区，可以用终端原生的滚动和搜索 |
+| `TuiAltScreen` | fullscreen | 切到备用屏幕（`\x1b[?1049h`），自己管理滚动、搜索、鼠标选择，每帧按屏幕坐标写行 |
+
+coding-agent 在 [tui-renderer.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/tui-renderer.ts#L22-L50) 里按 `tuiMode` 二选一：
+
+```ts title="packages/coding-agent/src/modes/interactive/tui-renderer.ts:22-50"
+export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScreen | TuiAltScreen {
+	const terminal = options.terminal ?? new ProcessTerminal();
+	if (options.tuiMode === "fullscreen") {
+		const styleSearchMatch = (text: string) => theme.bg("searchMatchBg", theme.fg("searchMatchText", text));
+		return new TuiAltScreen(terminal, options.showHardwareCursor, options.logDirectory, {
+		// ...
+		});
+	}
+	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory);
+}
+```
+
+下面以默认的 `TuiMainScreen` 为例。
+
+### 3.3 一帧的流程
+
+```ts title="packages/tui/src/tui-main-screen.ts:247-275"
+	protected doRender(): void {
+		if (this.stopped) return;
+		const width = this.terminal.columns;
+		const height = this.terminal.rows;
+		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
+		const heightChanged = this.previousHeight !== 0 && this.previousHeight !== height;
+		const previousBufferLength = this.previousHeight > 0 ? this.previousViewportTop + this.previousHeight : height;
+		let prevViewportTop = heightChanged ? Math.max(0, previousBufferLength - height) : this.previousViewportTop;
+		let viewportTop = prevViewportTop;
+		let hardwareCursorRow = this.hardwareCursorRow;
+		const computeLineDiff = (targetRow: number): number => {
+			const currentScreenRow = hardwareCursorRow - prevViewportTop;
+			const targetScreenRow = targetRow - viewportTop;
+			return targetScreenRow - currentScreenRow;
+		};
+
+		// Render all components to get new lines
+		// Resolve fake cursors before compositing so overlays and line slicing see plain SGR codes
+		let newLines = this.resolveFakeCursors(this.render(width));
+
+		// Composite overlays into the rendered lines (before differential compare)
+		if (this.hasOverlayEntries) {
+			newLines = this.compositeOverlays(newLines, width, height);
+		}
+
+		// Extract cursor position before applying line resets (marker must be found first)
+		const cursorPos = this.extractCursorPosition(newLines, height);
+
+		newLines = this.applyLineResets(newLines);
+```
+
+1. 从根节点 `render(width)` 得到完整的行数组 `newLines`。
+2. 把浮层（overlay，比如选择框）合成进这些行。
+3. 找出光标标记的位置并删掉标记。
+4. 和上一帧的 `previousLines` 比较，决定怎么写终端。
+
+某些情况下没法差分，只能全量重绘：
+
+```ts title="packages/tui/src/tui-main-screen.ts:331-352"
+		// First render - just output everything without clearing (assumes clean screen)
+		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
+			logRedraw("first render");
+			fullRender(false);
+			return;
+		}
+
+		// Width changes always need a full re-render because wrapping changes.
+		if (widthChanged) {
+			logRedraw(`terminal width changed (${this.previousWidth} -> ${width})`);
+			fullRender(true);
+			return;
+		}
+
+		// Height changes normally need a full re-render to keep the visible viewport aligned,
+		// but Termux changes height when the software keyboard shows or hides.
+		// In that environment, a full redraw causes the entire history to replay on every toggle.
+		if (heightChanged && !isTermuxSession()) {
+			logRedraw(`terminal height changed (${this.previousHeight} -> ${height})`);
+			fullRender(true);
+			return;
+		}
+```
+
+宽度变了，每一行的折行都会变，只能整体重画（`\x1b[2J\x1b[H\x1b[3J`：清屏、光标回左上角、清回滚缓冲区）。高度变了也一样，但 Termux（安卓上的终端）例外：软键盘弹出收起都会改变高度，每次都全量重绘会把整段历史重放一遍。
+
+### 3.4 找出变化的行
+
+```ts title="packages/tui/src/tui-main-screen.ts:363-398"
+		// Find first and last changed lines
+		let firstChanged = -1;
+		let lastChanged = -1;
+		const maxLines = Math.max(newLines.length, this.previousLines.length);
+		for (let i = 0; i < maxLines; i++) {
+			const oldLine = i < this.previousLines.length ? this.previousLines[i] : "";
+			const newLine = i < newLines.length ? newLines[i] : "";
+
+			if (oldLine !== newLine) {
+				if (firstChanged === -1) {
+					firstChanged = i;
+				}
+				lastChanged = i;
+			}
+		}
+		const appendedLines = newLines.length > this.previousLines.length;
+		if (appendedLines) {
+			if (firstChanged === -1) {
+				firstChanged = this.previousLines.length;
+			}
+			lastChanged = newLines.length - 1;
+		}
+		if (firstChanged !== -1) {
+			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
+			firstChanged = expandedRange.firstChanged;
+			lastChanged = expandedRange.lastChanged;
+		}
+		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
+
+		// No changes - but still need to update hardware cursor position if it moved
+		if (firstChanged === -1) {
+			this.positionHardwareCursor(cursorPos, newLines.length);
+			this.previousViewportTop = prevViewportTop;
+			this.previousHeight = height;
+			return;
+		}
+```
+
+逐行比较字符串，记下第一个和最后一个不同的行号。因为组件有缓存，没变化的行是同一个字符串对象，比较很快。完全没变化时，只更新光标位置，不写任何内容。
+
+具体例子：模型正在输出一段回复，屏幕上有 40 行。这一帧新到了几个 token，只影响助手消息的最后一行（第 37 行），底部的编辑器和状态栏不变。比较结果是 `firstChanged = lastChanged = 37`，渲染器只需要：把光标移到第 37 行、清掉这一行、写入新内容。其余 39 行一个字节都不发。
+
+### 3.5 只重写变化的范围
+
+```ts title="packages/tui/src/tui-main-screen.ts:450-547"
+		// Differential rendering can only touch what was actually visible.
+		// If the first changed line is above the previous viewport, we need a full redraw.
+		if (firstChanged < prevViewportTop) {
+			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
+			fullRender(true);
+			return;
+		}
+
+		// Render from first changed line to end
+		// Keep updates wrapped in synchronized output while writing bounded chunks.
+		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+		output.append("\x1b[?2026h"); // Begin synchronized output
+		output.append(this.deleteChangedKittyImages(firstChanged, lastChanged));
+		const prevViewportBottom = prevViewportTop + height - 1;
+		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
+		if (moveTargetRow > prevViewportBottom) {
+			const currentScreenRow = Math.max(0, Math.min(height - 1, hardwareCursorRow - prevViewportTop));
+			const moveToBottom = height - 1 - currentScreenRow;
+			if (moveToBottom > 0) {
+				output.append(`\x1b[${moveToBottom}B`);
+			}
+			const scroll = moveTargetRow - prevViewportBottom;
+			output.append("\r\n".repeat(scroll));
+			prevViewportTop += scroll;
+			viewportTop += scroll;
+			hardwareCursorRow = moveTargetRow;
+		}
+
+		// Move cursor to first changed line (use hardwareCursorRow for actual position)
+		const lineDiff = computeLineDiff(moveTargetRow);
+		if (lineDiff > 0) {
+			output.append(`\x1b[${lineDiff}B`); // Move down
+		} else if (lineDiff < 0) {
+			output.append(`\x1b[${-lineDiff}A`); // Move up
+		}
+
+		output.append(appendStart ? "\r\n" : "\r"); // Move to column 0
+
+		// Only render changed lines (firstChanged to lastChanged), not all lines to end
+		// This reduces flicker when only a single line changes (e.g., spinner animation)
+		const renderEnd = Math.min(lastChanged, newLines.length - 1);
+		for (let i = firstChanged; i <= renderEnd; i++) {
+			if (i > firstChanged) output.append("\r\n");
+			// ...
+			output.append("\x1b[2K"); // Clear current line
+			if (!isImage && visibleWidth(line) > width) {
+			// ...
+			output.append(line);
+		}
+```
+
+用到的转义序列：
+
+| 序列 | 含义 |
+| --- | --- |
+| `\x1b[nA` / `\x1b[nB` | 光标上移 / 下移 n 行 |
+| `\r` | 回到行首 |
+| `\x1b[2K` | 清除当前整行 |
+| `\x1b[?2026h` / `\x1b[?2026l` | 开始 / 结束同步输出 |
+
+渲染器记录了硬件光标当前在哪一行（`hardwareCursorRow`），用相对移动走到 `firstChanged`，然后逐行“清行 + 写入”，直到 `lastChanged`。注释里说得很直接：只渲染 `firstChanged` 到 `lastChanged`，而不是到末尾，为的是一个 spinner 动画这样的单行变化不引起闪烁。
+
+开头那个判断是主屏模式的根本限制：**已经滚出屏幕顶端、进入回滚缓冲区的行，终端不允许再修改**。如果变化发生在可视区域上方（`firstChanged < prevViewportTop`），差分无从下手，只能全量重绘。这种情况在正常对话中很少发生，因为新内容总是追加在底部。
+
+渲染器对组件有一个硬性检查：某一行的可见宽度超过终端宽度时，直接停止 TUI 并抛错，同时把所有行写进崩溃日志：
+
+```ts title="packages/tui/src/tui-main-screen.ts:518-544"
+			if (!isImage && visibleWidth(line) > width) {
+				// Log all lines to crash file for debugging
+				const crashLogPath = path.join(this.logDirectory ?? os.tmpdir(), "pi-tui-crash.log");
+				const crashData = [
+					`Crash at ${new Date().toISOString()}`,
+					`Terminal width: ${width}`,
+					`Line ${i} visible width: ${visibleWidth(line)}`,
+					"",
+					"=== All rendered lines ===",
+					...newLines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
+					"",
+				].join("\n");
+				fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+				fs.writeFileSync(crashLogPath, crashData);
+
+				// Clean up terminal state before throwing
+				this.stop();
+
+				const errorMsg = [
+					`Rendered line ${i} exceeds terminal width (${visibleWidth(line)} > ${width}).`,
+					"",
+					"This is likely caused by a custom TUI component not truncating its output.",
+					"Use visibleWidth() to measure and truncateToWidth() to truncate lines.",
+					"",
+					`Debug log written to: ${crashLogPath}`,
+				].join("\n");
+				throw new Error(errorMsg);
+```
+
+这是有意的。一行超宽，终端会自动折行，实际占用的屏幕行数就和渲染器以为的不一致，之后所有基于行号的光标移动都会错位，屏幕变成乱码。与其显示错乱的界面，不如立即报错并指出是哪个组件的问题。
+
+### 3.6 CSI 2026：同步输出
+
+CSI（Control Sequence Introducer）指以 `ESC [` 开头的一类终端控制序列。`\x1b[?2026h` 和 `\x1b[?2026l` 是其中的一对，开启和关闭 DEC 私有模式 2026，名字叫 Synchronized Output（同步输出）。
+
+问题是这样的：一次差分更新要发好几段内容，“上移 3 行、清行、写第一行、换行、清行、写第二行……”。终端收到数据就会开始绘制，如果正好在“清行”之后、“写入”之前刷新了一次屏幕，用户就会看到一行短暂变空，这就是闪烁。全量重绘更明显：清屏之后到内容写完之前，整个屏幕可能闪一下白。
+
+同步输出的语义是：收到 `?2026h` 后，终端照常解析后续数据、更新内部的屏幕缓冲区，但**暂停把缓冲区画到屏幕上**；收到 `?2026l` 后，一次性把最终结果画出来。用户只会看到“更新前”和“更新后”两个状态。不支持这个模式的终端会忽略这两个序列，行为退化为普通输出，不会出错。
+
+pi-tui 的每一条写入路径都包在这一对序列里：全量重绘（`fullRender`）、只删除行、差分更新，以及 `TuiAltScreen` 的每一帧：
+
+```ts title="packages/tui/src/tui-alt-screen.ts:1743-1791"
+		let buffer = BEGIN_SYNCHRONIZED_OUTPUT;
+		if (fullRedraw) {
+			this.fullRedrawCount += 1;
+			const clearImages =
+				this.imageProtocol === "kitty" && hadUploadedKittyImages
+					? deleteAllKittyPlacements()
+					: this.deleteKittyImages();
+			buffer += `${clearImages}\x1b[2J`;
+		// ...
+		} else {
+			for (let row = 0; row < height; row++) {
+				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
+				buffer += `\x1b[${row + 1};1H\x1b[2K${preparedKittyScreen.lines[row] ?? ""}`;
+			}
+		}
+
+		if (cursorPos) {
+			buffer += `\x1b[${cursorPos.row + 1};${Math.min(width, cursorPos.col) + 1}H`;
+			buffer += this.getShowHardwareCursor() ? "\x1b[?25h" : "\x1b[?25l";
+		} else {
+			buffer += "\x1b[?25l";
+		}
+		buffer += END_SYNCHRONIZED_OUTPUT;
+		this.terminal.write(buffer);
+```
+
+备用屏幕的写法更直接：用 `\x1b[行;列H` 绝对定位，逐行比较 `screen[row]` 和 `previousScreen[row]`，只重写不同的行，整帧拼成一个字符串，一次 `write`。
+
+主屏渲染器则用 `BoundedTerminalWriter` 以 1 MiB 为单位分块写（[tui-main-screen.ts:11-74](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/tui/src/tui-main-screen.ts#L11-L74)）：长会话首次全量渲染可能产生非常大的输出，拼成一个字符串会超出 V8 的字符串长度上限。分块不影响同步输出，因为开始和结束序列分别在第一块和最后一块里。
+
+## 4. 编辑器：components/editor.ts
+
+输入框是 pi-tui 里最复杂的组件（[editor.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/tui/src/components/editor.ts)，约 2.5k 行）。它要处理多行编辑、自动补全、粘贴、撤销、历史、Emacs 风格的 kill ring（删除的文本存入一个环，可以再贴回来）、按字符跳转等。
+
+### 4.1 状态
+
+```ts title="packages/tui/src/components/editor.ts:219-230"
+interface EditorState {
+	lines: string[];
+	cursorLine: number;
+	cursorCol: number;
+}
+
+/** Undo snapshot: editor text state plus the paste registry. */
+interface EditorSnapshot {
+	state: EditorState;
+	pastes: Map<number, string>;
+	pasteCounter: number;
+}
+```
+
+文本按逻辑行存储，光标是“第几行、第几列”。折行只在 `render` 时根据宽度计算（`layoutText`），不存进状态。撤销栈保存的快照包括粘贴注册表，所以撤销能正确恢复粘贴标记。
+
+`render` 的高度有上限：最多占终端高度的 30%，至少 5 行（[editor.ts:536-538](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/tui/src/components/editor.ts#L536-L538)），超出部分在编辑器内部滚动，边框上显示滚动提示。
+
+### 4.2 提交
+
+```ts title="packages/tui/src/components/editor.ts:908-923"
+		// Submit (Enter)
+		if (kb.matches(data, "tui.input.submit")) {
+			if (this.disableSubmit) return;
+
+			// Workaround for terminals without Shift+Enter support:
+			// If char before cursor is \, delete it and insert newline instead of submitting.
+			const currentLine = this.state.lines[this.state.cursorLine] || "";
+			if (this.state.cursorCol > 0 && currentLine[this.state.cursorCol - 1] === "\\") {
+				this.handleBackspace();
+				this.addNewLine();
+				return;
+			}
+
+			this.submitValue();
+			return;
+		}
+```
+
+按键通过 `kb.matches(data, "tui.input.submit")` 判断，而不是写死 `"\r"`，所以提交键可以在 keybindings 配置里改。有些终端无法区分 Shift+Enter 和 Enter，于是提供了一个兼容写法：行尾输入 `\` 再按回车，得到换行而不是提交。
+
+```ts title="packages/tui/src/components/editor.ts:1364-1378"
+	private submitValue(): void {
+		this.cancelAutocomplete();
+		const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
+
+		this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
+		this.pastes.clear();
+		this.pasteCounter = 0;
+		this.exitHistoryBrowsing();
+		this.scrollOffset = 0;
+		this.undoStack.clear();
+		this.lastAction = null;
+
+		if (this.onChange) this.onChange("");
+		if (this.onSubmit) this.onSubmit(result);
+	}
+```
+
+`submitValue` 先把粘贴标记展开成原文，清空编辑器，最后调用 `onSubmit` 回调。编辑器本身不知道 agent 的存在，提交之后发生什么完全由使用者决定。
+
+### 4.3 粘贴
+
+终端支持 bracketed paste 模式：粘贴的内容被包在 `\x1b[200~` 和 `\x1b[201~` 之间，程序可以把它和逐字敲入区分开（[editor.ts:720-744](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/tui/src/components/editor.ts#L720-L744)）。没有这个区分，粘贴一段多行代码时，第一个换行就会被当作回车提交。
+
+大段粘贴不会直接展开在编辑器里：
+
+```ts title="packages/tui/src/components/editor.ts:1301-1316"
+		// Check if this is a large paste (> 10 lines or > 1000 characters)
+		const totalChars = filteredText.length;
+		if (pastedLines.length > 10 || totalChars > 1000) {
+			// Store the paste and insert a marker
+			this.pasteCounter++;
+			const pasteId = this.pasteCounter;
+			this.pastes.set(pasteId, filteredText);
+
+			// Insert marker like "[paste #1 +123 lines]" or "[paste #1 1234 chars]"
+			const marker =
+				pastedLines.length > 10
+					? `[paste #${pasteId} +${pastedLines.length} lines]`
+					: `[paste #${pasteId} ${totalChars} chars]`;
+			this.insertTextAtCursorInternal(marker);
+			return;
+		}
+```
+
+超过 10 行或 1000 个字符时，编辑器里只显示 `[paste #1 +250 lines]`，原文存在 `pastes` 里，提交时再展开。用户粘贴一个 500 行的日志，输入框仍然只有一行高，还能继续在后面写问题。
+
+## 5. 交互模式：界面结构
+
+### 5.1 组件树
+
+[interactive-mode.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts) 约 7.1k 行，是 coding-agent 里最大的文件。它在初始化时把一组容器挂到 TUI 根节点上：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:984-997"
+		this.mountInteractiveTui(this.renderer, [
+			this.documentContainer,
+			this.pendingMessagesContainer,
+			this.statusContainer,
+			this.widgetContainerAbove,
+			this.editorContainer,
+			this.widgetContainerBelow,
+			this.footerContainer,
+		]);
+		// Accept text while startup completes, but only enable interrupt, exit, and submission feedback.
+		this.defaultEditor.onAction("app.clear", () => this.handleCtrlC());
+		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
+		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
+		this.ui.setFocus(this.editor);
+```
+
+从上到下：
+
+| 容器 | 内容 |
+| --- | --- |
+| `documentContainer` | 包含 `chatContainer`，即聊天记录：用户消息、助手消息、工具调用等组件 |
+| `pendingMessagesContainer` | 排队中的 steer / followUp 消息 |
+| `statusContainer` | “Working...” 等状态指示器 |
+| `widgetContainerAbove` | 扩展用 `setWidget` 放在编辑器上方的组件 |
+| `editorContainer` | 输入框 |
+| `widgetContainerBelow` | 扩展放在编辑器下方的组件 |
+| `footerContainer` | 底部状态栏：模型、token 用量、git 分支、扩展状态 |
+
+因为布局就是“从上往下拼行”，聊天记录增长时，下面的输入框和状态栏自然被往下推；差分渲染保证每次只重写变化的部分。
+
+`components/` 目录下是 coding-agent 专用的组件，比如 `AssistantMessageComponent`（Markdown 渲染、思考块）、`ToolExecutionComponent`（工具调用框，调用扩展或内置工具的 `renderCall` / `renderResult`）、`UserMessageComponent`、`BashExecutionComponent`、`FooterComponent`，以及各种选择器（模型、会话、树、设置）。
+
+### 5.2 扩展 UI 怎样落到组件上
+
+第 6 章说 `ctx.ui` 由各模式实现。交互模式的 `setWidget`：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:2400-2440"
+	private setExtensionWidget(
+		key: string,
+		content: string[] | ((tui: TUI, thm: Theme) => Component & { dispose?(): void }) | undefined,
+		options?: ExtensionWidgetOptions,
+	): void {
+		const placement = options?.placement ?? "aboveEditor";
+		const removeExisting = (map: Map<string, Component & { dispose?(): void }>) => {
+			const existing = map.get(key);
+			if (existing?.dispose) existing.dispose();
+			map.delete(key);
+		};
+
+		removeExisting(this.extensionWidgetsAbove);
+		removeExisting(this.extensionWidgetsBelow);
+
+		if (content === undefined) {
+			this.renderWidgets();
+			return;
+		}
+
+		let component: Component & { dispose?(): void };
+
+		if (Array.isArray(content)) {
+			// Wrap string array in a Container with Text components
+			const container = new Container();
+			for (const line of content.slice(0, InteractiveMode.MAX_WIDGET_LINES)) {
+				container.addChild(new Text(line, 1, 0));
+			}
+			if (content.length > InteractiveMode.MAX_WIDGET_LINES) {
+				container.addChild(new ThemedText(() => theme.fg("muted", "... (widget truncated)"), 1, 0));
+			}
+			component = container;
+		} else {
+			// Factory function - create component
+			component = content(this.ui, theme);
+		}
+
+		const targetMap = placement === "belowEditor" ? this.extensionWidgetsBelow : this.extensionWidgetsAbove;
+		targetMap.set(key, component);
+		this.renderWidgets();
+	}
+```
+
+字符串数组被包成若干 `Text` 组件；工厂函数直接调用，得到扩展自己的组件。按 `placement` 放进上方或下方的 Map，`renderWidgets()` 再把它们同步到对应容器。同一个 `key` 再次设置时先调用旧组件的 `dispose()`。第 6 章 plan-mode 的待办列表就是这样显示出来的。
+
+## 6. 交互模式：输入与事件
+
+### 6.1 输入：从 onSubmit 到 session.prompt
+
+主循环很短：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:1253-1262"
+		// Main interactive loop
+		while (true) {
+			const userInput = await this.getUserInput();
+			try {
+				await this.session.prompt(userInput);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
+			}
+		}
+```
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:4243-4255"
+	async getUserInput(): Promise<string> {
+		const queuedInput = this.pendingUserInputs.shift();
+		if (queuedInput !== undefined) {
+			return queuedInput;
+		}
+
+		return new Promise((resolve) => {
+			this.onInputCallback = (text: string) => {
+				this.onInputCallback = undefined;
+				resolve(text);
+			};
+		});
+	}
+```
+
+`getUserInput()` 返回一个 Promise，由编辑器的 `onSubmit` 兑现。`onSubmit` 的处理顺序：
+
+1. 内置斜杠命令：`/model`、`/tree`、`/compact`、`/new`、`/reload` 等二十多个，在交互模式里直接处理（[interactive-mode.ts:3161-3306](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3161-L3306)）。扩展命令、skill 命令和 prompt template 不在这里，它们交给 `session.prompt()` 处理。
+2. `!cmd` / `!!cmd`：用户直接执行 shell 命令，后者的输出不进入模型上下文。
+3. compaction 进行中：排进本地队列，compaction 结束后再发。
+4. 模型正在输出：带 `streamingBehavior: "steer"` 调用 `prompt`。
+5. 其他情况：交给主循环，主循环调用 `session.prompt(userInput)`。
+
+第 3–5 步的代码：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3326-3358"
+			// Queue input during compaction (extension commands execute immediately)
+			if (this.session.isCompacting) {
+				if (this.isExtensionCommand(text)) {
+					this.editor.addToHistory?.(text);
+					this.editor.setText("");
+					await this.session.prompt(text);
+				} else {
+					this.queueCompactionMessage(text, "steer");
+				}
+				return;
+			}
+
+			// If streaming, use prompt() with steer behavior
+			// This handles extension commands (execute immediately), prompt template expansion, and queueing
+			if (this.session.isStreaming) {
+				this.editor.addToHistory?.(text);
+				this.editor.setText("");
+				await this.session.prompt(text, { streamingBehavior: "steer" });
+				this.updatePendingMessagesDisplay();
+				this.ui.requestRender();
+				return;
+			}
+
+			// Normal message submission
+			// First, move any pending bash components to chat
+			this.flushPendingBashComponents();
+
+			if (this.onInputCallback) {
+				this.onInputCallback(text);
+			} else {
+				this.pendingUserInputs.push(text);
+			}
+			this.editor.addToHistory?.(text);
+```
+
+### 6.2 streamingBehavior：steer 还是 followUp
+
+模型正在输出时，用户又输入了一句话。这句话有两种处理方式（第 2 章讲过 agent 循环这一侧）：
+
+- **steer**（插话）：当前 turn 的工具执行完后、下一次调用模型前注入。适合“停一下，别改那个文件”。
+- **followUp**（排队）：等 agent 把这一轮全部做完，再作为新的输入发送。适合“做完以后顺便跑一下测试”。
+
+交互模式里，普通回车是 steer；`app.message.followUp` 快捷键（默认 Alt+Enter，Windows 上是 Ctrl+Q）是 followUp：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:4488-4501"
+		// Alt+Enter queues a follow-up message (waits until agent finishes)
+		// This handles extension commands (execute immediately), prompt template expansion, and queueing
+		if (this.session.isStreaming) {
+			this.editor.addToHistory?.(text);
+			this.editor.setText("");
+			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			this.updatePendingMessagesDisplay();
+			this.ui.requestRender();
+		}
+		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
+		else if (this.editor.onSubmit) {
+			this.editor.setText("");
+			this.editor.onSubmit(text);
+		}
+```
+
+空闲时按 Alt+Enter 等同于回车。AgentSession 一侧根据这个参数决定进哪个队列：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2136-2150"
+		// If streaming, queue via steer() or followUp() based on option
+		if (this.isStreaming) {
+			if (!options?.streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
+			}
+			if (options.streamingBehavior === "followUp") {
+				await this._queueFollowUp(expandedText, currentImages);
+			} else {
+				await this._queueSteer(expandedText, currentImages);
+			}
+			preflightResult?.("queued");
+			return;
+		}
+```
+
+模型正在输出却没给 `streamingBehavior`，`prompt()` 直接抛错。SDK 和 RPC 的调用者都必须明确选择。排队的消息会通过 `queue_update` 事件通知界面，显示在 `pendingMessagesContainer` 里；按 `app.message.dequeue` 对应的快捷键可以把它们取回编辑器修改。
+
+### 6.3 事件：从 AgentSessionEvent 到组件
+
+交互模式订阅 session 的全部事件：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3362-3366"
+	private subscribeToAgent(): void {
+		this.unsubscribe = this.session.subscribe(async (event) => {
+			await this.handleEvent(event);
+		});
+	}
+```
+
+`AgentSessionEvent` 是 agent-core 的 `AgentEvent` 加上 AgentSession 自己的事件：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:196-212"
+export type AgentSessionEvent =
+	| WithParentToolCallId<Exclude<AgentEvent, { type: "agent_end" }>>
+	| {
+			type: "agent_end";
+			messages: AgentMessage[];
+			willRetry: boolean;
+	  }
+	| { type: "agent_settled"; aborted: boolean }
+	| {
+			type: "queue_update";
+			steering: readonly string[];
+			followUp: readonly string[];
+	  }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "entry_appended"; entry: SessionEntry }
+	| { type: "session_info_changed"; name: string | undefined }
+	| { type: "thinking_level_changed"; level: ThinkingLevel }
+```
+
+`handleEvent` 是一个大 switch。消息相关的部分：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3462-3562"
+			case "message_start":
+				if (event.message.role === "custom") {
+					this.addMessageToChat(event.message);
+					this.ui.requestRender();
+				} else if (event.message.role === "user") {
+					this.addMessageToChat(event.message);
+					this.updatePendingMessagesDisplay();
+					this.ui.requestRender();
+				} else if (event.message.role === "assistant") {
+					this.streamingComponent = new AssistantMessageComponent(
+					// ...
+					this.streamingMessage = event.message;
+					this.chatContainer.addChild(this.streamingComponent);
+					this.streamingComponent.updateContent(this.streamingMessage, true);
+					this.ui.requestRender();
+				}
+				break;
+
+			case "message_update":
+				if (this.streamingComponent && event.message.role === "assistant") {
+					this.streamingMessage = event.message;
+					this.streamingComponent.updateContent(this.streamingMessage, true);
+
+					for (const content of this.streamingMessage.content) {
+						if (content.type === "toolCall") {
+							if (!this.pendingTools.has(content.id)) {
+								const component = new ToolExecutionComponent(
+									content.name,
+									content.id,
+									content.arguments,
+									{
+										showImages: this.settingsManager.getShowImages(),
+										imageWidthCells: this.settingsManager.getImageWidthCells(),
+										outputPad: this.outputPad,
+									},
+									this.getRegisteredToolDefinition(content.name),
+									this.ui,
+									this.sessionManager.getCwd(),
+								);
+								component.setExpanded(this.toolOutputExpanded);
+								this.chatContainer.addChild(component);
+								this.pendingTools.set(content.id, component);
+							} else {
+								const component = this.pendingTools.get(content.id);
+								if (component) {
+									component.updateArgs(content.arguments);
+								}
+							}
+						}
+					}
+					this.ui.requestRender();
+				}
+				break;
+
+			case "message_end":
+				if (event.message.role === "user") break;
+				if (this.streamingComponent && event.message.role === "assistant") {
+					// ...
+					this.streamingComponent.updateContent(this.streamingMessage, false);
+					// ...
+					} else {
+						// Args are now complete - trigger diff computation for edit tools
+						for (const [, component] of this.pendingTools.entries()) {
+							component.setArgsComplete();
+						}
+						this.maybeShowThinkingDropNotice(this.streamingMessage);
+						this.maybeShowCacheMissNotice(this.streamingMessage);
+					}
+					this.streamingComponent = undefined;
+					this.streamingMessage = undefined;
+					this.footer.invalidate();
+				}
+				this.ui.requestRender();
+				break;
+```
+
+一条助手消息在界面上的生命周期：
+
+1. `message_start`：创建一个 `AssistantMessageComponent`，挂到 `chatContainer` 末尾，记为 `streamingComponent`。
+2. `message_update`：每个增量都调用 `updateContent(message, true)` 重设内容，然后 `requestRender()`。消息里出现新的 `toolCall` 块时，立刻创建 `ToolExecutionComponent` 挂在后面，参数还在流式生成时就能看到工具调用框。
+3. `message_end`：最后一次更新，`isStreaming` 为 `false`；把各工具组件标记为参数完整（edit 工具此时才计算 diff）。
+
+工具执行相关的部分：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3568-3613"
+			case "tool_execution_start": {
+				// Nested calls (from codemode scripts) are shown inside their parent's row.
+				if (event.parentToolCallId) break;
+				let component = this.pendingTools.get(event.toolCallId);
+				// ...
+				component.markExecutionStarted();
+				this.ui.requestRender();
+				break;
+			}
+
+			case "tool_execution_update": {
+				const component = this.pendingTools.get(event.toolCallId);
+				if (component) {
+					component.updateResult({ ...event.partialResult, isError: false }, true);
+					this.ui.requestRender();
+				}
+				break;
+			}
+
+			case "tool_execution_end": {
+				if (event.isError) this.maybeShowInstallChangeWarning();
+				const component = this.pendingTools.get(event.toolCallId);
+				if (component) {
+					component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
+					this.pendingTools.delete(event.toolCallId);
+					this.ui.requestRender();
+				}
+				break;
+			}
+```
+
+`pendingTools` 是一个以 `toolCallId` 为键的 Map，把流式阶段创建的组件和后续的执行事件对应起来。`parentToolCallId` 存在时（codemode 脚本里的嵌套调用）不单独显示，由父工具的组件负责展示。
+
+这里能看到整个设计的分工：AgentSession 不知道界面长什么样，只发事件；交互模式不知道 agent 循环怎么跑，只根据事件增删、更新组件，再 `requestRender()`；pi-tui 不知道什么是消息，只把组件树渲染成行、做差分、写终端。每层只依赖下一层的接口。
+
+## 7. print 模式
+
+print 模式（`pi -p "..."`，或 stdin/stdout 不是终端时）发完提示就退出：
+
+```ts title="packages/coding-agent/src/modes/print-mode.ts:74-137"
+	const rebindSession = async (): Promise<void> => {
+		session = runtimeHost.session;
+		await session.bindExtensions({
+			mode: mode === "json" ? "json" : "print",
+			commandContextActions: {
+			// ...
+			onError: (err) => {
+				console.error(`Extension error (${err.extensionPath}): ${err.error}`);
+			},
+		});
+
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		unsubscribe = session.subscribe((event) => {
+			if (mode === "json") {
+				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+			}
+		});
+		// ...
+		await rebindSession();
+
+		if (initialMessage) {
+			await session.prompt(initialMessage, { images: initialImages });
+		}
+
+		for (const message of messages) {
+			await session.prompt(message);
+		}
+```
+
+和交互模式一样是 `bindExtensions` + `subscribe` + `prompt`，只是：
+
+- 不传 `uiContext`，扩展拿到 `noOpUIContext`，`ctx.hasUI` 为 `false`。
+- `--mode json` 时，每个事件序列化成一行 JSON 写到 stdout；否则什么都不输出，最后只打印最后一条助手消息的文本。
+- 每个 `prompt()` 都 await 到 agent 完全结束，再发下一条。没有并发输入，所以不需要 `streamingBehavior`。
+
+JSON 输出不是原样序列化事件。`message_update` 里带着累积到当前为止的整条消息（`partial`），原样输出的话，一条 1 万 token 的回复会产生上千行、总量平方增长的输出。`toJsonEvent` 把它去掉，只留增量：
+
+```ts title="packages/coding-agent/src/modes/json-event.ts:40-61"
+/**
+ * Remove cumulative assistant snapshots from streaming wire events.
+ * `message_start` provides the initial message, deltas build it, and
+ * `message_end` provides the final authoritative message. Cumulative usage,
+ * tool-call ids, and tool names remain available because their size is constant.
+ */
+export function toJsonEvent(event: MessageUpdateEvent): JsonMessageUpdateEvent;
+export function toJsonEvent(event: AgentSessionEvent): JsonAgentSessionEvent;
+export function toJsonEvent(event: AgentSessionEvent): JsonAgentSessionEvent {
+	if (event.type !== "message_update") {
+		return event;
+	}
+	if (event.message.role !== "assistant") {
+		throw new Error("message_update message is not an assistant message");
+	}
+
+	return {
+		type: "message_update",
+		usage: event.message.usage,
+		assistantMessageEvent: toJsonAssistantMessageEvent(event.assistantMessageEvent),
+	};
+}
+```
+
+消费者用 `message_start` 拿到初始消息，用增量拼出过程，用 `message_end` 拿到最终的完整消息。第 6 章的 subagent 示例就是这样读子进程输出的：它只关心 `message_end`。
+
+## 8. RPC 模式：JSONL 协议
+
+### 8.1 帧格式
+
+RPC 模式（`pi --mode rpc`）让其他程序（编辑器插件、桌面应用、其他语言写的工具）通过 stdin/stdout 驱动 pi。协议是 JSONL：每条消息是一个 JSON 对象，以 `\n` 结尾。
+
+```ts title="packages/coding-agent/src/modes/rpc/jsonl.ts:4-41"
+/**
+ * Serialize a single strict JSONL record.
+ *
+ * Framing is LF-only. Payload strings may contain other Unicode separators such as
+ * U+2028 and U+2029. Clients must split records on `\n` only.
+ */
+export function serializeJsonLine(value: unknown): string {
+	return `${JSON.stringify(value)}\n`;
+}
+
+/**
+ * Attach an LF-only JSONL reader to a stream.
+ *
+ * This intentionally does not use Node readline. Readline splits on additional
+ * Unicode separators that are valid inside JSON strings and therefore does not
+ * implement strict JSONL framing.
+ */
+export function attachJsonlLineReader(stream: Readable, onLine: (line: string) => void): () => void {
+	const decoder = new StringDecoder("utf8");
+	let buffer = "";
+
+	const emitLine = (line: string) => {
+		onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+	};
+
+	const onData = (chunk: string | Buffer) => {
+		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
+
+		while (true) {
+			const newlineIndex = buffer.indexOf("\n");
+			if (newlineIndex === -1) {
+				return;
+			}
+
+			emitLine(buffer.slice(0, newlineIndex));
+			buffer = buffer.slice(newlineIndex + 1);
+		}
+	};
+```
+
+注释解释了为什么不用 Node 的 `readline`：readline 除了 `\n` 还会在 U+2028、U+2029 等 Unicode 行分隔符处切分，而这些字符在 JSON 字符串里是合法的。模型输出里恰好有这些字符时，readline 会把一条消息切成两半，导致解析失败。所以 pi 自己实现了只按 `\n` 切分的读取器。
+
+### 8.2 命令与响应
+
+stdin 上是命令，`type` 字段区分种类，`id` 可选，用来把响应和命令对应起来：
+
+```ts title="packages/coding-agent/src/modes/rpc/rpc-types.ts:20-44"
+export type RpcCommand =
+	// Prompting
+	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "abort" }
+	| { id?: string; type: "clear_queue" }
+	| { id?: string; type: "new_session"; parentSession?: string }
+	// ...
+	// State
+	| { id?: string; type: "get_state" }
+	// ...
+	// Queue modes
+	| { id?: string; type: "set_steering_mode"; mode: "all" | "one-at-a-time" }
+	| { id?: string; type: "set_follow_up_mode"; mode: "all" | "one-at-a-time" }
+```
+
+完整列表还包括模型切换、思考级别、compaction、bash、会话切换与 fork、取消息和会话树等，共三十多种命令（[rpc-types.ts:20-74](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/rpc/rpc-types.ts#L20-L74)）。
+
+stdout 上有三类消息：
+
+1. **响应**：`type: "response"`，带 `command`、`success`，成功时有 `data`，失败时有 `error`。
+
+```ts title="packages/coding-agent/src/modes/rpc/rpc-types.ts:116-245"
+export type RpcResponse =
+	// Prompting
+	| { id?: string; type: "response"; command: "prompt"; success: true; data: { disposition: PromptDisposition } }
+	| { id?: string; type: "response"; command: "steer"; success: true; data: { disposition: QueuedInputDisposition } }
+	// ...
+	// Error response (any command can fail)
+	| { id?: string; type: "response"; command: string; success: false; error: string };
+```
+
+2. **事件**：AgentSessionEvent 经 `toJsonEvent` 处理后原样输出，和 `--mode json` 的格式相同。
+3. **扩展 UI 请求**：`type: "extension_ui_request"`，见 8.4 节。
+
+一次完整交互的示例（`>` 是写入 stdin，`<` 是从 stdout 读到）：
+
+```
+> {"id":"1","type":"prompt","message":"列出当前目录"}
+< {"id":"1","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}
+< {"type":"agent_start"}
+< {"type":"turn_start"}
+< {"type":"message_start","message":{"role":"user",...}}
+< {"type":"message_end","message":{"role":"user",...}}
+< {"type":"message_start","message":{"role":"assistant",...}}
+< {"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_delta",...}}
+< {"type":"tool_execution_start","toolCallId":"...","toolName":"ls","args":{...}}
+< {"type":"tool_execution_end","toolCallId":"...","toolName":"ls","result":{...},"isError":false}
+< ...
+< {"type":"agent_end","messages":[...],"willRetry":false}
+< {"type":"agent_settled","aborted":false}
+> {"id":"2","type":"prompt","message":"再看一下 src","streamingBehavior":"followUp"}
+< {"id":"2","type":"response","command":"prompt","success":true,"data":{"disposition":"queued"}}
+```
+
+事件的字段和顺序由 AgentSession 决定，这里省略了细节；`disposition` 的三个取值 `started`、`queued`、`handled` 来自 `PromptDisposition` 类型（[agent-session.ts:311-312](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L311-L312)）。
+
+### 8.3 prompt 命令的处理
+
+```ts title="packages/coding-agent/src/modes/rpc/rpc-mode.ts:394-419"
+			case "prompt": {
+				// Start prompt handling immediately, but emit the authoritative response only after
+				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
+				let preflightSucceeded = false;
+				void session
+					.prompt(command.message, {
+						images: command.images,
+						streamingBehavior: command.streamingBehavior,
+						source: "rpc",
+						preflightResult: (disposition) => {
+							preflightSucceeded = true;
+							output(success(id, "prompt", { disposition }));
+						},
+					})
+					.catch((e) => {
+						if (!preflightSucceeded) {
+							output(error(id, "prompt", e.message));
+						}
+					});
+				return undefined;
+			}
+
+			case "steer": {
+				const disposition = await session.steer(command.message, command.images, { source: "rpc" });
+				return success(id, "steer", { disposition });
+			}
+```
+
+`prompt` 的处理有一个细节：不能等 `session.prompt()` 完成再回复，因为它要等整个 agent 运行结束，可能几分钟；也不能一收到就回复成功，因为模型没配置、API key 缺失这类错误要在开始运行前报告。所以 AgentSession 提供了 `preflightResult` 回调：前置检查通过、确定了去向（开始运行、进队列、被扩展命令或 `input` 事件处理掉）时立即回调，RPC 此时输出成功响应；如果前置检查就失败，`.catch` 输出错误响应。`source: "rpc"` 会传给扩展的 `input` 事件。
+
+RPC 模式和交互模式的绑定方式相同：
+
+```ts title="packages/coding-agent/src/modes/rpc/rpc-mode.ts:317-363"
+	const rebindSession = async (): Promise<void> => {
+		session = runtimeHost.session;
+		await session.bindExtensions({
+			uiContext: createExtensionUIContext(),
+			mode: "rpc",
+			commandContextActions: {
+			// ...
+			shutdownHandler: () => {
+				shutdownRequested = true;
+			},
+			onError: (err) => {
+				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+			},
+		});
+
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		unsubscribe = session.subscribe((event) => {
+			output(toJsonEvent(event));
+			if (event.type === "agent_settled") {
+				void checkShutdownRequested();
+			}
+		});
+		unsubscribeBackpressure = session.agent.subscribe(async () => {
+			await waitForRawStdoutBackpressure();
+		});
+```
+
+`session.subscribe` 收到的每个事件都直接写到 stdout。`session.agent.subscribe` 那一行做背压控制：stdout 的缓冲区满了（宿主读得慢）时，agent 循环会等待，而不是在内存里无限堆积输出。
+
+### 8.4 扩展 UI 走协议
+
+扩展调用 `ctx.ui.confirm()` 时，RPC 模式没有终端可以弹窗，于是把请求发给宿主：
+
+```ts title="packages/coding-agent/src/modes/rpc/rpc-mode.ts:91-131"
+	function createDialogPromise<T>(
+		opts: ExtensionUIDialogOptions | undefined,
+		defaultValue: T,
+		request: Record<string, unknown>,
+		parseResponse: (response: RpcExtensionUIResponse) => T,
+	): Promise<T> {
+		if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+
+		const id = crypto.randomUUID();
+		return new Promise((resolve, reject) => {
+			// ...
+			if (opts?.timeout) {
+				timeoutId = setTimeout(() => {
+					cleanup();
+					resolve(defaultValue);
+				}, opts.timeout);
+			}
+
+			pendingExtensionRequests.set(id, {
+				resolve: (response: RpcExtensionUIResponse) => {
+					cleanup();
+					resolve(parseResponse(response));
+				},
+				reject,
+			});
+			output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
+		});
+	}
+```
+
+```ts title="packages/coding-agent/src/modes/rpc/rpc-types.ts:251-297"
+/** Emitted when an extension needs user input */
+export type RpcExtensionUIRequest =
+	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
+	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
+// ...
+/** Response to an extension UI request */
+export type RpcExtensionUIResponse =
+	| { type: "extension_ui_response"; id: string; value: string }
+	| { type: "extension_ui_response"; id: string; confirmed: boolean }
+	| { type: "extension_ui_response"; id: string; cancelled: true };
+```
+
+流程：pi 输出 `{"type":"extension_ui_request","id":"<uuid>","method":"confirm","title":"...","message":"..."}`，宿主显示对话框，用户确认后宿主写回 `{"type":"extension_ui_response","id":"<uuid>","confirmed":true}`，pi 根据 `id` 找到等待中的 Promise 并兑现。设置了 `timeout` 或 `signal` 时，超时或中止就以默认值兑现。所以第 6 章的 permission-gate 在 RPC 模式下同样能工作，由宿主程序负责界面。`notify`、`setStatus` 这类不需要回复的方法只发请求，不等待。
+
+## 9. SDK：直接用 AgentSession
+
+前面三种模式都是 CLI 进程里的“壳”。如果宿主本身就是 Node 或 Bun 程序，可以跳过 CLI，直接创建 AgentSession：
+
+```ts title="packages/coding-agent/docs/sdk.md:8-17"
+import { createAgentSession } from "@earendil-works/pi-coding-agent";
+
+const { session } = await createAgentSession();
+
+try {
+  await session.prompt("What files are in the current directory?");
+  console.log(session.getLastAssistantText());
+} finally {
+  session.dispose();
+}
+```
+
+`createAgentSession()`（[sdk.ts:191](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/sdk.ts#L191)）就是 CLI 启动时用的同一个函数（第 3 章），只是由调用者传入选项。拿到 `session` 后：
+
+- `session.subscribe(fn)` 收到的事件和交互模式、RPC 模式收到的完全一样。
+- `session.prompt(text, { streamingBehavior })`、`session.steer()`、`session.followUp()`、`session.abort()` 和其他模式调用的是同一组方法。
+- 需要扩展 UI 时调用 `session.bindExtensions({ uiContext, ... })`，提供自己的 `ExtensionUIContext` 实现，和 RPC 模式的做法一样。
+
+把四种模式放在一起看：
+
+| | 交互 | print | RPC | SDK |
+| --- | --- | --- | --- | --- |
+| 输入来源 | 编辑器 `onSubmit` | 参数、stdin | stdin 上的 JSONL 命令 | 函数调用 |
+| 调用的方法 | `session.prompt` | `session.prompt` | `session.prompt`、`steer`、`followUp` 等 | 同左 |
+| 事件去向 | `handleEvent` 更新组件 | JSON 行或丢弃 | stdout 上的 JSON 行 | 调用者的回调 |
+| 扩展 UI | 真实对话框和组件 | 无 | `extension_ui_request` | 调用者实现 |
+
+四种模式里都没有 agent 逻辑：排队、扩展事件、compaction、重试、持久化全在 AgentSession 里。这就是第 3 章说 AgentSession 是核心的原因，也是 pi 能同时提供 TUI、脚本模式、嵌入协议和库四种形态而不重复实现的原因。
+
+## 小结
+
+- pi-tui 的组件接口是 `render(width)` 返回字符串数组；`Container` 把子组件的行首尾相接，界面就是一棵组件树。组件自己缓存渲染结果。
+- `requestRender()` 合并同一 tick 的请求，并限制最多约 60 帧每秒。
+- `TuiMainScreen` 每帧和上一帧逐行比较，只重写 `firstChanged` 到 `lastChanged` 之间的行；宽度变化、变化落在可视区上方等情况才全量重绘；超宽行直接报错。
+- 所有写入都包在 CSI 2026 同步输出里，终端在整帧写完后才刷新屏幕，避免闪烁；不支持的终端会忽略它。
+- 编辑器用逻辑行存储文本，提交时调用 `onSubmit`；硬件光标通过零宽 APC 标记定位，服务输入法；大段粘贴折叠成标记。
+- 交互模式订阅 AgentSessionEvent，在 `message_start/update/end` 和 `tool_execution_*` 上创建、更新组件；输入在 agent 运行时以 `steer`（回车）或 `followUp`（Alt+Enter）调用 `session.prompt`。
+- print 模式输出最终文本或 JSON 事件流；RPC 模式用严格按 `\n` 分帧的 JSONL 协议，扩展 UI 变成请求和响应；SDK 直接使用 AgentSession。四者共用同一个 AgentSession。
+
+## 动手验证
+
+1. **观察差分渲染**：用 `PI_TUI_DEBUG_REDRAW=1 ./pi-test.sh` 启动并对话一会儿，然后查看 agent 目录（默认 `~/.pi/agent`）下的 `pi-tui-debug.log`，里面只记录全量重绘及其原因（首次渲染、宽度变化等）。拖动改变终端宽度，看日志里新增的 `terminal width changed` 记录。
+2. **看 JSON 事件流**：`./pi-test.sh --mode json "列出当前目录"`，对照第 7 节看 `message_update` 里没有 `partial`、只有增量。
+3. **手动驱动 RPC**：运行 `./pi-test.sh --mode rpc`，在 stdin 输入 `{"id":"1","type":"get_state"}` 回车，再输入一条 `prompt` 命令，观察响应和事件。`packages/coding-agent/test/rpc-jsonl.test.ts` 和 `test/rpc-prompt-response-semantics.test.ts` 分别覆盖分帧规则和 `prompt` 的响应时机。
+4. **读 pi-tui 渲染测试**：在 `packages/tui` 下运行 `node --test test/tui-render.test.ts` 和 `node --test test/editor.test.ts`。前者用 `test/virtual-terminal.ts` 模拟终端，断言每帧写出的转义序列。

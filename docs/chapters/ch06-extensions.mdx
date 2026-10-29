@@ -1,0 +1,2139 @@
+---
+title: 第 6 章　扩展体系
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 第 6 章　扩展体系：pi 的设计重心
+
+## 导读
+
+<Say id="k06-01">很多编程助手都内置了子代理、计划模式和权限确认，pi 一个都没有内置。</Say>
+<Say id="k06-02">这些功能交给扩展来做。扩展就是一个 TypeScript 文件，默认导出一个工厂函数。</Say>
+<Say id="k06-03">pi 用 jiti 在运行时加载这个文件，把 ExtensionAPI 传给工厂函数。</Say>
+<Say id="k06-04">扩展在工厂里订阅事件，注册工具、命令、快捷键、模型提供方和界面组件。</Say>
+<Say id="k06-05">事件一共四十一种。多数只是通知，少数能改写数据，还有几个能直接拦截。</Say>
+<Say id="k06-06">ExtensionRunner 按加载顺序把事件发给每个扩展，再按各事件自己的规则合并结果。</Say>
+<Say id="k06-07">这些事件分三层来：agent-core 留钩子，AgentSession 实现钩子，再暴露成扩展事件。</Say>
+<Say id="k06-08">读完这一章，你能说清计划模式、子代理和权限确认怎样只靠公开 API 实现。</Say>
+
+## 1. 问题：功能为什么不进核心
+
+一个编程助手迟早会被要求做这些事：执行危险命令前先问一下用户；先只读地分析、出计划，确认后再动手；把子任务交给另一个上下文独立的 agent。常见做法是把它们写进核心，再加一堆配置开关。
+
+pi 的做法相反：核心只提供足够细的事件和注册接口，这些功能都写成扩展。以“执行危险命令前确认”为例，在 pi 里它只是一个 34 行的示例文件：
+
+```ts title="packages/coding-agent/examples/extensions/permission-gate.ts:10-34"
+export default function (pi: ExtensionAPI) {
+	const dangerousPatterns = [/\brm\s+(-rf?|--recursive)/i, /\bsudo\b/i, /\b(chmod|chown)\b.*777/i];
+
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName !== "bash") return undefined;
+
+		const command = event.input.command as string;
+		const isDangerous = dangerousPatterns.some((p) => p.test(command));
+
+		if (isDangerous) {
+			if (!ctx.hasUI) {
+				// In non-interactive mode, block by default
+				return { block: true, reason: "Dangerous command blocked (no UI for confirmation)" };
+			}
+
+			const choice = await ctx.ui.select(`⚠️ Dangerous command:\n\n  ${command}\n\nAllow?`, ["Yes", "No"]);
+
+			if (choice !== "Yes") {
+				return { block: true, reason: "Blocked by user" };
+			}
+		}
+
+		return undefined;
+	});
+}
+```
+
+这段代码用到了扩展体系的三个基本要素：
+
+1. **工厂函数**：`export default function (pi: ExtensionAPI)`。pi 加载文件后调用它，传入 `pi` 对象。
+2. **事件订阅**：`pi.on("tool_call", ...)`。模型每次调用工具前都会触发这个事件。
+3. **返回值即决策**：返回 `{ block: true, reason }` 就会阻止这次调用，模型收到的是一条错误工具结果，内容是 `reason`。
+
+另外，`ctx.hasUI` 和 `ctx.ui.select` 说明扩展不需要关心自己跑在哪种模式下：交互模式会弹出选择框，RPC 模式把请求转成 JSON 发给宿主程序，print 模式没有 UI，扩展自己决定默认拒绝。
+
+这样做的好处是，权限策略、计划流程这类“每个人想要的都不一样”的东西，可以由用户自己写、自己换，核心不用为每种偏好加开关。代价是核心必须把钩子开得足够多、语义定义得足够清楚。本章就是看 pi 怎样做到这一点：
+
+- 第 2 节：扩展文件怎么被找到、加载、初始化（[loader.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/loader.ts)）。
+- 第 3 节：`ExtensionAPI` 能订阅哪些事件（[types.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/types.ts)）。
+- 第 4 节：多个扩展处理同一个事件时，结果怎么合并（[runner.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/runner.ts)）。
+- 第 5 节：这些事件从哪里来，即钩子的三层结构。
+- 第 6–10 节：注册能力、skills 等其他资源、包分发、项目信任、内置扩展。
+- 第 11 节：plan-mode、subagent 两个完整示例。
+
+## 2. 加载：loader.ts
+
+### 2.1 从哪里找扩展
+
+CLI 启动时，扩展路径由 package-manager 统一解析，然后交给 loader 加载。入口在 [resource-loader.ts:711](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/resource-loader.ts#L711-L747)：
+
+```ts title="packages/coding-agent/src/core/resource-loader.ts:711-747"
+	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }): Promise<LoadExtensionsResult> {
+		const resolvedPaths = await this.packageManager.resolve();
+		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
+			temporary: true,
+		});
+		const enabledExtensions = resolvedPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
+		const cliEnabledExtensions = cliExtensionPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
+		// Built-in extensions wait for the final pass: project settings can disable them, and a loaded
+		// extension cannot be unloaded.
+		const extensionPaths = (
+			this.noExtensions ? cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions)
+		).filter((path) => !path.startsWith(BUILTIN_PATH_PREFIX));
+		const metadataByPath = new Map(
+			[...resolvedPaths.extensions, ...cliExtensionPaths.extensions].map((resource) => [
+				resource.path,
+				resource.metadata,
+			]),
+		);
+		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
+		const installWarnings = collectPackageInstallWarnings(
+			resolvedPaths.installFailures,
+			cliExtensionPaths.installFailures,
+		);
+		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
+		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
+		if (!options.includeInlineFactories) {
+			return extensionsResult;
+		}
+
+		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
+		extensionsResult.extensions.push(...inlineExtensions.extensions);
+		extensionsResult.errors.push(...inlineExtensions.errors);
+		const replacementWarnings: Array<{ path: string; warning: string }> = [];
+		extensionsResult.extensions = omitReplacedExtensions(extensionsResult.extensions, replacementWarnings);
+		mergeExtensionWarnings(extensionsResult, replacementWarnings);
+		return extensionsResult;
+	}
+```
+
+扩展有四个来源：
+
+| 来源 | 说明 |
+| --- | --- |
+| 自动发现 | 用户目录 `~/.pi/agent/extensions/` 和项目目录 `.pi/extensions/` |
+| settings | `settings.json` 里 `extensions` 字段列出的路径 |
+| 包 | 通过 `pi install` 装的 npm 或 git 包（第 8 节） |
+| CLI | `pi -e ./foo.ts` 临时加载，`--no-extensions` 时只保留这一类 |
+
+此外还有两类不走文件的扩展：`builtin:<name>` 内置扩展和 SDK 传入的 inline 工厂。它们在最后一轮加载，并经过 `omitReplacedExtensions` 处理（第 10 节）。
+
+目录里哪些文件算扩展，由 [package-manager.ts:609](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/package-manager.ts#L609-L661) 的 `collectAutoExtensionEntries` 决定：
+
+```ts title="packages/coding-agent/src/core/package-manager.ts:609-655"
+function collectAutoExtensionEntries(dir: string): string[] {
+	const entries: string[] = [];
+	if (!existsSync(dir)) return entries;
+
+	// First check if this directory itself has explicit extension entries (package.json or index)
+	const rootEntries = resolveExtensionEntries(dir);
+	if (rootEntries) {
+		return rootEntries;
+	}
+	// ...
+	try {
+		const dirEntries = readdirSync(dir, { withFileTypes: true });
+		for (const entry of dirEntries) {
+			if (entry.name.startsWith(".")) continue;
+			if (entry.name === "node_modules") continue;
+
+			const fullPath = join(dir, entry.name);
+			let isDir = entry.isDirectory();
+			let isFile = entry.isFile();
+
+			if (entry.isSymbolicLink()) {
+				try {
+					const stats = statSync(fullPath);
+					isDir = stats.isDirectory();
+					isFile = stats.isFile();
+				} catch {
+					continue;
+				}
+			}
+
+			const relPath = toPosixPath(relative(dir, fullPath));
+			const ignorePath = isDir ? `${relPath}/` : relPath;
+			if (ig.ignores(ignorePath)) continue;
+
+			if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
+				entries.push(fullPath);
+			} else if (isDir) {
+				const resolvedEntries = resolveExtensionEntries(fullPath);
+				if (resolvedEntries) {
+					entries.push(...resolvedEntries);
+				}
+			}
+		}
+```
+
+规则只有一层：目录里直接放的 `*.ts` / `*.js` 是扩展；子目录如果有 `index.ts`、`index.js`，或者 `package.json` 里有 `pi.extensions` 字段，也算扩展。不会继续往深处递归，复杂的包需要用 `package.json` 声明入口。loader.ts 里的 `discoverAndLoadExtensions`（[loader.ts:831](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/loader.ts#L831-L879)）实现了同样的规则，是给 SDK 用户直接调用的版本。
+
+### 2.2 用 jiti 加载 TypeScript
+
+扩展是 `.ts` 文件，但用户不需要先编译。pi 用 [jiti](https://github.com/unjs/jiti) 加载它。jiti 是一个运行时模块加载器：能用 Node 原生加载的就原生加载，不能的就当场用 Babel 转译成 JS 再执行。
+
+```ts title="packages/coding-agent/src/core/extensions/loader.ts:562-593"
+async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
+	if (isCurrentCacheToken(cacheToken)) {
+		const cachedFactory = extensionCache.get(extensionPath);
+		if (cachedFactory) {
+			return cachedFactory;
+		}
+	}
+
+	const createJitiImpl = await getCreateJiti();
+	// Compiled binaries and the bundled Node distribution use embedded modules.
+	// Source TypeScript reuses host modules and root tsconfig paths. Unbundled
+	// Node builds use dist aliases and do not need the bundled virtual modules.
+	const resolutionOptions = usesEmbeddedModules
+		? { virtualModules: await getVirtualModules(), tryNative: false }
+		: isTypeScriptSourceRuntime
+			? { virtualModules: await getVirtualModules(), tsconfigPaths: true }
+			: { alias: getAliases() };
+	const jiti = createJitiImpl(import.meta.url, {
+		moduleCache: false,
+		...resolutionOptions,
+	});
+
+	const module = await jiti.import(extensionPath, { default: true });
+	const factory = module as ExtensionFactory;
+	if (typeof factory !== "function") {
+		return undefined;
+	}
+	if (isCurrentCacheToken(cacheToken)) {
+		extensionCache.set(extensionPath, factory);
+	}
+	return factory;
+}
+```
+
+关键在 `resolutionOptions` 的三个分支，它们解决同一个问题：扩展里写的 `import { ... } from "@earendil-works/pi-coding-agent"`，必须解析到**当前进程里正在运行的那一份** pi，而不是磁盘上另一份拷贝。否则扩展拿到的 `theme`、`Key` 等单例和宿主不是同一个对象。
+
+| 运行形态 | 解析方式 |
+| --- | --- |
+| Bun 编译的二进制、Node SEA、打包版 Node | `virtualModules`：直接把宿主已加载的模块对象交给 jiti，`tryNative: false` |
+| 从 TS 源码运行（如 `./pi-test.sh`） | `virtualModules` 加 `tsconfigPaths` |
+| 普通 npm 安装（dist 是 JS） | `alias`：把包名映射到 dist 文件路径 |
+
+虚拟模块表在 [virtual-modules.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/virtual-modules.ts)：
+
+```ts title="packages/coding-agent/src/core/extensions/virtual-modules.ts:12-32"
+import * as bundledPiCodingAgent from "../../index.ts";
+
+/** Modules available to extensions in source and compiled binary runtimes. */
+export const VIRTUAL_MODULES: Record<string, unknown> = {
+	typebox: bundledTypebox,
+	"typebox/compile": bundledTypeboxCompile,
+	"typebox/value": bundledTypeboxValue,
+	"@sinclair/typebox": bundledTypebox,
+	"@sinclair/typebox/compile": bundledTypeboxCompile,
+	"@sinclair/typebox/value": bundledTypeboxValue,
+	"@earendil-works/pi-agent-core": bundledPiAgentCore,
+	"@earendil-works/pi-tui": bundledPiTui,
+	// Extensions resolve the pi-ai root to the compat entrypoint (a strict
+	// superset of the core entrypoint): existing extensions using the old
+	// global API keep working at runtime until compat is removed.
+	"@earendil-works/pi-ai": bundledPiAiCompat,
+	"@earendil-works/pi-ai/compat": bundledPiAiCompat,
+	"@earendil-works/pi-ai/models": bundledPiAiModels,
+	"@earendil-works/pi-ai/oauth": bundledPiAiOauth,
+	"@earendil-works/pi-ai/providers/all": bundledPiAiProviders,
+	"@earendil-works/pi-coding-agent": bundledPiCodingAgent,
+```
+
+注意 `@earendil-works/pi-ai` 映射到 `compat` 入口，旧扩展用到的全局 API 仍然可用；表里还有 `@mariozechner/*` 这组旧包名，作用相同。
+
+另外两个细节：
+
+- `moduleCache: false` 关掉了 jiti 自己的模块缓存，pi 改用自己的 `extensionCache`，以路径为键缓存工厂函数。缓存带 `cwd` 和 `generation` 令牌：切换工作目录或调用 `clearExtensionCache()` 时整体失效。`/reload` 能热重载扩展就依赖这一点。
+- `jiti.import(path, { default: true })` 取默认导出。如果默认导出不是函数，`loadExtension` 返回错误 “Extension does not export a valid factory function”。
+
+### 2.3 工厂函数和两阶段 API
+
+拿到工厂函数后，`initializeExtension` 为它创建一个空的 `Extension` 对象和一个 `ExtensionAPI`，然后调用工厂：
+
+```ts title="packages/coding-agent/src/core/extensions/loader.ts:616-635"
+async function initializeExtension(
+	factory: ExtensionFactory,
+	extensionPath: string,
+	resolvedPath: string,
+	cwd: string,
+	eventBus: EventBus,
+	runtime: ExtensionRuntime,
+): Promise<Extension> {
+	const extension = createExtension(extensionPath, resolvedPath);
+	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
+	try {
+		await factory(load.api);
+		load.commit();
+	} catch (error) {
+		load.discard();
+		throw error;
+	}
+	time(`${extensionPath} factory`, "extensions");
+	return extension;
+}
+```
+
+`ExtensionFactory` 的类型是 `(pi: ExtensionAPI) => void | Promise<void>`，所以工厂可以是 async 的，比如先读配置文件再注册工具。
+
+这里有一个时序问题。扩展在**会话创建之前**就被加载了：此时没有 AgentSession，没有模型注册表绑定，也没有 UI。如果工厂里直接调用 `pi.sendMessage()`，没有对象能接收这条消息。
+
+pi 的解决办法是把 `ExtensionAPI` 的方法分成两类：
+
+- **注册方法**（`on`、`registerTool`、`registerCommand`、`registerShortcut`、`registerFlag`、各种 renderer）：只往 `Extension` 对象里的 Map 写数据，加载期就能用。
+- **动作方法**（`sendMessage`、`setActiveTools`、`setModel` 等）：转发给一个共享的 `ExtensionRuntime`。
+
+`ExtensionRuntime` 一开始全是会抛错的占位函数：
+
+```ts title="packages/coding-agent/src/core/extensions/loader.ts:160-222"
+export function createExtensionRuntime(): ExtensionRuntime {
+	const notInitialized = () => {
+		throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
+	};
+	const state: { staleMessage?: string } = {};
+	const eventBusUnsubscribers = new Set<() => void>();
+	const assertActive = () => {
+		if (state.staleMessage) {
+			throw new Error(state.staleMessage);
+		}
+	};
+
+	const runtime: ExtensionRuntime = {
+		sendMessage: notInitialized,
+		sendUserMessage: notInitialized,
+		appendEntry: notInitialized,
+		setSessionName: notInitialized,
+		getSessionName: notInitialized,
+		setLabel: notInitialized,
+		getActiveTools: notInitialized,
+		getAllTools: notInitialized,
+		getSettings: notInitialized,
+		setActiveTools: notInitialized,
+		// registerTool() is valid during extension load; refresh is only needed post-bind.
+		refreshTools: () => {},
+		getCommands: notInitialized,
+		setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
+		getThinkingLevel: notInitialized,
+		setThinkingLevel: notInitialized,
+		flagValues: new Map(),
+		pendingProviderRegistrations: [],
+		pendingNativeProviderRegistrations: [],
+		mcpServers: new McpServerRegistry(),
+		pendingVirtualModelRegistrations: [],
+		createContext: notInitialized,
+		// ...
+		// Pre-bind: queue registrations so bindCore() can flush them once the
+		// model registry is available. bindCore() replaces both with direct calls.
+		registerProvider: (name, config, extensionPath = "<unknown>") => {
+			runtime.pendingProviderRegistrations.push({ name, config, extensionPath });
+		},
+		registerNativeProvider: (provider, extensionPath = "<unknown>") => {
+			runtime.pendingNativeProviderRegistrations.push({ provider, extensionPath });
+		},
+```
+
+会话创建好以后，`ExtensionRunner.bindCore()` 把真正的实现写进 runtime（4.1 节）。所有扩展的 API 对象都引用同一个 runtime，所以一次绑定对所有扩展生效。
+
+注册方法写入 `Extension` 对象的方式如下（[loader.ts:273](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/loader.ts#L273-L304)）：
+
+```ts title="packages/coding-agent/src/core/extensions/loader.ts:273-304"
+	const api = {
+		// Registration methods - write to extension
+		on(event: string, handler: HandlerFn): () => void {
+			assertActive();
+			const registeredHandler: HandlerFn = (...args) => handler(...args);
+			const list = extension.handlers.get(event) ?? [];
+			list.push(registeredHandler);
+			extension.handlers.set(event, list);
+
+			return () => {
+				const handlers = extension.handlers.get(event);
+				if (!handlers) return;
+				const handlerIndex = handlers.indexOf(registeredHandler);
+				if (handlerIndex === -1) return;
+				handlers.splice(handlerIndex, 1);
+				if (handlers.length === 0) extension.handlers.delete(event);
+			};
+		},
+
+		registerTool(tool: ToolDefinition): void {
+			assertActive();
+			if (typeof tool.parameters !== "object" || tool.parameters === null || Array.isArray(tool.parameters)) {
+				throw new Error(
+					`Tool "${tool.name}" registered by extension "${extension.path}" must define an object parameter schema.`,
+				);
+			}
+			extension.tools.set(tool.name, {
+				definition: tool,
+				sourceInfo: extension.sourceInfo,
+			});
+			runtime.refreshTools();
+		},
+```
+
+`on()` 返回一个取消订阅函数；`registerTool` 会检查参数 schema 必须是对象。
+
+有一类调用介于两者之间：`registerProvider`、`registerMcpServer`、`registerVirtualModel`。它们需要修改全局状态（模型注册表、MCP 服务器表），但在加载期也允许调用。它们经过 `applyRuntimeChange`：
+
+```ts title="packages/coding-agent/src/core/extensions/loader.ts:263-467"
+	const applyRuntimeChange = (change: () => void) => {
+		if (state === "loading") pendingRuntimeChanges.push(change);
+		else change();
+	};
+		// ...
+		registerProvider(providerOrName: Provider | string, config?: ProviderConfig) {
+			assertActive();
+			if (typeof providerOrName === "string") {
+				if (!config) throw new Error("Provider config is required when registering by name");
+				applyRuntimeChange(() => runtime.registerProvider(providerOrName, config, extension.path));
+				return;
+			}
+			applyRuntimeChange(() => runtime.registerNativeProvider(providerOrName, extension.path));
+		},
+```
+
+加载期（`state === "loading"`）的修改先存进 `pendingRuntimeChanges`，工厂成功返回后由 `commit()` 一次性应用；工厂抛错则由 `discard()` 丢弃（[loader.ts:533-551](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/loader.ts#L533-L551)），同时取消加载期订阅的事件总线监听，并把该扩展的 API 标记为 `failed`。例子：一个扩展先注册了 provider，然后读配置失败抛错。没有这个机制，这个 provider 会残留在注册表里；有了它，失败的扩展什么都不会留下。
+
+## 3. ExtensionAPI 全貌：事件
+
+### 3.1 事件一览
+
+`ExtensionAPI.on()` 有 41 个重载，每个对应一种事件（[types.ts:1602-1674](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/types.ts#L1602-L1674)）。下面截取一部分：
+
+```ts title="packages/coding-agent/src/core/extensions/types.ts:1597-1674"
+export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
+// ...
+export interface ExtensionAPI {
+	// =========================================================================
+	// Event Subscription
+	// =========================================================================
+
+	on(event: "project_trust", handler: ProjectTrustHandler): () => void;
+	on(
+		event: "resources_discover",
+		handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>,
+	): () => void;
+	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): () => void;
+	// ...
+	on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): () => void;
+	on(event: "context_with_system", handler: ExtensionHandler<ContextWithSystemEvent, ContextEventResult>): () => void;
+	on(
+		event: "cache_warming_decision",
+		handler: ExtensionHandler<CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult>,
+	): () => void;
+	on(
+		event: "before_provider_request",
+		handler: ExtensionHandler<BeforeProviderRequestEvent, BeforeProviderRequestEventResult>,
+	): () => void;
+	on(event: "before_provider_headers", handler: ExtensionHandler<BeforeProviderHeadersEvent>): () => void;
+	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): () => void;
+	on(event: "provider_stream_event", handler: ExtensionHandler<ProviderStreamEvent>): () => void;
+	on(
+		event: "before_agent_start",
+		handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>,
+	): () => void;
+	// ...
+	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): () => void;
+	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent, TurnEndEventResult>): () => void;
+	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): () => void;
+	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): () => void;
+	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent, MessageEndEventResult>): () => void;
+	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): () => void;
+	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): () => void;
+	on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): () => void;
+	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): () => void;
+	on(event: "thinking_level_select", handler: ExtensionHandler<ThinkingLevelSelectEvent>): () => void;
+	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): () => void;
+	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
+	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
+	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
+```
+
+`ExtensionHandler<E, R>` 的第二个类型参数 `R` 就是这个事件允许返回的结果类型。`R` 默认是 `undefined`，即纯通知事件，返回什么都会被忽略。按 `R` 是否有意义，可以把事件分成三种能力：
+
+- **通知**：只读，返回值忽略。
+- **改写**：返回值（或原地修改）会替换 pi 接下来使用的数据。
+- **拦截**：返回值能让 pi 放弃某个动作。
+
+按触发阶段分类，全部事件如下：
+
+| 阶段 | 事件 | 能力 | 返回值的作用 |
+| --- | --- | --- | --- |
+| 启动与资源 | `project_trust` | 拦截 | `trusted: "yes"/"no"/"undecided"`，决定是否信任项目目录 |
+| 启动与资源 | `resources_discover` | 改写 | 返回额外的 skill、prompt、theme 路径 |
+| 启动与资源 | `mcp_servers_change` | 通知 | 扩展注册或注销了 MCP 服务器 |
+| 会话 | `session_start` | 通知 | 会话启动、恢复、新建、fork、reload |
+| 会话 | `session_info_changed` | 通知 | 会话名变化 |
+| 会话 | `session_before_switch` | 拦截 | `cancel: true` 取消切换 |
+| 会话 | `session_before_fork` | 拦截 | `cancel`，或 `skipConversationRestore` |
+| 会话 | `session_before_compact` | 拦截/改写 | `cancel`，或直接给出 `compaction` 结果（自定义摘要） |
+| 会话 | `session_compact` / `session_compact_failed` | 通知 | compaction 成功或失败 |
+| 会话 | `session_before_tree` | 拦截/改写 | `cancel`，或提供分支摘要、改写摘要指令和标签 |
+| 会话 | `session_tree` | 通知 | 树导航完成 |
+| 会话 | `session_shutdown` | 通知 | 退出、reload 或会话替换前，用来释放资源 |
+| 输入 | `input` | 拦截/改写 | `transform` 改写文本和图片，`handled` 吞掉这次输入 |
+| 输入 | `user_bash` | 改写 | 用户 `!cmd` 时，返回 `operations` 换执行方式，或直接给 `result` |
+| 运行开始 | `before_agent_start` | 改写 | 追加一条 custom 消息，修改或替换 system prompt |
+| 请求构造 | `context` | 改写 | 改写本次请求的对话消息（不含 system 消息） |
+| 请求构造 | `context_with_system` | 改写 | 改写包含 system 消息的完整消息列表 |
+| 请求构造 | `before_provider_request` | 改写 | 替换发给 provider 的原始 payload |
+| 请求构造 | `before_provider_headers` | 改写 | 原地修改 HTTP 请求头，`null` 表示删除 |
+| 请求构造 | `after_provider_response` | 通知 | HTTP 状态码和响应头 |
+| 请求构造 | `provider_stream_event` | 通知 | provider 原始流事件（归一化之前） |
+| 请求构造 | `cache_warming_decision` | 改写 | 覆盖是否发送缓存预热请求 |
+| 运行与回合 | `agent_start` / `agent_end` | 通知 | agent 循环开始、结束 |
+| 运行与回合 | `turn_start` | 通知 | 一个 turn 开始 |
+| 运行与回合 | `turn_end` | 改写 | 追加会话 entry，要求 `continue` 再跑一个 turn |
+| 运行与回合 | `agent_before_settle` | 改写 | 结束前最后一次追加 entry 或要求继续 |
+| 运行与回合 | `agent_settled` | 通知 | 完全结束，不会再有重试、compaction 或排队消息 |
+| 消息 | `message_start` / `message_update` | 通知 | 消息开始、流式增量 |
+| 消息 | `message_end` | 改写 | 替换最终消息，角色必须不变 |
+| 工具 | `tool_call` | 拦截/改写 | `block: true` 阻止执行；原地修改 `event.input` 改参数 |
+| 工具 | `tool_result` | 改写 | 替换 `content`、`details`、`isError` 等字段 |
+| 工具 | `tool_execution_start` / `_update` / `_end` | 通知 | 工具执行进度 |
+| 模型 | `model_select` / `thinking_level_select` | 通知 | 切换模型或思考级别 |
+| UI | `ui_prompt_start` / `ui_prompt_end` | 通知 | 扩展弹出的阻塞式对话框开始、结束 |
+
+表中斜杠合并的事件计数时分开算，合计 41 个。
+
+### 3.2 两个值得注意的事件定义
+
+`tool_call` 的参数修改不是靠返回值，而是原地修改 `event.input`：
+
+```ts title="packages/coding-agent/src/core/extensions/types.ts:1256-1271"
+/**
+ * Fired before a tool executes. Can block.
+ *
+ * `event.input` is mutable. Mutate it in place to patch tool arguments before execution.
+ * Later `tool_call` handlers see earlier mutations. No re-validation is performed after mutation.
+ */
+export type ToolCallEvent =
+	| BashToolCallEvent
+	| PowerShellToolCallEvent
+	| ReadToolCallEvent
+	| EditToolCallEvent
+	| WriteToolCallEvent
+	| GrepToolCallEvent
+	| FindToolCallEvent
+	| LsToolCallEvent
+	| CustomToolCallEvent;
+```
+
+注释写明了两点：后面的 handler 能看到前面的修改；修改后**不会**重新做 schema 校验。所以扩展改参数时要自己保证类型正确。`isToolCallEventType("bash", event)` 这类类型守卫用于收窄内置工具的 `input` 类型（[types.ts:1394-1408](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/types.ts#L1394-L1408)）。
+
+`turn_end` 和 `agent_before_settle` 共用一组“边界”字段：
+
+```ts title="packages/coding-agent/src/core/extensions/types.ts:1021-1036"
+export interface BoundaryState {
+	entries: SessionBoundaryDraft[];
+	continue: boolean;
+	context: BoundaryContextPreview;
+	outcome: AgentActivityOutcome;
+}
+
+export interface BoundaryResult {
+	entries?: SessionBoundaryDraft[];
+	continue?: boolean;
+}
+
+/** Fired before final settlement. May append entries and ensure one next provider request. */
+export interface AgentBeforeSettleEvent extends BoundaryState {
+	type: "agent_before_settle";
+}
+```
+
+handler 可以返回 `entries`（要写进会话的草稿，可以是 custom entry、custom message、上下文编辑或 compaction）和 `continue`（要求再发起一次模型请求）。事件里的 `context` 是“如果写入这些 entry，下一次请求会看到什么”的预览。这让扩展可以在 turn 边界上做自定义 compaction 或注入提醒，而不用自己操作 SessionManager。
+
+## 4. 分发与合并：runner.ts
+
+### 4.1 bindCore：把动作方法接上
+
+`ExtensionRunner` 在 AgentSession 创建后构造，`bindCore()` 把 AgentSession 的方法写进共享 runtime：
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:417-487"
+	bindCore(
+		actions: ExtensionActions,
+		contextActions: ExtensionContextActions,
+		providerActions?: {
+			registerProvider?: (name: string, config: ProviderConfig) => void;
+			registerNativeProvider?: (provider: Provider) => void;
+			unregisterProvider?: (name: string) => void;
+			registerVirtualModel?: (definition: VirtualModelDefinition) => void;
+			unregisterVirtualModel?: (provider: string, id: string) => void;
+		},
+	): void {
+		// Copy actions into the shared runtime (all extension APIs reference this)
+		this.runtime.sendMessage = actions.sendMessage;
+		this.runtime.sendUserMessage = actions.sendUserMessage;
+		this.runtime.appendEntry = actions.appendEntry;
+		this.runtime.setSessionName = actions.setSessionName;
+		this.runtime.getSessionName = actions.getSessionName;
+		this.runtime.setLabel = actions.setLabel;
+		this.runtime.getActiveTools = actions.getActiveTools;
+		this.runtime.getAllTools = actions.getAllTools;
+		this.runtime.getSettings = actions.getSettings;
+		this.runtime.setActiveTools = actions.setActiveTools;
+		this.runtime.refreshTools = actions.refreshTools;
+		this.runtime.getCommands = actions.getCommands;
+		this.runtime.setModel = actions.setModel;
+		this.runtime.getThinkingLevel = actions.getThinkingLevel;
+		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.createContext = () => this.createContext();
+
+		// ...
+		// Flush provider registrations queued during extension loading
+		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
+			try {
+				if (providerActions?.registerProvider) {
+					providerActions.registerProvider(name, config);
+				} else {
+					this.modelRegistry.registerProvider(name, config);
+				}
+			} catch (err) {
+				this.emitError({
+					extensionPath,
+					event: "register_provider",
+					error: err instanceof Error ? err.message : String(err),
+					stack: err instanceof Error ? err.stack : undefined,
+				});
+			}
+		}
+		this.runtime.pendingProviderRegistrations = [];
+```
+
+后半段把加载期排队的 provider 注册一次性冲刷进模型注册表。之后 `runtime.registerProvider` 被替换为直接调用，所以扩展在命令处理函数里注册 provider 立即生效，不需要 `/reload`。
+
+AgentSession 一侧的调用在 [agent-session.ts:3446](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L3446-L3480)，例如 `sendMessage` 映射到 `this.sendCustomMessage()`，`appendEntry` 映射到 `sessionManager.appendCustomEntry()`。
+
+UI 和命令上下文分开绑定：`setUIContext(uiContext, mode)` 由各模式在 `bindExtensions` 时提供；没有 UI 的模式用 `noOpUIContext`，所有对话框直接返回 `undefined` 或 `false`（[runner.ts:331-362](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/runner.ts#L331-L362)）。
+
+### 4.2 通用分发：emit
+
+所有分发方法都是同一个骨架：
+
+1. `snapshotEventHandlers` 先复制每个扩展的 handler 列表。handler 在执行中途注册或注销别的 handler，不影响这一轮。
+2. 外层按扩展加载顺序，内层按同一扩展内的注册顺序，**依次 await**。不是并发。
+3. 每个 handler 拿到同一个 `ctx`（`createContext()` 的结果）。
+4. handler 抛错时调用 `emitError`，交给模式显示，然后继续下一个 handler。
+
+纯通知事件和 `session_before_*` 走通用的 `emit()`：
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:1096-1125"
+	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		const ctx = this.createContext();
+		let result: SessionBeforeEventResult | undefined;
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
+			for (const handler of handlers) {
+				try {
+					const handlerResult = await handler(event, ctx);
+
+					if (this.isSessionBeforeEvent(event) && handlerResult) {
+						result = handlerResult as SessionBeforeEventResult;
+						if (result.cancel) {
+							return result as RunnerEmitResult<TEvent>;
+						}
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: event.type,
+						error: message,
+						stack,
+					});
+				}
+			}
+		}
+
+		return result as RunnerEmitResult<TEvent>;
+	}
+```
+
+对 `session_before_*`，后一个 handler 的返回值覆盖前一个；只要有一个返回 `cancel: true`，立刻短路返回。
+
+需要特殊合并规则的事件各有一个专门方法，`RunnerEmitEvent` 类型用 `Exclude` 把它们从通用 `emit()` 里排除掉（[runner.ts:183-200](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/runner.ts#L183-L200)），这样调用方不会用错入口。
+
+### 4.3 合并规则一览
+
+| 方法 | 事件 | 合并规则 |
+| --- | --- | --- |
+| `emit` | 通知事件、`session_before_*` | 后者覆盖前者；`cancel` 短路 |
+| `emitToolCall` | `tool_call` | 第一个 `block: true` 短路；**handler 抛错不捕获** |
+| `emitToolResult` | `tool_result` | 按字段覆盖，后一个 handler 看到前一个的修改 |
+| `emitMessageEnd` | `message_end` | 链式替换，角色不一致的替换被拒绝 |
+| `emitInput` | `input` | `transform` 链式传递，`handled` 短路 |
+| `emitContext` | `context`、`context_with_system` | 两阶段链式改写 |
+| `emitBeforeAgentStart` | `before_agent_start` | 消息累加；system prompt 选项共享可变，`systemPrompt` 后者覆盖 |
+| `emitBeforeProviderRequest` | `before_provider_request` | 链式替换 payload |
+| `emitBeforeProviderHeaders` | `before_provider_headers` | 原地修改同一个对象，返回值忽略 |
+| `emitCacheWarmingDecision` | `cache_warming_decision` | 最后一个给出 `action` 的胜出 |
+| `emitUserBash` | `user_bash` | 第一个非 `undefined` 结果胜出 |
+| `emitResourcesDiscover` | `resources_discover` | 所有路径累加 |
+| `emitBoundary` | `turn_end`、`agent_before_settle` | entries 和 continue 链式覆盖，每步重建预览 |
+| `emitProjectTrustEvent` | `project_trust` | 第一个不是 `undecided` 的胜出 |
+
+下面看几个有代表性的。
+
+### 4.4 tool_call：失败即拦截
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:1249-1267"
+	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
+		const ctx = this.createContext();
+		let result: ToolCallEventResult | undefined;
+
+		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
+			for (const handler of handlers) {
+				const handlerResult = await handler(event, ctx);
+
+				if (handlerResult) {
+					result = handlerResult as ToolCallEventResult;
+					if (result.block) {
+						return result;
+					}
+				}
+			}
+		}
+
+		return result;
+	}
+```
+
+和其他方法不同，这里没有 try/catch。handler 抛出的异常会一路传到 agent-core 的 `prepareToolCall`，被那里的 catch 转成一条错误工具结果（第 5 节）。效果是：**权限扩展出错时，工具不会执行**。对拦截类事件来说，出错时放行比出错时拦截危险得多，所以这里选择 fail closed（失败时按拒绝处理）。
+
+### 4.5 tool_result：按字段覆盖
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:1190-1247"
+	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
+		const ctx = this.createContext();
+		const currentEvent: ToolResultEvent = { ...event };
+		let modified = false;
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "tool_result")) {
+			for (const handler of handlers) {
+				try {
+					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+					if (!handlerResult) continue;
+
+					if (handlerResult.content !== undefined) {
+						currentEvent.content = handlerResult.content;
+						// Structured content that is not replaced along with the content may no longer match it.
+						if (handlerResult.structuredContent === undefined) delete currentEvent.structuredContent;
+						modified = true;
+					}
+					if (handlerResult.details !== undefined) {
+						currentEvent.details = handlerResult.details;
+						modified = true;
+					}
+					if (handlerResult.structuredContent !== undefined) {
+						currentEvent.structuredContent = handlerResult.structuredContent;
+						modified = true;
+					}
+		// ...
+		if (!modified) {
+			return undefined;
+		}
+
+		return {
+			content: currentEvent.content,
+			details: currentEvent.details,
+			structuredContent: currentEvent.structuredContent,
+			isError: currentEvent.isError,
+			usage: currentEvent.usage,
+		};
+	}
+```
+
+只返回 `content` 的 handler 不会清掉 `details`。有一个例外：替换了 `content` 但没给 `structuredContent` 时，旧的 `structuredContent` 会被删除，因为它可能和新内容对不上。比如一个脱敏扩展把输出里的密钥替换成 `***`，如果 `structuredContent` 还留着原文，密钥就会通过 codemode 脚本泄露出去。
+
+### 4.6 input：链式改写与短路
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:1524-1564"
+	/** Emit input event. Transforms chain, "handled" short-circuits. */
+	async emitInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: InputSource,
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<InputEventResult> {
+		const ctx = this.createContext();
+		let currentText = text;
+		let currentImages = images;
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input")) {
+			for (const handler of handlers) {
+				try {
+					const event: InputEvent = {
+						type: "input",
+						text: currentText,
+						images: currentImages,
+						source,
+						streamingBehavior,
+					};
+					const result = (await handler(event, ctx)) as InputEventResult | undefined;
+					if (result?.action === "handled") return result;
+					if (result?.action === "transform") {
+						currentText = result.text;
+						currentImages = result.images ?? currentImages;
+					}
+				} catch (err) {
+					this.emitError({
+						extensionPath: ext.path,
+						event: "input",
+						error: err instanceof Error ? err.message : String(err),
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+				}
+			}
+		}
+		return currentText !== text || currentImages !== images
+			? { action: "transform", text: currentText, images: currentImages }
+			: { action: "continue" };
+	}
+```
+
+第一个扩展把 `"?? fix"` 改写成 `"Please fix the failing test"`，第二个扩展收到的就是改写后的文本。任意一个返回 `handled`，后面的扩展和 agent 都不会再看到这次输入。事件里的 `streamingBehavior` 告诉扩展：这条输入会作为 steer 还是 followUp 排队（第 7 章会讲到交互模式怎么选这个值）。
+
+### 4.7 context：保护 system 消息
+
+`context` 在每次调用模型前触发，扩展可以删消息、加消息、截断历史。风险是扩展可能顺手把 system 消息（系统提示和工具声明）也删掉。
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:1305-1351"
+	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		const ctx = this.createContext();
+		let currentMessages = structuredClone(messages);
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context")) {
+			for (const handler of handlers) {
+				try {
+					const visibleMessages = currentMessages.filter((message) => message.role !== "system");
+					const visibleSnapshot = visibleMessages.slice();
+					const event: ContextEvent = { type: "context", messages: visibleMessages };
+					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
+
+					// Handlers may return a new list or edit event.messages in place.
+					const returned =
+						handlerResult?.messages ??
+						(sameMessages(visibleMessages, visibleSnapshot) ? undefined : visibleMessages);
+					if (!returned) continue;
+					currentMessages = restoreSystemMessages(currentMessages, visibleSnapshot, returned);
+		// ...
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context_with_system")) {
+			for (const handler of handlers) {
+				try {
+					const hadLeadingSystemMessage = currentMessages[0]?.role === "system";
+					const event: ContextWithSystemEvent = { type: "context_with_system", messages: currentMessages };
+					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
+					currentMessages = handlerResult?.messages ?? currentMessages;
+					// Providers read the prompt and initial tools from the leading system message.
+					// Losing it is never intended; report it but honor the handler's output.
+					if (hadLeadingSystemMessage && currentMessages[0]?.role !== "system") {
+						this.emitError({
+							extensionPath: ext.path,
+							event: "context_with_system",
+							error: "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage().",
+						});
+					}
+```
+
+分两阶段处理：
+
+- `context` 阶段：handler 只看到非 system 消息。返回后，`restoreSystemMessages` 把 system 消息补回到开头。如果 handler 没改任何东西，就原样保留，模型的 prompt cache 前缀不受影响。
+- `context_with_system` 阶段：handler 看到完整列表，输出按原样使用。如果它把开头的 system 消息弄丢了，pi 会报一个扩展错误，但仍然尊重它的结果。
+
+大多数扩展只需要 `context`，比如第 11 节 plan-mode 用它过滤掉过期的计划模式提示。
+
+### 4.8 before_agent_start：共享可变的 system prompt
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:1427-1462"
+	async emitBeforeAgentStart(
+		trigger: BeforeAgentStartTrigger,
+		systemPromptOptions: BuildSystemPromptOptions,
+	): Promise<BeforeAgentStartCombinedResult> {
+		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
+		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
+		const ctx = Object.defineProperties(
+			{},
+			Object.getOwnPropertyDescriptors(this.createContext()),
+		) as ExtensionContext;
+		ctx.getSystemPrompt = () => {
+			this.assertActive();
+			return renderCurrentSystemPrompt();
+		};
+		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_agent_start")) {
+			for (const handler of handlers) {
+				try {
+					const event: BeforeAgentStartEvent = {
+						...trigger,
+						type: "before_agent_start",
+						get systemPrompt() {
+							return renderCurrentSystemPrompt();
+						},
+						systemPromptOptions: currentOptions,
+					};
+					const handlerResult = await handler(event, ctx);
+
+					if (handlerResult) {
+						const result = handlerResult as BeforeAgentStartEventResult;
+						if (result.message) messages.push(result.message);
+						if (result.systemPrompt !== undefined) {
+							currentOptions.forceSystemPrompt = result.systemPrompt;
+						}
+					}
+```
+
+`systemPrompt` 是一个 getter，每次读取都从 `currentOptions` 重新渲染。`systemPromptOptions` 是同一个可变对象，前一个 handler 往 `sections` 里加的段落，后一个 handler 读 `event.systemPrompt` 时就能看到。内置的 MCP 扩展就是这样把服务器列表写进 `sections` 的（第 10 节）。返回的 `message` 全部收集起来，AgentSession 把它们作为 custom 消息和用户消息一起放进本轮上下文（[agent-session.ts:1944-1965](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L1944-L1965)）。
+
+### 4.9 ctx 和失效检查
+
+`createContext()` 返回的对象，每个属性都是 getter，读取时先调用 `assertActive()`（[runner.ts:884-962](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/runner.ts#L884-L962)）。会话被替换（`/new`、fork、切换会话）或 reload 后，旧 runner 的 `invalidate()` 会让所有旧 `ctx` 失效，再访问就抛出一条很长的说明：不要在 `newSession()` 之后继续用捕获的 `ctx`，要把后续工作放进 `withSession` 回调。这防止扩展在闭包里拿着旧会话的 `ctx`，把消息发到已经不存在的会话里。
+
+命令处理函数拿到的是 `ExtensionCommandContext`，多了 `newSession`、`fork`、`navigateTree`、`switchSession`、`reload`、`waitForIdle` 这些会替换会话的方法。它们只在用户主动触发的命令里提供，事件 handler 拿不到，因为在 agent 运行中途替换会话是不安全的。
+
+## 5. 钩子的三层结构
+
+### 5.1 三层分工
+
+上面的事件不是 ExtensionRunner 自己产生的。它们来自三层：
+
+1. **agent-core 留钩子**：`Agent` 和 `runLoop` 只定义回调签名，如 `beforeToolCall`、`transformContext`（第 2 章）。agent-core 不知道扩展的存在。
+2. **AgentSession 实现钩子**：在 `sdk.ts` 创建 `Agent` 时，以及 AgentSession 构造时，把这些回调填上，回调内部调用 ExtensionRunner。
+3. **ExtensionRunner 暴露成事件**：按第 4 节的规则分发、合并，结果再沿原路返回给 agent-core。
+
+对应关系如下：
+
+| agent-core / pi-ai 钩子 | 实现位置 | 扩展事件 |
+| --- | --- | --- |
+| `transformContext` | sdk.ts 创建 Agent 时 | `context`、`context_with_system` |
+| `onPayload` | sdk.ts `transformProviderPayload` | `before_provider_request` |
+| 流选项 `transformHeaders` | sdk.ts `buildRequestOptions` | `before_provider_headers` |
+| `onResponse` | sdk.ts `handleProviderResponse` | `after_provider_response` |
+| `onProviderStreamEvent` | sdk.ts `handleProviderStreamEvent` | `provider_stream_event` |
+| `beforeToolCall` | `AgentSession._beforeToolCall` | `tool_call` |
+| `afterToolCall` | `AgentSession._afterToolCall` | `tool_result` |
+| `finishTurn` | `AgentSession._installAgentBoundaryHooks` | `turn_end` |
+| `Agent` 事件订阅 | `AgentSession._emitExtensionEvent` | `agent_*`、`turn_start`、`message_*`、`tool_execution_*` |
+| 无（AgentSession 自己的流程） | `prompt()`、`_prepareRun()`、compaction、树导航 | `input`、`before_agent_start`、`session_*` 等 |
+
+最后一行说明：`input`、`before_agent_start`、`session_*` 这些事件没有对应的 agent-core 钩子，它们发生在 agent 循环之外，由 AgentSession 自己在相应流程里触发。
+
+### 5.2 请求侧：sdk.ts
+
+```ts title="packages/coding-agent/src/core/sdk.ts:374-432"
+	const transformProviderPayload = async (payload: unknown) => {
+		const runner = extensionRunnerRef.current;
+		if (!runner?.hasHandlers("before_provider_request")) return payload;
+		return runner.emitBeforeProviderRequest(payload);
+	};
+	// ...
+	const agent = new Agent({
+		initialState: {
+			systemPrompt: "",
+			model,
+			thinkingLevel,
+			tools: [],
+			messages: existingSession.messages,
+		},
+		convertToLlm: convertToLlmWithBlockImages,
+		streamFn: async (model, context, options) => {
+			const requestOptions = buildRequestOptions(options);
+			// Compaction and summaries use their own routing ids; only session requests
+			// replace the cache entry, so warming restarts from them. Keep warming while
+			// the current transcript still extends the request's prefix. Agent state may
+			// shallow-copy the messages array or refresh the model object without changing
+			// the provider request, so top-level object identity is not a valid cache key.
+			if (options?.sessionId === sessionManager.getSessionId()) {
+				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+			}
+			return modelRuntime.streamSimple(model, context, requestOptions);
+		},
+		onPayload: transformProviderPayload,
+		onResponse: handleProviderResponse,
+		onProviderStreamEvent: handleProviderStreamEvent,
+		sessionId: sessionManager.getSessionId(),
+		transformContext: async (messages) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner) return messages;
+			return runner.emitContext(messages);
+		},
+```
+
+注意回调里读的是 `extensionRunnerRef.current`，而不是创建时捕获的 runner。`/reload` 会创建新的 runner，`Agent` 不需要重建，下一次请求自动走新 runner。
+
+### 5.3 工具侧：AgentSession
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:644-681"
+	/**
+	 * Install tool hooks once on the Agent instance.
+	 *
+	 * The callbacks read `this._extensionRunner` at execution time, so extension reload swaps in the
+	 * new runner without reinstalling hooks. Extension-specific tool wrappers are still used to adapt
+	 * registered tool execution to the extension context. Tool call and tool result interception now
+	 * happens here instead of in wrappers.
+	 */
+	private _installAgentToolHooks(): void {
+		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
+		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+	}
+
+	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
+	private async _beforeToolCall(
+		{ toolCall, args }: BeforeToolCallContext,
+		parentToolCallId?: string,
+	): Promise<BeforeToolCallResult | undefined> {
+		const runner = this._extensionRunner;
+		if (!runner.hasHandlers("tool_call")) {
+			return undefined;
+		}
+
+		try {
+			return await runner.emitToolCall({
+				type: "tool_call",
+				toolName: toolCall.name,
+				toolCallId: toolCall.id,
+				...(parentToolCallId ? { parentToolCallId } : {}),
+				input: args as Record<string, unknown>,
+			});
+		} catch (err) {
+			if (err instanceof Error) {
+				throw err;
+			}
+			throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+		}
+	}
+```
+
+`hasHandlers("tool_call")` 是一个快速路径：没有扩展订阅时直接返回 `undefined`，不创建 ctx，也不进入循环。
+
+结果回到 agent-core 后怎么处理：
+
+```ts title="packages/agent/src/agent-loop.ts:735-786"
+	try {
+		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		if (config.beforeToolCall) {
+			const beforeResult = await config.beforeToolCall(
+				{
+					assistantMessage,
+					toolCall,
+					args: validatedArgs,
+					context: currentContext,
+				},
+				signal,
+			);
+			if (signal?.aborted) {
+				return {
+					kind: "immediate",
+					result: createErrorToolResult("Operation aborted"),
+					isError: true,
+				};
+			}
+			if (beforeResult?.block) {
+				const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
+				if (beforeResult.terminate === true) {
+					result.terminate = true;
+				}
+				return {
+					kind: "immediate",
+					result,
+					isError: true,
+				};
+			}
+		}
+	// ...
+	} catch (error) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+		};
+	}
+```
+
+把三层连起来，用 permission-gate 走一遍：
+
+```
+模型回复里有 toolCall: bash { command: "sudo rm -rf /tmp/x" }
+→ agent-loop prepareToolCall：找到工具、校验参数
+→ config.beforeToolCall(...)                     // agent-core 钩子
+→ AgentSession._beforeToolCall                    // 实现
+→ runner.emitToolCall({ type: "tool_call", ... }) // 扩展事件
+→ permission-gate handler：匹配 /\bsudo\b/，ctx.ui.select(...)
+→ 用户选 No，返回 { block: true, reason: "Blocked by user" }
+→ agent-loop：createErrorToolResult("Blocked by user")，isError: true
+→ 模型在下一个 turn 看到这条错误结果，自行调整
+```
+
+如果 handler 抛错，`emitToolCall` 不捕获，`_beforeToolCall` 原样抛出，agent-loop 的 catch 把错误信息变成错误工具结果，同样不会执行工具。
+
+### 5.4 事件侧：先扩展，后监听者
+
+agent-core 发出的 `AgentEvent` 由 AgentSession 订阅，先转给扩展，再转给 UI 等公开监听者：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1142-1144"
+		// Emit to extensions first, then notify public listeners.
+		await this._emitExtensionEvent(event);
+		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+```
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1303-1352"
+	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
+		if (event.type === "agent_start") {
+			this._turnIndex = 0;
+			await this._extensionRunner.emit({ type: "agent_start" });
+		} else if (event.type === "agent_end") {
+			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
+		} else if (event.type === "turn_start") {
+			const extensionEvent: TurnStartEvent = {
+				type: "turn_start",
+				turnIndex: this._turnIndex,
+				timestamp: Date.now(),
+			};
+			await this._extensionRunner.emit(extensionEvent);
+		// ...
+		} else if (event.type === "message_end") {
+			const extensionEvent: MessageEndEvent = {
+				type: "message_end",
+				message: event.message,
+			};
+			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
+			if (replacement) {
+				// Untyped extension handlers can return messages with null/missing content;
+				// normalize so it never enters agent state or session history.
+				const normalized =
+					(replacement.role === "user" ||
+						replacement.role === "assistant" ||
+						replacement.role === "toolResult" ||
+						replacement.role === "custom") &&
+					replacement.content == null
+						? ({ ...replacement, content: [] } as AgentMessage)
+						: replacement;
+				this._replaceMessageInPlace(event.message, normalized);
+			}
+```
+
+“先扩展后 UI”的顺序保证 `message_end` 的改写在 UI 渲染和写入 JSONL 之前完成。`_replaceMessageInPlace` 把替换后的消息写回 agent 状态，UI 和会话文件看到的都是改写后的版本。
+
+## 6. 注册能力
+
+### 6.1 工具
+
+`registerTool` 接收一个 `ToolDefinition`：
+
+```ts title="packages/coding-agent/src/core/extensions/types.ts:585-673"
+export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = unknown, TState = any> {
+	/** Tool name (used in LLM tool calls) */
+	name: string;
+	/** Human-readable label for UI */
+	label: string;
+	/** Description for LLM */
+	description: string;
+	/** Optional one-line snippet for the Available tools section in the default system prompt. Custom tools are omitted from that section when this is not provided. */
+	promptSnippet?: string;
+	/** Optional guideline bullets appended to the default system prompt Guidelines section when this tool is active. */
+	promptGuidelines?: string[];
+	/** Parameter schema (TypeBox) */
+	parameters: TParams;
+	// ...
+	/**
+	 * How the model reaches the tool. Default: `"direct"`. See {@link ToolExposure}.
+	 */
+	exposure?: ToolExposure;
+	// ...
+	defaultActive?: boolean;
+	// ...
+	/** Execute the tool. */
+	execute(
+		toolCallId: string,
+		params: Static<TParams>,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
+		ctx: ExtensionToolContext,
+	): Promise<AgentToolResult<TDetails>>;
+
+	/** Custom rendering for tool call display */
+	renderCall?: (args: Static<TParams>, theme: Theme, context: ToolRenderContext<TState, Static<TParams>>) => Component;
+
+	/** Custom rendering for tool result display */
+	renderResult?: (
+		result: AgentToolResult<TDetails>,
+		options: ToolRenderResultOptions,
+		theme: Theme,
+		context: ToolRenderContext<TState, Static<TParams>>,
+	) => Component;
+```
+
+参数用 TypeBox 定义（TypeBox 是一个用 TypeScript 写 JSON Schema 的库，同时能推导出静态类型），`execute` 的 `params` 自动得到对应类型。`onUpdate` 用来流式上报中间结果，UI 会实时刷新；`renderCall` / `renderResult` 自定义这次调用在终端里的样子。
+
+`exposure` 决定模型怎样接触到这个工具：
+
+| exposure | 是否声明给模型 | 能否被其他工具（如 codemode）调用 | 注册时是否默认激活 |
+| --- | --- | --- | --- |
+| `direct`（默认） | 激活时声明 | 激活时可以 | 是 |
+| `model-only` | 激活时声明 | 不能 | 是 |
+| `codemode` | 默认不声明 | 注册后就可以 | 否 |
+| `deferred` | 由 tool_search 加载后声明 | 注册后就可以 | 否 |
+| `hidden` | 不声明 | 不能 | 激活无效 |
+
+工具重名时，`getAllRegisteredTools` 按加载顺序“先注册者胜”（[runner.ts:637-647](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/runner.ts#L637-L647)）。注册的工具经 [wrapper.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/wrapper.ts) 包装成 `AgentTool`，执行时拿到 `runner.createToolContext()`。这个上下文比普通 ctx 多了 `tools` 和 `executeTool()`：工具可以调用其他工具，嵌套调用的 id 是 `父id/n`，同样经过 `tool_call` / `tool_result`，所以权限扩展对嵌套调用一样有效。
+
+### 6.2 命令
+
+`registerCommand("name", { description, handler, getArgumentCompletions })` 注册 `/name`。AgentSession 在 `prompt()` 一开始就检查扩展命令，**即使 agent 正在输出也立即执行**：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2097-2108"
+		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const preflightResult = options?.preflightResult;
+		// Handle extension commands first (execute immediately, even during streaming)
+		// Extension commands manage their own LLM interaction via pi.sendMessage()
+		if (expandPromptTemplates && text.startsWith("/")) {
+			const handled = await this._tryExecuteExtensionCommand(text);
+			if (handled) {
+				// Extension command executed, no prompt to send
+				preflightResult?.("handled");
+				return;
+			}
+		}
+```
+
+两个扩展注册了同名命令时，不报错，而是改名为 `name:1`、`name:2`：
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:814-848"
+	private resolveRegisteredCommands(): ResolvedCommand[] {
+		const commands: RegisteredCommand[] = [];
+		const counts = new Map<string, number>();
+
+		for (const ext of this.extensions) {
+			for (const command of ext.commands.values()) {
+				commands.push(command);
+				counts.set(command.name, (counts.get(command.name) ?? 0) + 1);
+			}
+		}
+
+		const seen = new Map<string, number>();
+		const takenInvocationNames = new Set<string>();
+
+		return commands.map((command) => {
+			const occurrence = (seen.get(command.name) ?? 0) + 1;
+			seen.set(command.name, occurrence);
+
+			let invocationName = (counts.get(command.name) ?? 0) > 1 ? `${command.name}:${occurrence}` : command.name;
+
+			if (takenInvocationNames.has(invocationName)) {
+				let suffix = occurrence;
+				do {
+					suffix++;
+					invocationName = `${command.name}:${suffix}`;
+				} while (takenInvocationNames.has(invocationName));
+			}
+
+			takenInvocationNames.add(invocationName);
+			return {
+				...command,
+				invocationName,
+			};
+		});
+	}
+```
+
+### 6.3 快捷键和 CLI 参数
+
+`registerShortcut(key, { handler })` 注册快捷键。扩展快捷键和内置快捷键冲突时，`getShortcuts` 分两种情况处理：
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:98-720"
+const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
+	"app.interrupt",
+	"app.clear",
+	"app.exit",
+	"app.suspend",
+	"app.thinking.cycle",
+	"app.model.cycleForward",
+	"app.model.cycleBackward",
+	"app.model.select",
+	"app.tools.expand",
+	"app.thinking.toggle",
+	"app.editor.external",
+	"app.message.copy",
+	"app.message.followUp",
+	"tui.input.submit",
+	"tui.select.confirm",
+	"tui.select.cancel",
+	"tui.input.copy",
+	"tui.editor.deleteToLineEnd",
+] as const;
+		// ...
+		for (const ext of this.extensions) {
+			for (const [key, shortcut] of ext.shortcuts) {
+				const normalizedKey = key.toLowerCase() as KeyId;
+
+				const builtInKeybinding = builtinKeybindings[normalizedKey];
+				if (builtInKeybinding?.restrictOverride === true) {
+					addDiagnostic(
+						`Extension shortcut '${key}' from ${shortcut.extensionPath} conflicts with built-in shortcut. Skipping.`,
+						shortcut.extensionPath,
+					);
+					continue;
+				}
+
+				if (builtInKeybinding?.restrictOverride === false) {
+					addDiagnostic(
+						`Extension shortcut conflict: '${key}' is built-in shortcut for ${builtInKeybinding.keybinding} and ${shortcut.extensionPath}. Using ${shortcut.extensionPath}.`,
+						shortcut.extensionPath,
+					);
+				}
+
+				const existingExtensionShortcut = extensionShortcuts.get(normalizedKey);
+				if (existingExtensionShortcut) {
+					addDiagnostic(
+						`Extension shortcut conflict: '${key}' registered by both ${existingExtensionShortcut.extensionPath} and ${shortcut.extensionPath}. Using ${shortcut.extensionPath}.`,
+						shortcut.extensionPath,
+					);
+				}
+				extensionShortcuts.set(normalizedKey, shortcut);
+			}
+```
+
+- 内置动作在保留列表里（如中断、退出、提交）：扩展的快捷键被跳过，并给出警告。用户不会因为装了一个扩展就失去 Esc 中断。
+- 不在保留列表里：扩展覆盖内置绑定，也给出警告。
+- 两个扩展抢同一个键：后加载的胜出。
+
+`registerFlag("plan", { type: "boolean", default: false })` 注册 CLI 参数，用户可以 `pi --plan`；扩展用 `pi.getFlag("plan")` 读值。
+
+### 6.4 模型提供方
+
+`registerProvider(name, config)` 可以新增 provider、覆盖已有 provider 的 `baseUrl`、注册 OAuth 登录，或提供自定义 `streamSimple`。另一个重载 `registerProvider(provider: Provider)` 接收一个完整的 pi-ai `Provider` 对象，内置的 llama.cpp 扩展用的就是这个（第 10 节）。如 2.3 节所述，加载期调用会排队，`bindCore` 时冲刷。`registerVirtualModel` 注册一个“虚拟模型”：它出现在模型列表里，但每次请求由扩展的 `route()` 决定实际发给哪个物理模型。
+
+### 6.5 渲染器
+
+| 方法 | 作用 |
+| --- | --- |
+| `registerMessageRenderer(customType, fn)` | 自定义 `sendMessage` 发出的 custom 消息怎么显示 |
+| `registerEntryRenderer(customType, fn)` | 自定义 `appendEntry` 写入的 custom entry 怎么显示（不进 LLM 上下文） |
+| `registerToolRenderer(resolver)` | 改变任意工具（包括别人注册的、内置的）的显示方式 |
+| `registerMarkdownTransformer(fn)` | 在渲染前改写用户和助手消息里的 Markdown |
+
+工具渲染器是一条责任链，每个 resolver 可以调用 `next()` 拿到“如果我不管，会用什么渲染器”：
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:796-802"
+	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
+	resolveToolRenderers(toolName: string, base: () => ToolRenderers | undefined): ToolRenderers | undefined {
+		const resolvers = this.extensions.flatMap((ext) => ext.toolRenderers ?? []);
+		const resolve = (index: number): ToolRenderers | undefined =>
+			index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
+		return resolve(0);
+	}
+```
+
+渲染器返回的都是 pi-tui 的 `Component`，第 7 章会讲它的接口。
+
+### 6.6 UI
+
+`ctx.ui` 是 `ExtensionUIContext`，每种模式各自实现：
+
+| 方法 | 交互模式 | RPC 模式 | print 模式 |
+| --- | --- | --- | --- |
+| `select` / `confirm` / `input` / `editor` | 弹出对话框 | 发 `extension_ui_request`，等宿主回复 | 返回 `undefined` / `false` |
+| `notify`、`setStatus`、`setTitle`、`setEditorText` | 直接显示 | 发 fire-and-forget 请求 | 忽略 |
+| `setWidget(key, lines)` | 编辑器上方或下方显示 | 只支持字符串数组 | 忽略 |
+| `setWidget(key, factory)`、`setFooter`、`setHeader`、`custom`、`setEditorComponent` | 挂载自定义组件 | 不支持 | 忽略 |
+
+所以写扩展时，需要终端组件的功能要先判断 `ctx.mode === "tui"`，需要对话框的功能判断 `ctx.hasUI`。runner 还会把 `select`、`confirm` 等阻塞式对话框包一层，在开始和结束时发出 `ui_prompt_start` / `ui_prompt_end`（[runner.ts:577-616](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/runner.ts#L577-L616)），让别的扩展（比如通知扩展）知道 pi 在等用户输入。
+
+### 6.7 动作
+
+`ExtensionAPI` 上的动作方法：
+
+- `sendMessage(message, { triggerTurn, deliverAs })`：发送一条 custom 消息。`deliverAs` 可选 `steer`、`followUp`、`nextTurn`（等下一次用户输入时一起发送）。
+- `sendUserMessage(content, { deliverAs })`：以用户身份发消息，总会触发一个 turn。
+- `appendEntry(customType, data)`：往会话文件写一条 custom entry，用于持久化扩展状态，不进 LLM 上下文。
+- `getActiveTools` / `setActiveTools` / `getAllTools`：读写激活的工具集合。
+- `setModel`、`setThinkingLevel`、`exec`（执行 shell 命令）、`setSessionName`、`setLabel`。
+- `events`：扩展之间通信的事件总线。
+
+## 7. 其他资源：skills、prompt templates、themes
+
+扩展是代码，另外三类资源是纯文本，同样可以放在用户目录、项目目录，或打包分发。包通过 `package.json` 的 `pi` 字段声明它们：
+
+```ts title="packages/coding-agent/src/core/pi-manifest.ts:4-9"
+export interface PiManifest {
+	extensions?: string[];
+	skills?: string[];
+	prompts?: string[];
+	themes?: string[];
+}
+```
+
+**Skills**：一个目录加一个 `SKILL.md`，frontmatter 里有 `name` 和 `description`（遵循 Agent Skills 规范，名字只能用小写字母、数字和连字符）。系统提示里只放每个 skill 的名字、描述和文件路径：
+
+```ts title="packages/coding-agent/src/core/skills.ts:358-388"
+export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "bash" | "indirect" = "read"): string {
+	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
+
+	if (visibleSkills.length === 0) {
+		return "";
+	}
+
+	const lines = [
+		"\n\nThe following skills provide specialized instructions for specific tasks.",
+		fileReadTool === "read"
+			? "Use the read tool to load a skill's file when the task matches its description."
+			: fileReadTool === "bash"
+				? "Use bash to load a skill's file when the task matches its description."
+				: "Load a skill's file when the task matches its description.",
+		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"",
+		"<available_skills>",
+	];
+
+	for (const skill of visibleSkills) {
+		lines.push("  <skill>");
+		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
+		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
+		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		lines.push("  </skill>");
+	}
+
+	lines.push("</available_skills>");
+
+	return lines.join("\n");
+}
+```
+
+模型判断任务匹配某个 skill 时，自己用 read 工具读取完整文件。这叫渐进式披露：一百个 skill 只占一百行系统提示，正文按需加载。用户也可以输入 `/skill:name args` 强制使用某个 skill，AgentSession 的 `_expandSkillCommand` 会把文件内容展开进消息（[agent-session.ts:2211](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L2211)）。`disable-model-invocation: true` 的 skill 不出现在系统提示里，只能这样手动调用。
+
+**Prompt templates**：`prompts/` 下的 Markdown 文件，文件名就是命令名。输入 `/review src/a.ts` 时展开成文件内容，`$1`、`$@`、`${@:2}` 等占位符替换成参数：
+
+```ts title="packages/coding-agent/src/core/prompt-templates.ts:309-325"
+export function expandPromptTemplate(text: string, templates: PromptTemplate[]): string {
+	if (!text.startsWith("/")) return text;
+
+	const match = text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+	if (!match) return text;
+
+	const templateName = match[1];
+	const argsString = match[2] ?? "";
+
+	const template = templates.find((t) => t.name === templateName);
+	if (template) {
+		const args = parseCommandArgs(argsString);
+		return substituteArgs(template.content, args);
+	}
+
+	return text;
+}
+```
+
+把第 6.2 节和这里合起来，`prompt()` 处理一行以 `/` 开头的输入的顺序是：扩展命令 → `input` 事件 → `/skill:` 展开 → prompt template 展开。扩展命令最先匹配，所以扩展可以用同名命令盖过模板。
+
+**Themes**：JSON 文件，`vars` 定义调色板，`colors` 把语义颜色名（`accent`、`error`、`toolTitle` 等）映射到调色板或具体颜色值：
+
+```json title="packages/coding-agent/src/modes/interactive/theme/dark.json:1-24"
+{
+	"$schema": "https://pi.dev/schemas/theme.schema.json",
+	"name": "dark",
+	"appearance": "dark",
+	"vars": {
+		"text": "okhsl(234 3% 89%)",
+		"muted": "okhsl(229 6% 67%)",
+		"violet": "okhsl(295 50% 67%)",
+		"blue": "okhsl(232 54% 67%)",
+		"green": "okhsl(159 59% 67%)",
+		"red": "okhsl(20 72% 67%)",
+		"yellow": "okhsl(83 88% 67%)",
+		"blueBg": "okhsl(233 41% 24%)"
+	},
+	"colors": {
+		"accent": "violet",
+		"border": "okhsl(231 57% 65%)",
+		"borderAccent": "okhsl(295 53% 64%)",
+		"borderMuted": "okhsl(229 8% 53%)",
+		"success": "green",
+		"error": "red",
+		"warning": "yellow",
+		"muted": "muted",
+		"dim": "okhsl(229 8% 56%)",
+```
+
+扩展可以在 `resources_discover` 事件里返回额外的 `skillPaths`、`promptPaths`、`themePaths`，AgentSession 收到后扩展资源并重建系统提示（[agent-session.ts:3344-3366](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L3344-L3366)）。这样一个扩展包可以根据项目情况动态提供 skill。
+
+## 8. 分发：package-manager.ts
+
+用户分享扩展的方式是 `pi install <source>`。[package-manager.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/package-manager.ts) 先识别来源类型：
+
+```ts title="packages/coding-agent/src/core/package-manager.ts:1507-1532"
+	private parseSource(source: string): ParsedSource {
+		if (source.startsWith("npm:")) {
+			const spec = source.slice("npm:".length).trim();
+			const { name, version } = this.parseNpmSpec(spec);
+			return {
+				type: "npm",
+				spec,
+				name,
+				version,
+				range: getNpmVersionRange(version),
+				pinned: isExactNpmVersion(version),
+			};
+		}
+
+		if (isLocalPath(source)) {
+			return { type: "local", path: source };
+		}
+
+		// Try parsing as git URL
+		const gitParsed = parseGitUrl(source);
+		if (gitParsed) {
+			return gitParsed;
+		}
+
+		return { type: "local", path: source };
+	}
+```
+
+- `npm:@scope/pkg@1.2.3`：npm 包。版本是精确版本号时视为 pinned，`pi update` 不会升级它。
+- 本地路径：直接引用，不复制。
+- git URL（如 `github.com/user/repo@v1`）：克隆到受管目录。
+
+git 安装的过程：
+
+```ts title="packages/coding-agent/src/core/package-manager.ts:1923-1955"
+	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
+		const targetDir = this.getGitInstallPath(source, scope);
+		if (existsSync(targetDir)) {
+			if (source.ref) {
+				await this.ensureGitRef(targetDir, ["fetch", "origin", source.ref], "FETCH_HEAD");
+				return;
+			}
+			const target = await this.getLocalGitUpdateTarget(targetDir);
+			await this.ensureGitRef(targetDir, target.fetchArgs, target.ref);
+			return;
+		}
+		const gitRoot = this.getGitInstallRoot(scope);
+		if (gitRoot) {
+			this.ensureGitIgnore(gitRoot);
+		}
+		mkdirSync(dirname(targetDir), { recursive: true });
+		rmSync(this.getGitUpdateMarkerPath(targetDir), { force: true });
+
+		try {
+			await this.runCommand("git", ["clone", source.repo, targetDir]);
+			if (source.ref) {
+				await this.runCommand("git", ["checkout", source.ref], { cwd: targetDir });
+			}
+			const packageJsonPath = join(targetDir, "package.json");
+			if (existsSync(packageJsonPath)) {
+				await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
+			}
+		} catch (error) {
+			rmSync(targetDir, { recursive: true, force: true });
+			this.pruneEmptyGitParents(targetDir, gitRoot);
+			throw error;
+		}
+	}
+```
+
+克隆后如果有 `package.json`，会在克隆目录里用检测到的包管理器（npm、pnpm 或 bun）安装生产依赖；任何一步失败都删掉整个目录。安装位置分两种作用域：
+
+| 作用域 | npm | git |
+| --- | --- | --- |
+| 用户（默认） | `~/.pi/agent/npm` | `~/.pi/agent/git/<host>/<path>` |
+| 项目（`-l`） | `.pi/npm` | `.pi/git/<host>/<path>` |
+
+项目作用域会先调用 `assertProjectTrustedForScope`，项目不受信任时拒绝安装。npm 安装参数里有 `--legacy-peer-deps`（[package-manager.ts:1872-1896](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/package-manager.ts#L1872-L1896)），注释给出了原因：扩展在运行时通过 alias 或虚拟模块拿到宿主的 `@earendil-works/pi-*`，不能让包管理器另装一份 peer 依赖。另外，这些参数里没有 `--ignore-scripts`，所以安装一个包时它的 npm 生命周期脚本会照常执行。安装扩展包本质上就是运行别人的代码，应当只装信任的来源。
+
+同名资源冲突时的优先级：
+
+```ts title="packages/coding-agent/src/core/package-manager.ts:196-214"
+/**
+ * Compute a numeric precedence rank for a resource based on its metadata.
+ * Lower rank = higher precedence. Used to sort resolved resources so that
+ * name-collision resolution ("first wins") produces the correct outcome.
+ *
+ * Precedence (highest to lowest):
+ *   0  project + settings entry (source: "local", scope: "project")
+ *   1  project + auto-discovered (source: "auto", scope: "project")
+ *   2  user + settings entry (source: "local", scope: "user")
+ *   3  user + auto-discovered (source: "auto", scope: "user")
+ *   4  package resource (origin: "package")
+ */
+function resourcePrecedenceRank(m: PathMetadata): number {
+	// Built-in extensions load after file and package extensions, whichever scope enables them.
+	if (m.source === "builtin") return 5;
+	if (m.origin === "package") return 4;
+	const scopeBase = m.scope === "project" ? 0 : 2;
+	return scopeBase + (m.source === "local" ? 0 : 1);
+}
+```
+
+项目级高于用户级，显式配置高于自动发现，包里的资源再低一级，内置扩展最低。
+
+## 9. trust-manager：项目信任
+
+问题：你 `git clone` 了一个陌生仓库，里面有 `.pi/extensions/steal-keys.ts`。如果 pi 一进入这个目录就自动加载项目扩展，打开项目就等于执行了对方的代码。
+
+[trust-manager.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/trust-manager.ts) 先判断项目里有没有需要信任才能加载的资源：
+
+```ts title="packages/coding-agent/src/core/trust-manager.ts:30-208"
+const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
+	"settings.json",
+	"mcp.json",
+	"extensions",
+	"skills",
+	"prompts",
+	"themes",
+	"SYSTEM.md",
+	"APPEND_SYSTEM.md",
+] as const;
+// ...
+export function hasTrustRequiringProjectResources(cwd: string): boolean {
+	const homeDir = canonicalizePath(resolvePath(process.env.HOME || homedir()));
+	const userAgentsSkillsDir = join(homeDir, ".agents", "skills");
+	let currentDir = canonicalizePath(resolvePath(cwd));
+
+	const configDir = join(currentDir, CONFIG_DIR_NAME);
+	if (TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES.some((entry) => existsSync(join(configDir, entry)))) {
+		return true;
+	}
+
+	while (true) {
+		const agentsSkillsDir = join(currentDir, ".agents", "skills");
+		if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
+			return true;
+		}
+
+		const parentDir = dirname(currentDir);
+		if (parentDir === currentDir) {
+			return false;
+		}
+		currentDir = parentDir;
+	}
+}
+```
+
+除了 `.pi/` 下的这些条目，cwd 及其祖先目录里的 `.agents/skills` 也算。没有这些资源的目录不需要询问。
+
+信任决定保存在 `~/.pi/agent/trust.json`，键是规范化后的绝对路径。查询时从 cwd 一路往上找最近的一条记录（`findNearestTrustEntry`，[trust-manager.ts:45-59](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/trust-manager.ts#L45-L59)），所以信任 `~/work` 等于信任它下面的所有项目。读写都在文件锁里进行，多个 pi 进程同时运行也不会写坏文件。
+
+扩展也可以参与信任决定。`project_trust` 事件在项目资源加载之前触发，只有用户级扩展能收到：
+
+```ts title="packages/coding-agent/src/core/extensions/runner.ts:302-329"
+export async function emitProjectTrustEvent(
+	extensionsResult: LoadExtensionsResult,
+	event: ProjectTrustEvent,
+	ctx: ProjectTrustContext,
+): Promise<{ result?: ProjectTrustEventResult; errors: ExtensionError[] }> {
+	const errors: ExtensionError[] = [];
+	for (const { ext, handlers } of snapshotEventHandlers(extensionsResult.extensions, "project_trust")) {
+		// A single extension may register multiple handlers for the same event.
+		// The first project_trust handler that returns yes/no wins; undecided falls through.
+		for (const handler of handlers) {
+			try {
+				const handlerResult = (await handler(event, ctx)) as ProjectTrustEventResult;
+				if (handlerResult.trusted === "undecided") {
+					continue;
+				}
+				return { result: handlerResult, errors };
+			} catch (error) {
+				errors.push({
+					extensionPath: ext.path,
+					event: event.type,
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
+		}
+	}
+	return { errors };
+}
+```
+
+第一个返回 `yes` 或 `no` 的 handler 胜出，`undecided` 交给下一个。示例 [project-trust.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/examples/extensions/project-trust.ts) 演示了按规则自动信任。内置扩展在信任确定之后才加载，所以不能处理这个事件（见 `InlineExtension.builtin` 的注释，[types.ts:2076-2084](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/extensions/types.ts#L2076-L2084)）。
+
+## 10. 内置扩展：src/extensions/
+
+pi 自己的几个功能也写成扩展，和第三方扩展用同一套 API：
+
+```ts title="packages/coding-agent/src/extensions/index.ts:1-14"
+import type { InlineExtension } from "../core/extensions/types.ts";
+import codemodeExtension from "./codemode/index.ts";
+import llamaExtension from "./llama/index.ts";
+import mcpExtension from "./mcp/index.ts";
+import toolSearchExtension from "./tool-search/index.ts";
+
+export const builtInExtensions: InlineExtension[] = [
+	{ name: "llama.cpp", factory: llamaExtension, builtin: true },
+	// Replaceable: an extension that registers `codemode`, `tool_search`, or `/mcp` (such as a third-party
+	// MCP extension) takes over instead of running alongside the built-in one.
+	{ name: "codemode", factory: codemodeExtension, replaceable: true, builtin: true },
+	{ name: "tool-search", factory: toolSearchExtension, replaceable: true, builtin: true },
+	{ name: "mcp", factory: mcpExtension, replaceable: true, builtin: true },
+];
+```
+
+`replaceable: true` 的含义：如果别的扩展注册了同名的工具、命令或 flag，内置扩展整个不加载。比如第三方 MCP 扩展注册了 `/mcp`，内置 MCP 扩展就让位，避免两个扩展连接同一批服务器：
+
+```ts title="packages/coding-agent/src/core/resource-loader.ts:147-166"
+function omitReplacedExtensions(
+	extensions: Extension[],
+	warnings?: Array<{ path: string; warning: string }>,
+): Extension[] {
+	const names = (extension: Extension) => [
+		...[...extension.tools.keys()].map((name) => `tool:${name}`),
+		...[...extension.commands.keys()].map((name) => `command:${name}`),
+		...[...extension.flags.keys()].map((name) => `flag:${name}`),
+	];
+	const taken = new Map(
+		extensions
+			.filter((extension) => !extension.replaceable)
+			.flatMap((extension) => names(extension).map((name) => [name, extension] as const)),
+	);
+	return extensions.filter((extension) => {
+		if (!extension.replaceable) return true;
+		const replacement = names(extension)
+			.map((name) => ({ name, extension: taken.get(name) }))
+			.find((value): value is { name: string; extension: Extension } => value.extension !== undefined);
+		if (!replacement) return true;
+```
+
+四个内置扩展：
+
+**mcp**：MCP（Model Context Protocol，一种让模型调用外部服务工具的开放协议）客户端集成。它在 `session_start` 时连接 `mcp.json` 里配置的服务器和其他扩展通过 `registerMcpServer` 注册的服务器，把每个远程工具注册为 `mcp__<server>__<tool>`。默认 exposure 是 `codemode`，工具不直接声明给模型，模型通过 codemode 脚本搜索和调用，这样几十个 MCP 工具不会撑大工具声明。它用到的事件：
+
+```ts title="packages/coding-agent/src/extensions/mcp/index.ts:1176-1209"
+		// Every prompt lists the servers in the `mcp_servers` section as they are when it starts. Pi
+		// appends the section to the conversation when it changed, for example after a server connected.
+		pi.on("before_agent_start", async (event, ctx) => {
+			await waitForDirectServers(ctx);
+			const { sections } = event.systemPromptOptions;
+			const section = renderServersSection(servers);
+			if (section) sections[MCP_SERVERS_SECTION] = section;
+			else delete sections[MCP_SERVERS_SECTION];
+		});
+
+		// A tool that reaches other tools (`reachesTools`) waits for the servers it may reach, so their
+		// tools are registered before it runs: a codemode script for the servers it names, or for every
+		// server when it searches or enumerates tools, and tool_search for every server. The resource
+		// tools reach every server, so they wait for all of them. Direct MCP calls wait only for their
+		// own server, including a reconnect still closing its old transport.
+		pi.on("tool_call", async (event, ctx) => {
+			const tool = pi.getAllTools().find((candidate) => candidate.name === event.toolName);
+			if (!tool) return;
+			// Readiness can be pending while the display state is still connected: reconnect first
+			// closes the old transport, then opens a new one. Settled promises return immediately.
+			const readyServers = servers.filter((server) => isEnabled(server) && server.ready);
+			if (readyServers.length === 0) return;
+			let waiting: McpServer[] = [];
+			const reach = tool.reachesTools?.(event.input);
+			if (reach !== undefined) {
+				waiting = readyServers.filter((server) => reachesServer(reach, server.entry.name));
+			} else if (RESOURCE_TOOL_NAMES.has(tool.name)) {
+				waiting = readyServers;
+			} else {
+				const owner = toolOwners.get(event.toolName)?.split("\0", 1)[0];
+				waiting = readyServers.filter((server) => server.entry.name === owner);
+			}
+			await waitForServers(waiting, ctx.signal);
+		});
+```
+
+- `before_agent_start`：等待声明了 direct 工具的服务器连好，把服务器列表写进 system prompt 的一个 section。这正是 4.8 节说的共享可变 `systemPromptOptions`。
+- `tool_call`：这里没有拦截，而是**等待**。服务器在后台连接，模型调用某个 MCP 工具时，handler 等到对应服务器就绪再返回。handler 是 async 的，agent 循环会一直等它完成。
+- 另外还订阅了 `turn_start`、`mcp_servers_change`、`session_shutdown`，并注册 `/mcp` 管理命令。
+
+**codemode**：注册一个 `codemode` 工具，让模型写 JS 脚本在 QuickJS 沙箱里批量调用其他工具（细节在第 8 章）。注册时 `defaultActive: false`，需要用 `--tools` 或 `setActiveTools` 激活；MCP 扩展在需要时会自动激活它。
+
+```ts title="packages/coding-agent/src/extensions/codemode/index.ts:32-47"
+export function createCodemodeExtension(options: CodemodeExtensionOptions = {}): ExtensionFactory {
+	return (pi) => {
+		pi.registerTool({
+			...createCodemodeToolDefinition({
+				appendEntry: (customType, data) => pi.appendEntry(customType, data),
+				models: options.models ?? true,
+				getToolNamespace: (name) => pi.getAllTools().find((tool) => tool.name === name)?.namespace,
+				getToolGuidelines: () =>
+					new Map(pi.getAllTools().map((tool) => [tool.name, tool.promptGuidelines ?? []] as const)),
+				getMode: () => options.mode ?? readMode(pi),
+				getInlineBudget: () => options.inlineBudget ?? readInlineBudget(pi),
+			}),
+			defaultActive: false,
+		});
+	};
+}
+```
+
+**tool-search**：注册 `tool_search` 工具，模型按关键词搜索 `deferred` 工具并把它们加载进声明：
+
+```ts title="packages/coding-agent/src/extensions/tool-search/index.ts:12-18"
+export function createToolSearchExtension(): ExtensionFactory {
+	return (pi) => {
+		pi.registerTool({ ...createToolSearchToolDefinition({ tools: pi }), defaultActive: false });
+	};
+}
+
+export default createToolSearchExtension();
+```
+
+**llama**：本地 llama.cpp 服务器支持。工厂第一行就是 `pi.registerProvider(provider.provider)`（[llama/index.ts:42-44](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/extensions/llama/index.ts#L42-L44)），然后注册 `/llama` 命令，用来浏览、下载、加载模型。
+
+这几个扩展说明扩展 API 足够写出 MCP 集成、新的工具调用方式和新的模型来源这类核心级功能。SDK 用户如果不要其中某个，不加载对应工厂即可。
+
+## 11. 示例精读
+
+`examples/extensions/` 下有七十多个示例。permission-gate 第 1 节已经讲过，这里看另外两个：plan-mode 和 subagent。
+
+### 11.1 plan-mode：计划模式
+
+目标行为：`/plan` 或 `Ctrl+Alt+P` 进入只读模式，模型只能读代码、用白名单里的 bash 命令，并按 `Plan:` 格式输出编号步骤；用户确认后切回完整权限执行计划，模型每完成一步输出 `[DONE:n]`，界面显示进度。
+
+用到的 API：
+
+| 需求 | API |
+| --- | --- |
+| 开关 | `registerCommand("plan")`、`registerShortcut(Key.ctrlAlt("p"))`、`registerFlag("plan")` |
+| 禁用写工具 | `getActiveTools()`、`setActiveTools()` |
+| 限制 bash | `on("tool_call")` 返回 `block` |
+| 告诉模型规则 | `on("before_agent_start")` 返回 `message` |
+| 退出后清理提示 | `on("context")` 过滤消息 |
+| 跟踪进度 | `on("turn_end")` |
+| 计划完成后询问 | `on("agent_end")`、`ctx.ui.select`、`ctx.ui.editor`、`sendMessage`、`sendUserMessage` |
+| 状态显示 | `ctx.ui.setStatus`、`ctx.ui.setWidget` |
+| 持久化与恢复 | `appendEntry`、`on("session_start")` |
+
+**禁用写工具**。进入计划模式时记下当前工具集合，然后去掉 edit 和 write：
+
+```ts title="packages/coding-agent/examples/extensions/plan-mode/index.ts:104-114"
+	function enablePlanModeTools(): void {
+		if (toolsBeforePlanMode === undefined) {
+			toolsBeforePlanMode = pi.getActiveTools();
+		}
+		pi.setActiveTools(getPlanModeTools(toolsBeforePlanMode));
+	}
+
+	function restoreNormalModeTools(): void {
+		pi.setActiveTools(toolsBeforePlanMode ?? getNormalModeTools(pi.getActiveTools()));
+		toolsBeforePlanMode = undefined;
+	}
+```
+
+`setActiveTools` 改的是声明给模型的工具集合，模型根本看不到 edit、write。这比“看到了但调用时拒绝”更干净，模型不会浪费 turn 去尝试。
+
+**限制 bash**。bash 不能整个去掉，因为 `grep`、`git log` 这类只读命令很有用。所以只拦截不在白名单里的命令：
+
+```ts title="packages/coding-agent/examples/extensions/plan-mode/index.ts:163-174"
+	// Block destructive bash commands in plan mode
+	pi.on("tool_call", async (event) => {
+		if (!planModeEnabled || event.toolName !== "bash") return;
+
+		const command = event.input.command as string;
+		if (!isSafeCommand(command)) {
+			return {
+				block: true,
+				reason: `Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\nCommand: ${command}`,
+			};
+		}
+	});
+```
+
+`isSafeCommand` 要求命令既匹配某个安全模式（以 `cat`、`grep`、`git status` 等开头），又不匹配任何破坏性模式（`rm`、`>` 重定向、`npm install`、`git commit` 等），见 [plan-mode/utils.ts:97-101](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/examples/extensions/plan-mode/utils.ts#L97-L101)。被拦截时 `reason` 告诉模型怎么办（让用户先退出计划模式）。
+
+**告诉模型规则**。每次用户发消息时注入一条看不见的 custom 消息：
+
+```ts title="packages/coding-agent/examples/extensions/plan-mode/index.ts:203-232"
+	pi.on("before_agent_start", async (event) => {
+		if (event.messageType !== "user") return;
+
+		if (planModeEnabled) {
+			return {
+				message: {
+					customType: "plan-mode-context",
+					content: `[PLAN MODE ACTIVE]
+You are in plan mode - a read-only exploration mode for safe code analysis.
+
+Restrictions:
+- Built-in edit and write tools are disabled
+- Other currently active tools remain available
+- Bash is restricted to an allowlist of read-only commands
+
+Ask clarifying questions using the questionnaire tool.
+Use brave-search skill via bash for web research.
+
+Create a detailed numbered plan under a "Plan:" header:
+
+Plan:
+1. First step description
+2. Second step description
+...
+
+Do NOT attempt to make changes - just describe what you would do.`,
+					display: false,
+				},
+			};
+		}
+```
+
+`display: false` 表示这条消息进 LLM 上下文，但不在界面上显示。`messageType !== "user"` 的判断让后台通知等 custom 消息触发的运行不重复注入。
+
+**退出后清理**。问题：注入的 `[PLAN MODE ACTIVE]` 消息留在会话历史里。退出计划模式后，模型在后续每个 turn 都还能看到“你在计划模式，不要修改文件”，会继续拒绝写文件。解决办法是用 `context` 在每次请求前把它们过滤掉，会话文件里的原始记录不变：
+
+```ts title="packages/coding-agent/examples/extensions/plan-mode/index.ts:176-198"
+	// Filter out stale plan mode context when not in plan mode
+	pi.on("context", async (event) => {
+		if (planModeEnabled) return;
+
+		return {
+			messages: event.messages.filter((m) => {
+				const msg = m as AgentMessage & { customType?: string };
+				if (msg.customType === "plan-mode-context") return false;
+				if (msg.role !== "user") return true;
+
+				const content = msg.content;
+				if (typeof content === "string") {
+					return !content.includes("[PLAN MODE ACTIVE]");
+				}
+				if (Array.isArray(content)) {
+					return !content.some(
+						(c) => c.type === "text" && (c as TextContent).text?.includes("[PLAN MODE ACTIVE]"),
+					);
+				}
+				return true;
+			}),
+		};
+	});
+```
+
+这里体现了 `context` 事件的定位：它只影响“这一次请求发什么”，不改历史。
+
+**计划完成后询问**。`agent_end` 时从最后一条助手消息里提取编号步骤，然后弹出选择框：
+
+```ts title="packages/coding-agent/examples/extensions/plan-mode/index.ts:283-333"
+		if (!planModeEnabled || !ctx.hasUI) return;
+
+		// Extract todos from last assistant message
+		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
+		// ...
+		const choice = await ctx.ui.select("Plan mode - what next?", [
+			"Execute the plan (track progress)",
+			"Stay in plan mode",
+			"Refine the plan",
+		]);
+
+		if (choice?.startsWith("Execute")) {
+			const firstTodoItem = todoItems[0];
+			if (!firstTodoItem) return;
+
+			planModeEnabled = false;
+			executionMode = true;
+			restoreNormalModeTools();
+			updateStatus(ctx);
+			persistState();
+
+			const remainingList = todoItems.map((t) => `${t.step}. ${t.text}`).join("\n");
+			const execMessage = `Execute the plan.
+
+Remaining steps:
+${remainingList}
+
+Start with: ${firstTodoItem.text}
+After completing a step, include a [DONE:n] tag in your response.`;
+			pi.sendMessage(planTodoListMessage, { deliverAs: "followUp" });
+			pi.sendMessage(
+				{ customType: "plan-mode-execute", content: execMessage, display: true },
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+```
+
+选择执行后，扩展恢复工具集合，再用 `sendMessage(..., { triggerTurn: true, deliverAs: "followUp" })` 发出执行指令，开始新一轮运行。执行期间，`turn_end` handler 扫描助手消息里的 `[DONE:n]`，更新 `setWidget` 显示的待办列表。
+
+**持久化与恢复**。扩展的状态（是否在计划模式、待办列表、原工具集合）每次变化都用 `appendEntry("plan-mode", {...})` 写进会话文件。恢复会话时从 entry 里读回来：
+
+```ts title="packages/coding-agent/examples/extensions/plan-mode/index.ts:344-361"
+	pi.on("session_start", async (_event, ctx) => {
+		if (pi.getFlag("plan") === true) {
+			planModeEnabled = true;
+		}
+
+		const entries = ctx.sessionManager.getEntries();
+
+		// Restore persisted state
+		const planModeEntry = entries
+			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "plan-mode")
+			.pop() as { data?: PlanModeState } | undefined;
+
+		if (planModeEntry?.data) {
+			planModeEnabled = planModeEntry.data.enabled ?? planModeEnabled;
+			todoItems = planModeEntry.data.todos ?? todoItems;
+			executionMode = planModeEntry.data.executing ?? executionMode;
+			toolsBeforePlanMode = planModeEntry.data.toolsBeforePlanMode ?? toolsBeforePlanMode;
+		}
+```
+
+custom entry 不进 LLM 上下文，又跟着会话树走。用 `/tree` 跳回旧分支时，读到的就是那个分支上的状态。扩展不需要自己管理状态文件。
+
+### 11.2 subagent：子代理
+
+目标行为：注册一个 `subagent` 工具，模型可以把任务交给专门的子 agent（scout 侦察、planner 规划、worker 执行、reviewer 审查），子 agent 有独立的上下文窗口。支持单个、并行（最多 8 个任务，同时最多 4 个）、链式（后一步用 `{previous}` 引用前一步输出）三种模式。
+
+核心思路很简单：**子 agent 就是另一个 pi 进程**。
+
+```ts title="packages/coding-agent/examples/extensions/subagent/index.ts:298-348"
+	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	const inheritsDispatchConfig = !agent.model;
+	const model = agent.model ?? dispatchDefaults.model;
+	if (model) args.push("--model", model);
+	if (inheritsDispatchConfig && dispatchDefaults.thinkingLevel) {
+		args.push("--thinking", dispatchDefaults.thinkingLevel);
+	}
+	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+		// ...
+		args.push(`Task: ${task}`);
+		let wasAborted = false;
+
+		const exitCode = await new Promise<number>((resolve) => {
+			const invocation = getPiInvocation(args);
+			const proc = spawn(invocation.command, invocation.args, {
+				cwd: cwd ?? defaultCwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+```
+
+`--mode json -p --no-session` 让子进程以 print 模式运行，把所有会话事件逐行输出成 JSON，不写会话文件（第 7 章讲 JSON 输出格式）。`--append-system-prompt` 指向 agent 定义文件的正文，`--tools` 限制子 agent 能用的工具。agent 定义是带 frontmatter 的 Markdown，例如 `agents/scout.md` 写着 `tools: read, grep, find, ls, bash` 和 `model: claude-haiku-4-5`。
+
+父进程逐行解析子进程的 stdout：
+
+```ts title="packages/coding-agent/examples/extensions/subagent/index.ts:351-418"
+			const processLine = (line: string) => {
+				if (!line.trim()) return;
+				let event: any;
+				try {
+					event = JSON.parse(line);
+				} catch {
+					return;
+				}
+
+				if (event.type === "message_end" && event.message) {
+					const msg = event.message as Message;
+					currentResult.messages.push(msg);
+
+					if (msg.role === "assistant") {
+						currentResult.usage.turns++;
+						const usage = msg.usage;
+						if (usage) {
+							currentResult.usage.input += usage.input || 0;
+							currentResult.usage.output += usage.output || 0;
+							currentResult.usage.cacheRead += usage.cacheRead || 0;
+							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+							currentResult.usage.cost += usage.cost?.total || 0;
+							currentResult.usage.contextTokens = usage.totalTokens || 0;
+						}
+						if (!currentResult.model && msg.model) currentResult.model = msg.model;
+						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+					}
+					emitUpdate();
+				}
+
+				if (event.type === "tool_result_end" && event.message) {
+					currentResult.messages.push(event.message as Message);
+					emitUpdate();
+				}
+			};
+			// ...
+			if (signal) {
+				const killProc = () => {
+					wasAborted = true;
+					proc.kill("SIGTERM");
+					setTimeout(() => {
+						if (!proc.killed) proc.kill("SIGKILL");
+					}, 5000);
+				};
+				if (signal.aborted) killProc();
+				else signal.addEventListener("abort", killProc, { once: true });
+			}
+```
+
+每收到一条 `message_end` 就累加 token 用量，并通过 `onUpdate` 把中间结果推给 UI，用户能看到子 agent 正在调用什么工具。父 agent 被中止（Esc）时，`signal` 触发，先发 SIGTERM，5 秒后还没退出就 SIGKILL。
+
+这段代码里还有一个 `tool_result_end` 分支。在 pi 当前源码里搜不到这个事件类型；工具结果消息已经作为 `role: "toolResult"` 的 `message_end` 发出，被上面的分支收集了。所以这个分支实际上不会执行。
+
+工具注册部分：
+
+```ts title="packages/coding-agent/examples/extensions/subagent/index.ts:469-539"
+export default function (pi: ExtensionAPI) {
+	pi.registerTool({
+		name: "subagent",
+		label: "Subagent",
+		description: [
+			"Delegate tasks to specialized subagents with isolated context.",
+			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
+			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
+		].join(" "),
+		parameters: SubagentParams,
+
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const agentScope: AgentScope = params.agentScope ?? "user";
+			const dispatchDefaults: DispatchDefaults = {
+				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+				thinkingLevel: ctx.thinkingLevel,
+			};
+			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const agents = discovery.agents;
+			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+
+			// ...
+			if (
+				(agentScope === "project" || agentScope === "both") &&
+				confirmProjectAgents &&
+				ctx.hasUI &&
+				!ctx.isProjectTrusted()
+			) {
+					// ...
+					const ok = await ctx.ui.confirm(
+						"Run project-local agents?",
+						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+					);
+```
+
+两点值得注意：
+
+- 子 agent 默认继承父会话当前的模型和思考级别（`dispatchDefaults` 读 `ctx.model`、`ctx.thinkingLevel`），agent 定义里写了 `model` 时以定义为准。
+- 项目目录 `.pi/agents/` 下的 agent 定义来自仓库，可能是恶意的。所以默认只用用户目录的 agent；使用项目 agent 时，如果项目不受信任，先 `ctx.ui.confirm` 让用户确认。这和第 9 节的项目信任是同一个考虑。
+
+最后，`renderCall` / `renderResult` 让这个工具在终端里显示成可折叠的子 agent 进度树，而不是一大段 JSON（[subagent/index.ts:721-1030](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/examples/extensions/subagent/index.ts#L721-L1030)）。
+
+### 11.3 三个示例对照
+
+| 示例 | 主要机制 | 说明了什么 |
+| --- | --- | --- |
+| permission-gate | `tool_call` 拦截 + `ctx.ui.select` | 权限系统只是一个事件 handler |
+| plan-mode | 工具集合切换 + 四个事件 + `appendEntry` | 模式切换由“改工具、改提示、改上下文”组合而成 |
+| subagent | `registerTool` + 子进程 + JSON 模式 | 子代理复用 pi 自己的 print/JSON 模式，不需要核心支持 |
+
+## 小结
+
+- pi 不内置权限、计划模式、子代理，而是提供足够细的扩展接口，这些功能都写成扩展。
+- 扩展是默认导出工厂函数的 TS 文件。loader 用 jiti 在运行时加载，通过 alias 或虚拟模块让扩展拿到宿主进程里的同一份 pi 模块。
+- `ExtensionAPI` 分注册方法和动作方法。动作方法在加载期是会抛错的占位函数，`bindCore` 后才可用；provider 等全局修改在加载期排队，工厂失败时整体丢弃。
+- 事件共 41 种，分通知、改写、拦截三种能力。每种需要合并的事件都有专门的 emit 方法和明确的合并规则；`tool_call` 的 handler 出错时按拦截处理。
+- 钩子分三层：agent-core 定义回调，sdk.ts 和 AgentSession 填入实现，ExtensionRunner 分发给扩展。事件先给扩展，再给 UI 等监听者。
+- 工具、命令、快捷键、CLI 参数、provider、渲染器、UI 都可以注册；同名冲突有固定的处理规则。
+- skills、prompt templates、themes 是文本资源；package-manager 从 npm、git 或本地路径安装扩展包；trust-manager 防止陌生仓库的项目级资源被自动加载。
+- mcp、codemode、tool-search、llama 这些内置功能也是扩展，并且可以被第三方扩展替换。
+
+## 动手验证
+
+1. **加载 permission-gate**：从仓库根目录运行 `./pi-test.sh -e packages/coding-agent/examples/extensions/permission-gate.ts`，让模型执行 `sudo ls`，观察选择框；选 No 后看模型收到的错误结果。再用 `./pi-test.sh -p -e packages/coding-agent/examples/extensions/permission-gate.ts "run sudo ls"` 在 print 模式下运行，确认它走了 `!ctx.hasUI` 分支。
+2. **写一个最小扩展**：在任意项目下建 `.pi/extensions/hello.ts`，订阅 `input` 事件，把输入里的 `??` 替换成 `Please explain`，返回 `{ action: "transform", text }`。启动 pi（会询问是否信任项目），输入 `?? this repo`；修改文件后用 `/reload` 热重载。
+3. **读 runner 测试**：在 `packages/coding-agent` 下运行 `node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/extensions-runner.test.ts`，对照第 4.3 节的合并规则表看各个用例。`test/extensions-input-event.test.ts`、`test/extensions-discovery.test.ts` 分别覆盖 input 事件和目录发现规则。
+4. **读 plan-mode 测试**：`test/plan-mode-extension.test.ts` 用 faux provider 驱动完整的计划、执行流程，可以看到 `[DONE:n]` 如何更新进度。

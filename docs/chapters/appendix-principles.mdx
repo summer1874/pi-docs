@@ -1,0 +1,634 @@
+---
+title: 附录　贯穿全程的练习与设计原则
+---
+
+import { Diagram, Say } from '../../theme/narration';
+
+# 附录　贯穿全程的练习与设计原则
+
+## 导读
+
+<Say id="kap-01">附录做两件事：把一句输入走过的完整链路串起来，再总结源码里反复出现的六条设计原则。</Say>
+<Say id="kap-02">链路从编辑器回车开始，经过 AgentSession、Agent、runLoop，到 pi-ai 发出 HTTP 请求。</Say>
+<Say id="kap-03">回程是事件逐层包装：模型事件变成 Agent 事件，再变成会话事件，交给扩展和界面。</Say>
+<Say id="kap-04">最后在 message_end 时，消息作为一条 entry 追加进会话的 JSONL 文件。</Say>
+<Say id="kap-05">六条原则是：事件逐层包装、消息只在边界转换、会话是只追加的树。</Say>
+<Say id="kap-06">还有 Provider 与 API 解耦并按需加载、钩子分三层、小核心加扩展。</Say>
+<Say id="kap-07">每一步和每条原则都给出源码位置，读完可以自己在编辑器里跟一遍。</Say>
+
+## 1. 练习：一句输入的完整调用链
+
+在交互模式里输入“读一下 README”并回车。下面按顺序列出它经过的每一站。每站给出源码位置和关键代码，细节回到对应章节去看。
+
+总览：
+
+```
+editor.onSubmit → InteractiveMode 主循环 → AgentSession.prompt → Agent.prompt → runAgentLoop
+→ streamAssistantResponse → streamFn → modelRuntime.streamSimple → provider.streamSimple
+→ lazyApi → anthropic-messages → HTTP
+← AssistantMessageEvent ← AgentEvent ← AgentSessionEvent
+→ 扩展处理 → InteractiveMode 渲染 → message_end 时写入 JSONL
+```
+
+### 第 1 站：编辑器提交（第 7 章）
+
+回车触发 `defaultEditor.onSubmit`。斜杠命令、`!` bash 命令、compaction 期间的输入都有各自的分支；模型正在输出时走 `streamingBehavior: "steer"`。空闲时的普通输入交给 `onInputCallback`：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3338-3359"
+			// If streaming, use prompt() with steer behavior
+			// This handles extension commands (execute immediately), prompt template expansion, and queueing
+			if (this.session.isStreaming) {
+				this.editor.addToHistory?.(text);
+				this.editor.setText("");
+				await this.session.prompt(text, { streamingBehavior: "steer" });
+				this.updatePendingMessagesDisplay();
+				this.ui.requestRender();
+				return;
+			}
+
+			// Normal message submission
+			// First, move any pending bash components to chat
+			this.flushPendingBashComponents();
+
+			if (this.onInputCallback) {
+				this.onInputCallback(text);
+			} else {
+				this.pendingUserInputs.push(text);
+			}
+			this.editor.addToHistory?.(text);
+		};
+```
+
+`onInputCallback` 是 `getUserInput()` 返回的 Promise 的 resolve（[interactive-mode.ts:4249-4254](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L4249-L4254)）。等待它的是交互模式的主循环：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:1253-1262"
+		// Main interactive loop
+		while (true) {
+			const userInput = await this.getUserInput();
+			try {
+				await this.session.prompt(userInput);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
+			}
+		}
+```
+
+### 第 2 站：AgentSession.prompt（第 3 章）
+
+`AgentSession.prompt` 依次做：扩展命令 → `input` 事件（扩展可改写或拦截）→ 展开 skill 和 prompt template → 如果正在输出就排队 → 检查模型和鉴权 → 开始一次运行：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2116-2127"
+		// Emit input event for extension interception (before skill/template expansion)
+		const processedInput = await this._runInputHandlers(
+			text,
+			options?.images,
+			options?.source ?? "interactive",
+			this.isStreaming ? options?.streamingBehavior : undefined,
+		);
+		if (!processedInput) {
+			preflightResult?.("handled");
+			return;
+		}
+		const { text: currentText, images: currentImages } = processedInput;
+```
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:2172-2174"
+		await this._startRun({ messageType: "user", prompt: expandedText, images: currentImages }, () =>
+			preflightResult?.("started"),
+		);
+```
+
+`_startRun` 触发 `before_agent_start` 等准备工作后，调用 agent-core：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1898-1899"
+		try {
+			await this.agent.prompt(messages);
+```
+
+### 第 3 站：Agent.prompt（第 2 章）
+
+```ts title="packages/agent/src/agent.ts:441-455"
+	private async runPromptMessages(
+		messages: AgentMessage[],
+		options: { skipInitialSteeringPoll?: boolean } = {},
+	): Promise<void> {
+		await this.runWithLifecycle(async (signal) => {
+			await runAgentLoop(
+				messages,
+				this.createContextSnapshot(),
+				this.createLoopConfig(options),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+			);
+		});
+	}
+```
+
+`Agent.prompt` 先把字符串规范成 user 消息（[agent.ts:382-390](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/src/agent.ts#L382-L390)），然后进入上面的 `runPromptMessages`。注意第四个参数 `emit`：循环产生的每个事件都会回到 `processEvents`。
+
+### 第 4 站：runAgentLoop 与 streamAssistantResponse（第 2 章）
+
+`runAgentLoop` 发出 `agent_start`、`turn_start` 和 user 消息的 `message_start/end`，然后进入双层循环 `runLoop`：
+
+```ts title="packages/agent/src/agent-loop.ts:126-133"
+	await emit({ type: "agent_start" });
+	await emit({ type: "turn_start" });
+	for (const message of initialMessages) {
+		await emit({ type: "message_start", message });
+		await emit({ type: "message_end", message });
+	}
+
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+```
+
+每个 turn 调用一次 `streamAssistantResponse`。这里是“消息边界”：`AgentMessage[]` 先经扩展的 `context` 事件变换，再转成 pi-ai 的 `Message[]`，然后调用 `streamFn`：
+
+```ts title="packages/agent/src/agent-loop.ts:397-417"
+	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+	let messages = context.messages;
+	if (config.transformContext) {
+		messages = await config.transformContext(messages, signal);
+	}
+
+	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
+	const llmMessages = await config.convertToLlm(messages);
+
+	const llmContext = normalizeContext({ messages: llmMessages });
+
+	// Resolve API key (important for expiring tokens)
+	const resolvedApiKey =
+		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+
+	const response = await streamFunction(config.model, llmContext, {
+		...config,
+		apiKey: resolvedApiKey,
+		identity: mergeClientIdentity(DEFAULT_AGENT_IDENTITY, config.identity),
+		signal,
+	});
+```
+
+### 第 5 站：streamFn → modelRuntime.streamSimple（第 3 章）
+
+`streamFn` 是 coding-agent 在 `sdk.ts` 里构造 `Agent` 时注入的：
+
+```ts title="packages/coding-agent/src/core/sdk.ts:411-423"
+		convertToLlm: convertToLlmWithBlockImages,
+		streamFn: async (model, context, options) => {
+			const requestOptions = buildRequestOptions(options);
+			// Compaction and summaries use their own routing ids; only session requests
+			// replace the cache entry, so warming restarts from them. Keep warming while
+			// the current transcript still extends the request's prefix. Agent state may
+			// shallow-copy the messages array or refresh the model object without changing
+			// the provider request, so top-level object identity is not a valid cache key.
+			if (options?.sessionId === sessionManager.getSessionId()) {
+				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+			}
+			return modelRuntime.streamSimple(model, context, requestOptions);
+		},
+```
+
+`modelRuntime.streamSimple` 处理虚拟模型路由、鉴权准备，然后交给 provider：
+
+```ts title="packages/coding-agent/src/core/model-runtime.ts:752-756"
+		return lazyStream(model, async () => {
+			assertChatModel(model);
+			const prepared = await this.prepareRequest(model, options);
+			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+		});
+```
+
+### 第 6 站：provider → API → HTTP（第 1 章）
+
+provider 按模型的 `api` 字段分派到传输协议实现：
+
+```ts title="packages/ai/src/models.ts:1159-1161"
+		stream: (model, context, options) => dispatch(model, (streams) => streams.stream(model, context, options)),
+		streamSimple: (model, context, options) =>
+			dispatch(model, (streams) => streams.streamSimple(model, context, options)),
+```
+
+Anthropic provider 的 `api` 是一个懒加载包装，第一次请求时才 `import("./anthropic-messages.ts")`：
+
+```ts title="packages/ai/src/api/anthropic-messages.lazy.ts:1-4"
+import type { ProviderStreams } from "../types.ts";
+import { lazyApi } from "./lazy.ts";
+
+export const anthropicMessagesApi = (): ProviderStreams => lazyApi(() => import("./anthropic-messages.ts"));
+```
+
+真正的 HTTP 请求在这里发出：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:660-668"
+				try {
+					response = await retryProviderRequest(
+						() => client.beta.messages.create(params, requestOptions).asResponse(),
+						{
+							maxRetries: options?.maxRetries,
+							maxRetryDelayMs: options?.maxRetryDelayMs,
+							signal: options?.signal,
+						},
+					);
+```
+
+### 第 7 站：回程第一层，AssistantMessageEvent（第 1 章）
+
+服务器的 SSE 事件被翻译成 pi-ai 统一的 `AssistantMessageEvent`，推进 `AssistantMessageEventStream`：
+
+```ts title="packages/ai/src/api/anthropic-messages.ts:771-782"
+				} else if (event.type === "content_block_delta") {
+					const open = openBlock(event.index);
+					if (event.delta.type === "text_delta") {
+						if (open?.block.type === "text") {
+							open.block.text += event.delta.text;
+							stream.push({
+								type: "text_delta",
+								contentIndex: open.contentIndex,
+								delta: event.delta.text,
+								partial: output,
+							});
+						}
+```
+
+### 第 8 站：回程第二层，AgentEvent（第 2 章）
+
+`streamAssistantResponse` 消费这个流，把每个 `AssistantMessageEvent` 包进 `message_update`：
+
+```ts title="packages/agent/src/agent-loop.ts:433-451"
+			case "text_start":
+			case "text_delta":
+			case "text_end":
+			case "thinking_start":
+			case "thinking_delta":
+			case "thinking_end":
+			case "toolcall_start":
+			case "toolcall_delta":
+			case "toolcall_end":
+				if (partialMessage) {
+					partialMessage = event.partial;
+					context.messages[context.messages.length - 1] = partialMessage;
+					await emit({
+						type: "message_update",
+						assistantMessageEvent: event,
+						message: { ...partialMessage },
+					});
+				}
+				break;
+```
+
+`emit` 就是 `Agent.processEvents`：先更新 Agent 自己的状态，再依次 await 每个订阅者：
+
+```ts title="packages/agent/src/agent.ts:575-588"
+	private async processEvents(event: AgentEvent): Promise<void> {
+		switch (event.type) {
+			case "message_start":
+				this._state.streamingMessage = event.message;
+				break;
+
+			case "message_update":
+				this._state.streamingMessage = event.message;
+				break;
+
+			case "message_end":
+				this._state.streamingMessage = undefined;
+				this._state.messages.push(event.message);
+				break;
+```
+
+模型回复里如果有 read 工具调用，`runLoop` 会执行它（中间经过 `beforeToolCall`，也就是扩展的 `tool_call` 事件），把结果追加到上下文，开始下一个 turn，重复第 4 到第 8 站，直到模型不再调用工具。
+
+### 第 9 站：回程第三层，AgentSessionEvent 与扩展（第 3、6 章）
+
+`AgentSession` 订阅了 Agent（[agent-session.ts:513](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/agent-session.ts#L513)）。收到事件后先给扩展，再给公开订阅者：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1142-1144"
+		// Emit to extensions first, then notify public listeners.
+		await this._emitExtensionEvent(event);
+		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+```
+
+`_emitExtensionEvent` 把 Agent 事件翻译成扩展事件，例如 `message_update`：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1327-1333"
+		} else if (event.type === "message_update") {
+			const extensionEvent: MessageUpdateEvent = {
+				type: "message_update",
+				message: event.message,
+				assistantMessageEvent: event.assistantMessageEvent,
+			};
+			await this._extensionRunner.emit(extensionEvent);
+```
+
+### 第 10 站：InteractiveMode 渲染（第 7 章）
+
+交互模式是 `AgentSession` 的一个普通订阅者：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3362-3366"
+	private subscribeToAgent(): void {
+		this.unsubscribe = this.session.subscribe(async (event) => {
+			await this.handleEvent(event);
+		});
+	}
+```
+
+收到 `message_update` 时更新正在流式输出的组件，遇到新的工具调用就建一个工具执行组件：
+
+```ts title="packages/coding-agent/src/modes/interactive/interactive-mode.ts:3486-3489"
+			case "message_update":
+				if (this.streamingComponent && event.message.role === "assistant") {
+					this.streamingMessage = event.message;
+					this.streamingComponent.updateContent(this.streamingMessage, true);
+```
+
+pi-tui 随后做差分渲染，只重绘变化的行。
+
+### 第 11 站：message_end 写入 JSONL（第 5 章）
+
+还是在 `_handleAgentEvent` 里，通知完扩展和订阅者后，`message_end` 触发持久化：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:1146-1166"
+		// Handle session persistence
+		if (event.type === "message_end") {
+			let entryId: string | undefined;
+			// Check if this is a custom message from extensions
+			if (event.message.role === "custom") {
+				// Persist as CustomMessageEntry
+				entryId = this.sessionManager.appendCustomMessageEntry(
+					event.message.customType,
+					event.message.content,
+					event.message.display,
+					event.message.details,
+				);
+			} else if (
+				event.message.role === "system" ||
+				event.message.role === "user" ||
+				event.message.role === "assistant" ||
+				event.message.role === "toolResult"
+			) {
+				// Regular LLM message - persist as SessionMessageEntry
+				entryId = this.sessionManager.appendMessage(event.message);
+			}
+```
+
+`appendMessage` 生成一条以当前叶子为父的 entry，并追加一行 JSON 到会话文件：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1214-1224"
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			message,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+```
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1186-1188"
+		} else {
+			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+		}
+```
+
+至此，一句输入走完全程。
+
+## 2. 六条设计原则
+
+### 原则 1：事件逐层包装
+
+**是什么**：三层事件，下层事件被原样包在上层事件里。UI、RPC、扩展都只是订阅者。
+
+**证据**：`AgentEvent` 的 `message_update` 直接携带 pi-ai 的 `AssistantMessageEvent`：
+
+```ts title="packages/agent/src/types.ts:524-527"
+	| { type: "message_start"; message: AgentMessage }
+	// Only emitted for assistant messages during streaming
+	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
+	| { type: "message_end"; message: AgentMessage }
+```
+
+`AgentSessionEvent` 又把 `AgentEvent` 整体并进来，再加上会话层自己的事件：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:196-210"
+export type AgentSessionEvent =
+	| WithParentToolCallId<Exclude<AgentEvent, { type: "agent_end" }>>
+	| {
+			type: "agent_end";
+			messages: AgentMessage[];
+			willRetry: boolean;
+	  }
+	| { type: "agent_settled"; aborted: boolean }
+	| {
+			type: "queue_update";
+			steering: readonly string[];
+			followUp: readonly string[];
+	  }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "entry_appended"; entry: SessionEntry }
+```
+
+**好处**：每层只加自己知道的信息，不丢下层细节。交互模式、print 模式、RPC 模式订阅同一个 `AgentSession`，所以行为一致。相关章节：[第 1 章](/chapters/ch01-pi-ai)、[第 2 章](/chapters/ch02-agent-core)、[第 7 章](/chapters/ch07-ui)。
+
+### 原则 2：消息只在边界转换
+
+**是什么**：agent 内部一直用信息更丰富的 `AgentMessage`，只在调用模型前一刻转成 pi-ai 的 `Message[]`。
+
+**证据**：转换只发生在 `streamAssistantResponse` 一处（见上文第 4 站，[agent-loop.ts:397-404](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/agent/src/agent-loop.ts#L397-L404)）。coding-agent 的 `convertToLlm` 定义了自定义消息怎么变成模型能理解的消息：
+
+```ts title="packages/coding-agent/src/core/messages.ts:148-175"
+export function convertToLlm(messages: AgentMessage[]): Message[] {
+	return messages
+		.map((m): Message | undefined => {
+			switch (m.role) {
+				case "bashExecution":
+					// Skip messages excluded from context (!! prefix)
+					if (m.excludeFromContext) {
+						return undefined;
+					}
+					return {
+						role: "user",
+						content: [{ type: "text", text: bashExecutionToText(m) }],
+						timestamp: m.timestamp,
+					};
+				case "custom": {
+					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
+					return {
+						role: "user",
+						content,
+						timestamp: m.timestamp,
+					};
+				}
+				case "branchSummary":
+					return {
+						role: "user",
+						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
+						timestamp: m.timestamp,
+					};
+```
+
+**好处**：`bashExecution`、`branchSummary` 这些消息在会话和 UI 里保留完整结构（命令、退出码、摘要来源），模型只看到它需要的文本。用 `!!` 执行的命令带 `excludeFromContext`，在边界处直接丢弃。相关章节：[第 2 章](/chapters/ch02-agent-core)、[第 3 章](/chapters/ch03-coding-agent)。
+
+### 原则 3：会话是只追加的树
+
+**是什么**：每条 entry 用 `id/parentId` 挂在树上，文件只追加不改写。当前上下文是从叶子沿父指针走回根得到的一条路径。
+
+**证据**：`appendMessage` 总是以当前叶子为父（见上文第 11 站）；持久化用 `appendFileSync`。读取活动分支：
+
+```ts title="packages/coding-agent/src/core/session-manager.ts:1479-1489"
+	getBranch(fromId?: string): SessionEntry[] {
+		const path: SessionEntry[] = [];
+		const startId = fromId ?? this.leafId;
+		let current = startId ? this.byId.get(startId) : undefined;
+		while (current) {
+			path.push(current);
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
+		path.reverse();
+		return path;
+	}
+```
+
+**好处**：从旧节点继续对话只是把 `leafId` 移回去再追加，旧分支原样留在文件里；compaction 追加一条摘要 entry，不删除旧消息。崩溃时最多丢最后一行。codemode 的 `store()` 写入也是作为自定义 entry 追加的，所以天然按分支隔离（[第 8 章](/chapters/ch08-small-packages)）。相关章节：[第 5 章](/chapters/ch05-session)。
+
+### 原则 4：Provider 和 API 解耦，按需加载
+
+**是什么**：provider 负责鉴权和模型列表，API 负责传输协议。多个 provider 共用一个 API 实现，API 实现在第一次请求时才加载。
+
+**证据**：groq、cerebras、deepseek 三个 provider 的 `api` 都是同一个 `openAICompletionsApi()`（[groq.ts:13](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/providers/groq.ts#L13)、[cerebras.ts:13](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/providers/cerebras.ts#L13)、[deepseek.ts:13](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/ai/src/providers/deepseek.ts#L13)）。懒加载由 `lazyApi` 实现：
+
+```ts title="packages/ai/src/api/lazy.ts:98-104"
+export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
+	const api: ProviderStreams = {
+		stream: (model, context, options) =>
+			lazyStream(model, async () => (await load()).stream(model, context, options)),
+		streamSimple: (model, context, options) =>
+			lazyStream(model, async () => (await load()).streamSimple(model, context, options)),
+	};
+```
+
+**好处**：加一个 OpenAI 兼容的 provider 只需要写鉴权和模型列表；启动时不加载 15 种协议的实现。第 10 章的入口预算检查（`check-entry-graphs.mjs`）保证这种懒加载不会被无意中破坏。相关章节：[第 1 章](/chapters/ch01-pi-ai)、[第 10 章](/chapters/ch10-engineering)。
+
+### 原则 5：钩子分三层
+
+**是什么**：agent-core 定义钩子接口但不实现；AgentSession 实现这些钩子；实现的内容是把调用转发成扩展事件。
+
+**证据**：以工具调用前的拦截为例。第一层，agent-core 只声明一个可选回调：
+
+```ts title="packages/agent/src/types.ts:319-326"
+	/**
+	 * Called before a tool is executed, after arguments have been validated.
+	 *
+	 * Return `{ block: true }` to prevent execution. The loop emits an error tool result instead.
+	 * A blocked result can also set `terminate: true` to participate in the batch early-termination rule.
+	 * The hook receives the agent abort signal and is responsible for honoring it.
+	 */
+	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
+```
+
+第二层，AgentSession 装上实现；第三层，实现内容是发出扩展的 `tool_call` 事件：
+
+```ts title="packages/coding-agent/src/core/agent-session.ts:652-674"
+	private _installAgentToolHooks(): void {
+		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
+		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+	}
+
+	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
+	private async _beforeToolCall(
+		{ toolCall, args }: BeforeToolCallContext,
+		parentToolCallId?: string,
+	): Promise<BeforeToolCallResult | undefined> {
+		const runner = this._extensionRunner;
+		if (!runner.hasHandlers("tool_call")) {
+			return undefined;
+		}
+
+		try {
+			return await runner.emitToolCall({
+				type: "tool_call",
+				toolName: toolCall.name,
+				toolCallId: toolCall.id,
+				...(parentToolCallId ? { parentToolCallId } : {}),
+				input: args as Record<string, unknown>,
+			});
+```
+
+`transformContext` 是同样的结构：agent-core 在第 4 站调用它，`sdk.ts` 把它实现为 `runner.emitContext(messages)`（[sdk.ts:428-432](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/src/core/sdk.ts#L428-L432)）。
+
+**好处**：agent-core 不知道扩展的存在，保持 2.5k 行，可以单独使用；扩展作者面对的是稳定的事件名，而不是 agent-core 的内部接口。相关章节：[第 2 章](/chapters/ch02-agent-core)、[第 3 章](/chapters/ch03-coding-agent)、[第 6 章](/chapters/ch06-extensions)。
+
+### 原则 6：小核心 + 扩展
+
+**是什么**：核心不内置 sub-agent、plan mode 和权限系统。这些交给扩展；真正需要隔离时靠容器或沙箱。
+
+**证据**：CONTRIBUTING.md 开篇就是这一条：
+
+```md title="CONTRIBUTING.md:7-11"
+First things first: **pi's core is minimal**.
+
+If your feature does not belong in the core, it should be an extension. PRs that bloat the core will likely be rejected.
+
+Pi's core exists to be minimal and to be extensible so that it can be influenced and manipulated by extensions.  Even hook points for extensions however should be well considered and discussed to avoid adding unmaintainable bloat and complex interactions.
+```
+
+文档也直说工具用的是 pi 进程自己的系统权限：
+
+```md title="packages/coding-agent/docs/how-pi-works.md:47-49"
+## Trust and permissions
+
+Pi resolves project trust before loading project settings and resources. After the trust decision and project-resource loading, Pi loads context files. Enabled tools use the operating-system permissions of the Pi process. Extensions execute inside that process.
+```
+
+需要权限确认时，写一个扩展订阅 `tool_call` 即可，示例只有 30 多行：
+
+```ts title="packages/coding-agent/examples/extensions/permission-gate.ts:10-34"
+export default function (pi: ExtensionAPI) {
+	const dangerousPatterns = [/\brm\s+(-rf?|--recursive)/i, /\bsudo\b/i, /\b(chmod|chown)\b.*777/i];
+
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName !== "bash") return undefined;
+
+		const command = event.input.command as string;
+		const isDangerous = dangerousPatterns.some((p) => p.test(command));
+
+		if (isDangerous) {
+			if (!ctx.hasUI) {
+				// In non-interactive mode, block by default
+				return { block: true, reason: "Dangerous command blocked (no UI for confirmation)" };
+			}
+
+			const choice = await ctx.ui.select(`⚠️ Dangerous command:\n\n  ${command}\n\nAllow?`, ["Yes", "No"]);
+
+			if (choice !== "Yes") {
+				return { block: true, reason: "Blocked by user" };
+			}
+		}
+
+		return undefined;
+	});
+}
+```
+
+`examples/extensions/` 下还有 `plan-mode`、`subagent`、`sandbox`、`gondolin` 等目录，分别实现计划模式、子 agent 和沙箱隔离。连 MCP 和 codemode 也是以内置扩展的形式放在 `src/extensions/` 下，而不是写进 AgentSession（[第 8 章](/chapters/ch08-small-packages)）。
+
+**好处**：核心小，读得完、改得动；不同用户要的权限模型差别很大，交给扩展比在核心里做一个“折中方案”更合适。相关章节：[第 6 章](/chapters/ch06-extensions)、[第 8 章](/chapters/ch08-small-packages)。
+
+## 小结
+
+| 原则 | 一句话 | 关键源码 |
+|---|---|---|
+| 事件逐层包装 | 下层事件原样包进上层事件 | `agent/src/types.ts:524-527`、`agent-session.ts:196-210` |
+| 消息只在边界转换 | 调用模型前才 `convertToLlm` | `agent-loop.ts:397-404`、`messages.ts:148` |
+| 会话是只追加的树 | `parentId` 连成树，`appendFileSync` 追加 | `session-manager.ts:1214-1224`、`1479-1489` |
+| Provider 与 API 解耦 | provider 管鉴权，API 管协议，按需 import | `api/lazy.ts:98-104`、`api/anthropic-messages.lazy.ts:4` |
+| 钩子分三层 | core 声明、session 实现、扩展订阅 | `agent/src/types.ts:326`、`agent-session.ts:652-674` |
+| 小核心 + 扩展 | 权限、计划、子 agent 都是扩展 | `CONTRIBUTING.md:7-11`、`examples/extensions/permission-gate.ts` |
+
+## 动手验证
+
+1. 用 `./pi-test.sh` 启动 pi，输入一句会触发 read 工具的话。另开终端 `tail -f` 当前会话的 JSONL 文件（`~/.pi/agent/sessions/` 下按 cwd 分目录，以实际路径为准），对照第 11 站，看 user、assistant、toolResult 三种 entry 依次出现，以及每条的 `parentId` 指向上一条。
+2. 在第 1 到第 11 站的源码位置各打一个断点（或 `console.error`），用 `node --inspect` 运行 `./pi-test.sh` 中的命令，亲自走一遍调用链。
+3. 读 [packages/coding-agent/test/suite/agent-session-prompt.test.ts](https://github.com/earendil-works/pi/blob/44f6851b7f27ad5c18ccc94f6b4321650e757e3e/packages/coding-agent/test/suite/agent-session-prompt.test.ts)：它用 faux provider 走的正是第 2 到第 11 站（第 6 站被 faux 替换），断言了事件和消息顺序。
