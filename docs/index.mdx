@@ -1,0 +1,52 @@
+---
+title: 总览：四层架构
+---
+
+import { Diagram, Say } from '../theme/narration';
+
+# 总览：pi 是怎么搭起来的
+
+点底部的 **播放**，跟着语音读。讲到哪个模块，图上对应的节点会亮起来；点任意一句话，就从那句开始讲。
+
+<Diagram src="/diagrams/layers.html" title="pi 的四层架构" />
+
+<Say id="a01" cue="user">pi 是一个开源的 AI 编程助手，跑在终端里。</Say>
+<Say id="a02">你说一句“帮我修个 bug”，它会自己读代码、改代码、跑测试。</Say>
+<Say id="a03">把它拆开，主干只有四层。我们从你打字的地方开始，一层层往下走。</Say>
+
+## 界面和装配
+
+<Say id="a04" cue="tui">最上面是 pi-tui，负责终端界面：输入框、滚动、只重绘变化的那几行。</Say>
+<Say id="a05" cue="coding">你按下回车，输入交给 coding-agent。</Say>
+<Say id="a06" cue="coding">coding-agent 是装配层，会话文件、内置工具、扩展，都在这里接到一起。</Say>
+
+## 循环和模型接口
+
+<Say id="a07" cue="agent">它把你的话交给 agent-core。这一层只有两千五百行左右，核心是一个循环。</Say>
+<Say id="a08" cue="ai">循环需要调用模型时，走 pi-ai。</Say>
+<Say id="a09" cue="ai">pi-ai 把几十家模型的协议，统一成一种消息格式和一种事件流。</Say>
+<Say id="a10" cue="llm">最后才是真正的网络请求，发到 Anthropic、OpenAI 这些模型服务。</Say>
+
+## 工具和扩展
+
+<Say id="a11" cue="tools">模型想读文件、跑命令时，循环去执行下面这些内置工具。</Say>
+<Say id="a12" cue="ext">上面单独的那一块是扩展：你自己写的 TypeScript 模块，通过事件钩子接进来。</Say>
+<Say id="a13" cue="ext">pi 刻意不内置子代理、计划模式和权限系统，这些都留给扩展去做。</Say>
+<Say id="a14">记住这条线：界面、装配、循环、模型接口。接下来逐层细看。</Say>
+
+## 包和代码量
+
+| 包 | 职责 | src 代码量 |
+|---|---|---|
+| `pi-tui` | 终端界面，差分渲染 | 约 20k 行 |
+| `pi-coding-agent` | CLI、会话、工具、扩展 | 约 76k 行 |
+| `pi-agent-core` | Agent 循环 | 约 2.5k 行 |
+| `pi-ai` | 统一 LLM 接口 | 约 29k 行 |
+
+```text
+pi-coding-agent
+ ├─ pi-agent-core ─ pi-ai ─ pi-telemetry
+ ├─ pi-tui
+ ├─ pi-codemode
+ └─ pi-mcp
+```

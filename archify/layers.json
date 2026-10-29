@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "pi 的四层架构",
+    "locale": "zh-CN",
+    "output": "docs/public/diagrams/layers.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "git@github.com:earendil-works/pi.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "44f6851b7f27ad5c18ccc94f6b4321650e757e3e"
+    }
+  },
+  "components": [
+    { "id": "user", "type": "external", "label": "你", "sublabel": "终端里打字", "pos": [40, 180], "size": [130, 64] },
+    { "id": "tui", "type": "frontend", "label": "pi-tui", "sublabel": "终端界面", "pos": [250, 180], "size": [130, 64],
+      "sources": [{ "path": "packages/tui/src/tui.ts", "label": "TUI" }] },
+    { "id": "coding", "type": "backend", "label": "coding-agent", "sublabel": "会话 / 工具 / 扩展", "pos": [460, 180], "size": [130, 64],
+      "sources": [
+        { "path": "packages/coding-agent/package.json", "line": 44, "end_line": 48, "label": "依赖" },
+        { "path": "packages/coding-agent/src/modes/interactive/interactive-mode.ts", "line": 1, "end_line": 5, "label": "界面交给 TUI" }
+      ] },
+    { "id": "agent", "type": "backend", "label": "agent-core", "sublabel": "Agent 循环", "pos": [670, 180], "size": [130, 64],
+      "sources": [
+        { "path": "packages/agent/package.json", "line": 26, "label": "只依赖 pi-ai" },
+        { "path": "packages/agent/src/agent-loop.ts", "line": 172, "end_line": 338, "label": "runLoop" }
+      ] },
+    { "id": "ai", "type": "backend", "label": "pi-ai", "sublabel": "统一 LLM 接口", "pos": [880, 180], "size": [130, 64],
+      "sources": [{ "path": "packages/ai/src/models.ts", "line": 929, "label": "streamSimple" }] },
+    { "id": "llm", "type": "cloud", "label": "模型服务", "sublabel": "Anthropic / OpenAI…", "pos": [1090, 180], "size": [130, 64],
+      "sources": [{ "path": "packages/ai/src/api/anthropic-messages.ts", "line": 662, "label": "发出请求" }] },
+    { "id": "ext", "type": "messagebus", "label": "扩展", "sublabel": "你写的 TS 模块", "pos": [460, 30], "size": [130, 64],
+      "sources": [{ "path": "packages/coding-agent/src/core/extensions/loader.ts", "line": 1, "end_line": 12, "label": "jiti 加载" }] },
+    { "id": "tools", "type": "database", "label": "内置工具", "sublabel": "read / edit / bash", "pos": [670, 340], "size": [130, 64],
+      "sources": [{ "path": "packages/coding-agent/src/core/tools/index.ts", "line": 164, "label": "createCodingToolDefinitions" }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "pi monorepo", "wraps": ["tui", "coding", "agent", "ai", "tools"] }
+  ],
+  "connections": [
+    { "id": "type", "from": "user", "to": "tui", "label": "键入", "variant": "emphasis" },
+    { "id": "submit", "from": "tui", "to": "coding", "label": "提交" },
+    { "id": "prompt", "from": "coding", "to": "agent", "label": "prompt", "variant": "emphasis" },
+    { "id": "stream", "from": "agent", "to": "ai", "label": "流式调用", "variant": "emphasis" },
+    { "id": "http", "from": "ai", "to": "llm", "label": "HTTPS" },
+    { "id": "hooks", "from": "ext", "to": "coding", "label": "事件钩子", "variant": "dashed", "fromSide": "bottom", "toSide": "top" },
+    { "id": "exec", "from": "agent", "to": "tools", "label": "执行", "fromSide": "bottom", "toSide": "top" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "从下往上读", "items": ["pi-ai 把各家协议统一成一种消息和事件流", "agent-core 只有约 2.5k 行，核心是 runLoop", "coding-agent 把会话、工具、扩展装配起来"] },
+    { "dot": "amber", "title": "刻意不内置", "items": ["子代理、计划模式、权限系统交给扩展"] }
+  ]
+}

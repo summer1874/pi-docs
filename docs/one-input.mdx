@@ -1,0 +1,32 @@
+---
+title: 一句输入走一遍
+---
+
+import { Diagram, Say } from '../theme/narration';
+
+# 一句输入走一遍
+
+<Diagram src="/diagrams/flow.html" title="一句输入的完整链路" />
+
+## 进去
+
+<Say id="d01">最后，把一句输入从头到尾走一遍，把前面几层串起来。</Say>
+<Say id="d02" cue="user">你在终端里敲下一句话，按回车。</Say>
+<Say id="d03" cue="editor">编辑器把文字交给 AgentSession 的 prompt 方法。</Say>
+<Say id="d04" cue="sessionPrompt">这里会展开提示模板。如果 agent 正在忙，这句话就进 steering 或 follow-up 队列。</Say>
+<Say id="d05" cue="runLoop">空闲的话，就调用 Agent.prompt，启动我们刚才看的 runLoop。</Say>
+
+## 到模型
+
+<Say id="d06" cue="streamSimple">runLoop 把上下文转成模型消息，交给 pi-ai 的 streamSimple。</Say>
+<Say id="d07" cue="provider">streamSimple 按模型的协议类型，找到对应的实现，比如 anthropic-messages。</Say>
+<Say id="d08" cue="llm">由它发出真正的网络请求，再把流式响应还原成统一的事件。</Say>
+<Say id="d09" cue="tools">模型要工具的话，runLoop 执行工具，把结果交回，再请求一次模型。</Say>
+
+## 回来
+
+<Say id="d10" cue="dispatch">这一路上，循环不断发出事件。</Say>
+<Say id="d11" cue="dispatch">AgentSession 收到事件，先交给扩展，再通知其他订阅者。</Say>
+<Say id="d12" cue="render">界面据此实时刷新，你看到回复一个字一个字地出来。</Say>
+<Say id="d13" cue="persist">每条消息结束时，写进会话的 JSONL 文件，下次打开还能接着聊。</Say>
+<Say id="d14">四层，一个循环，一条事件流。读源码时抓住这三样，就不会迷路。</Say>

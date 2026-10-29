@@ -1,0 +1,280 @@
+/* ---------- Narrated sentences ---------- */
+:root {
+  --narration-mark: rgba(255, 138, 40, 0.3);
+  --narration-mark-hover: rgba(255, 138, 40, 0.12);
+}
+html.dark {
+  --narration-mark: rgba(255, 138, 40, 0.32);
+  --narration-mark-hover: rgba(255, 138, 40, 0.14);
+}
+.say {
+  cursor: pointer;
+  border-radius: 3px;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  transition: background-color 0.25s ease;
+}
+.say:hover {
+  background: var(--narration-mark-hover);
+}
+/* A highlighter stroke across the lower half of the line, like a marker pen. */
+.say.say-active {
+  background: linear-gradient(transparent 52%, var(--narration-mark) 52%);
+}
+
+/* ---------- Diagram card ---------- */
+.narration-diagram {
+  position: relative;
+  margin: 20px 0 28px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--rp-c-bg, #fff);
+  border: 1px solid var(--rp-c-divider-light, rgba(0, 0, 0, 0.08));
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px rgba(15, 23, 42, 0.06);
+  transition: box-shadow 0.3s ease;
+}
+.narration-diagram iframe {
+  display: block;
+  width: 100%;
+  height: min(54vh, 540px);
+  border: 0;
+  transition: height 0.45s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.narration-diagram a {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--rp-c-text-1, #222);
+  text-decoration: none;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(12px) saturate(160%);
+}
+html.dark .narration-diagram a {
+  background: rgba(40, 40, 46, 0.55);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+/* While narrating, the diagram stays in view and the text scrolls beneath it. */
+html.narrating .narration-diagram {
+  position: sticky;
+  top: calc(var(--rp-nav-height, 64px) + var(--rp-sidebar-menu-height, 0px) + 10px);
+  z-index: 5;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06), 0 18px 40px rgba(15, 23, 42, 0.14);
+}
+html.narrating .narration-diagram iframe {
+  height: min(40vh, 420px);
+}
+/* The doc column scrolls on x (overflow: auto), which would pin the sticky diagram to that box instead of the window. */
+html.narrating .rp-doc-layout__doc {
+  overflow: visible;
+}
+
+/* ---------- Player: a liquid-glass capsule ---------- */
+.narration-bar {
+  --glass-bg: linear-gradient(135deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.28));
+  --glass-edge: rgba(255, 255, 255, 0.75);
+  --glass-shine: rgba(255, 255, 255, 0.95);
+  --glass-text: #1d1d1f;
+  --glass-sub: rgba(29, 29, 31, 0.6);
+  --glass-hover: rgba(255, 255, 255, 0.55);
+  --glass-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 12px 32px rgba(15, 23, 42, 0.16), 0 24px 60px rgba(15, 23, 42, 0.1);
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  z-index: 100;
+  transform: translateX(-50%);
+  width: min(700px, calc(100vw - 32px));
+  height: 64px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border-radius: 32px;
+  overflow: hidden;
+  color: var(--glass-text);
+  background: var(--glass-bg);
+  backdrop-filter: blur(22px) saturate(190%) brightness(1.04);
+  border: 1px solid var(--glass-edge);
+  box-shadow:
+    inset 0 1px 0 var(--glass-shine),
+    inset 0 -1px 1px rgba(255, 255, 255, 0.35),
+    inset 0 0 18px rgba(255, 255, 255, 0.28),
+    var(--glass-shadow);
+  transition: width 0.5s var(--ease);
+}
+/* Specular sheen: light catching the top of the glass. */
+.narration-bar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 90% at 18% -20%, rgba(255, 255, 255, 0.55), transparent 55%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.28), transparent 50%);
+  mix-blend-mode: soft-light;
+}
+html.dark .narration-bar {
+  --glass-bg: linear-gradient(135deg, rgba(58, 58, 66, 0.55), rgba(24, 24, 28, 0.42));
+  --glass-edge: rgba(255, 255, 255, 0.14);
+  --glass-shine: rgba(255, 255, 255, 0.22);
+  --glass-text: #f5f5f7;
+  --glass-sub: rgba(245, 245, 247, 0.6);
+  --glass-hover: rgba(255, 255, 255, 0.1);
+  --glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.45), 0 24px 60px rgba(0, 0, 0, 0.3);
+}
+html.dark .narration-bar::before {
+  background: radial-gradient(120% 90% at 18% -20%, rgba(255, 255, 255, 0.16), transparent 55%);
+  mix-blend-mode: normal;
+}
+
+.narration-bar button {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 0.2s ease, transform 0.1s ease-out;
+}
+.narration-bar button:hover {
+  background: var(--glass-hover);
+}
+.narration-bar button:active {
+  transform: scale(0.92);
+}
+.narration-bar button:focus-visible {
+  outline: 2px solid var(--rp-c-brand, #ff5e00);
+  outline-offset: 2px;
+}
+
+.narration-bar .narration-play {
+  width: 48px;
+  height: 48px;
+  margin: 0 2px;
+  color: #fff;
+  background: radial-gradient(circle at 32% 26%, #ffb37e 0%, #ff6a12 55%, #e24c00 100%);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.6), inset 0 -2px 4px rgba(150, 40, 0, 0.35), 0 4px 14px rgba(255, 94, 0, 0.4);
+}
+.narration-bar .narration-play:hover {
+  background: radial-gradient(circle at 32% 26%, #ffc092 0%, #ff7524 55%, #ea5200 100%);
+}
+.narration-ring {
+  position: absolute;
+  inset: -4px;
+  width: 56px;
+  height: 56px;
+  transform: rotate(-90deg);
+  pointer-events: none;
+}
+.narration-ring circle {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+}
+.narration-ring circle:first-child {
+  stroke: rgba(255, 94, 0, 0.16);
+}
+.narration-ring circle:last-child {
+  stroke: #ff6a12;
+  transition: stroke-dashoffset 0.3s linear;
+}
+
+/* Prev button and the main group fold away when collapsed. */
+.narration-side {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  transition: opacity 0.25s ease, max-width 0.5s var(--ease);
+  max-width: 700px;
+}
+.narration-main {
+  flex: 1;
+}
+.narration-text {
+  flex: 1;
+  min-width: 0;
+  padding: 0 6px;
+}
+.narration-line {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.narration-meta {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--glass-sub);
+  font-variant-numeric: tabular-nums;
+}
+.narration-bar .narration-rate {
+  width: auto;
+  min-width: 44px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 15px;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  background: var(--glass-hover);
+}
+.narration-bar .narration-fold {
+  width: 36px;
+  height: 36px;
+  color: var(--glass-sub);
+}
+
+.narration-bar.is-collapsed {
+  width: 116px;
+  gap: 4px;
+}
+.narration-bar.is-collapsed .narration-side {
+  opacity: 0;
+  max-width: 0;
+  pointer-events: none;
+}
+.narration-bar.is-collapsed .narration-play {
+  margin-left: 0;
+}
+
+@media (max-width: 520px) {
+  .narration-bar {
+    bottom: 12px;
+  }
+  .narration-bar .narration-rate {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .narration-bar,
+  .narration-side,
+  .narration-diagram iframe {
+    transition: none;
+  }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .narration-bar {
+    background: var(--rp-c-bg, #fff);
+    backdrop-filter: none;
+  }
+}
+
+/* Leave room so the last paragraph is not hidden behind the bar. */
+body {
+  padding-bottom: 104px;
+}

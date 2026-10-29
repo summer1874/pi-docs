@@ -1,0 +1,45 @@
+---
+title: Agent 循环
+---
+
+import { Diagram, Say } from '../theme/narration';
+
+# Agent 循环：runLoop
+
+<Diagram src="/diagrams/loop.html" title="runLoop：Agent 的双层循环" />
+
+## 内层循环
+
+<Say id="c01">现在进到核心：agent-core 里的 runLoop。</Say>
+<Say id="c02" cue="inject">你的输入，先被写进上下文。</Say>
+<Say id="c03" cue="model">然后调用模型。调用之前，内部消息会被转换成 pi-ai 认识的格式。</Say>
+<Say id="c04" cue="decide">模型流式回复。回复结束后，看里面有没有工具调用。</Say>
+<Say id="c05" cue="exec">有的话，就执行这些工具。读文件、改代码、跑命令，都发生在这里。</Say>
+<Say id="c06" cue="inject">工具结果写回上下文，然后回到起点，进入下一轮。</Say>
+<Say id="c07" cue="model">每一轮叫一个 turn：一次模型回复，加上它要的全部工具。</Say>
+<Say id="c08" cue="decide">直到模型不再要工具，内层循环才结束。</Say>
+
+## 外层循环
+
+<Say id="c09" cue="followup">但还没完。外层循环会检查 follow-up 队列。</Say>
+<Say id="c10" cue="followup">follow-up 是你在它干活时排队发的消息。有的话，就再跑一遍。</Say>
+<Say id="c11" cue="done">队列也空了，才真正结束，发出 agent_end 事件。</Say>
+<Say id="c12" cue="inject">还有一种插话叫 steering，它不用等到最后，每一轮开始前就会被注入。</Say>
+<Say id="c13">整个循环不到两百行，建议你打开 agent-loop.ts，逐行读一遍。</Say>
+
+```ts
+// packages/agent/src/agent-loop.ts（简化）
+while (true) {
+  while (hasMoreToolCalls || pending.length > 0) {
+    inject(pending);
+    const message = await streamAssistantResponse(context);
+    const toolCalls = message.content.filter((c) => c.type === "toolCall");
+    hasMoreToolCalls = toolCalls.length > 0;
+    if (hasMoreToolCalls) context.push(...(await executeToolCalls(toolCalls)));
+    pending = await getSteeringMessages();
+  }
+  pending = await getFollowUpMessages();
+  if (pending.length === 0) break;
+}
+emit({ type: "agent_end" });
+```

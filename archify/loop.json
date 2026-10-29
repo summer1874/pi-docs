@@ -1,0 +1,233 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "runLoop：Agent 的双层循环",
+    "locale": "zh-CN",
+    "output": "docs/public/diagrams/loop.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "git@github.com:earendil-works/pi.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "44f6851b7f27ad5c18ccc94f6b4321650e757e3e"
+    }
+  },
+  "lanes": [
+    {
+      "id": "io",
+      "label": "输入"
+    },
+    {
+      "id": "loop",
+      "label": "runLoop"
+    },
+    {
+      "id": "tools",
+      "label": "工具"
+    }
+  ],
+  "mainPath": [
+    "input",
+    "inject",
+    "model",
+    "decide",
+    "followup",
+    "done"
+  ],
+  "nodes": [
+    {
+      "id": "input",
+      "lane": "io",
+      "col": 0,
+      "type": "external",
+      "label": "你的输入",
+      "sublabel": "agent.prompt()",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent.ts",
+          "line": 382,
+          "label": "prompt"
+        }
+      ]
+    },
+    {
+      "id": "inject",
+      "lane": "loop",
+      "col": 1,
+      "type": "backend",
+      "label": "注入消息",
+      "sublabel": "新输入 / steering",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 219,
+          "end_line": 225,
+          "label": "写入上下文"
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "lane": "loop",
+      "col": 2,
+      "type": "backend",
+      "label": "调用模型",
+      "sublabel": "流式回复",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 251,
+          "label": "streamAssistantResponse"
+        },
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 398,
+          "end_line": 404,
+          "label": "转成 LLM 消息"
+        }
+      ]
+    },
+    {
+      "id": "decide",
+      "lane": "loop",
+      "col": 3,
+      "type": "security",
+      "label": "要用工具？",
+      "sublabel": "toolCall 块",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 267,
+          "end_line": 268,
+          "label": "筛出 toolCall"
+        }
+      ]
+    },
+    {
+      "id": "exec",
+      "lane": "tools",
+      "col": 3,
+      "type": "messagebus",
+      "label": "执行工具",
+      "sublabel": "结果写回上下文",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 270,
+          "end_line": 286,
+          "label": "executeToolCalls"
+        }
+      ]
+    },
+    {
+      "id": "followup",
+      "lane": "loop",
+      "col": 4,
+      "type": "backend",
+      "label": "有排队消息？",
+      "sublabel": "follow-up 队列",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 310,
+          "end_line": 317,
+          "label": "getFollowUpMessages"
+        }
+      ]
+    },
+    {
+      "id": "done",
+      "lane": "loop",
+      "col": 5,
+      "type": "external",
+      "label": "结束",
+      "sublabel": "agent_end",
+      "sources": [
+        {
+          "path": "packages/agent/src/agent-loop.ts",
+          "line": 329,
+          "label": "agent_end"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "start",
+      "from": "input",
+      "to": "inject"
+    },
+    {
+      "id": "ask",
+      "from": "inject",
+      "to": "model",
+      "variant": "emphasis"
+    },
+    {
+      "id": "reply",
+      "from": "model",
+      "to": "decide"
+    },
+    {
+      "id": "use-tool",
+      "from": "decide",
+      "to": "exec",
+      "label": "要",
+      "variant": "emphasis",
+      "role": "branch"
+    },
+    {
+      "id": "next-turn",
+      "from": "exec",
+      "to": "inject",
+      "label": "下一轮",
+      "variant": "emphasis",
+      "role": "return",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "route": "bottom-channel"
+    },
+    {
+      "id": "no-tool",
+      "from": "decide",
+      "to": "followup",
+      "label": "不要"
+    },
+    {
+      "id": "outer",
+      "from": "followup",
+      "to": "inject",
+      "label": "有，再跑",
+      "variant": "dashed",
+      "role": "return",
+      "fromSide": "top",
+      "toSide": "top",
+      "route": "up-channel"
+    },
+    {
+      "id": "finish",
+      "from": "followup",
+      "to": "done",
+      "label": "没有"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "内层循环",
+      "items": [
+        "一个 turn = 一次模型回复 + 它要的全部工具",
+        "还有工具调用或 steering 消息就继续"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "外层循环",
+      "items": [
+        "本该结束时查 follow-up 队列，有就再跑",
+        "模型报错或被中止时直接结束"
+      ]
+    }
+  ]
+}
