@@ -1,5 +1,6 @@
 import { useDark, useLocation, useNavigate, withBase } from '@rspress/core/runtime';
 import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { lensMap, supportsBackdropSvgFilter } from './glass';
 import { player, prepareDiagram } from './player';
 import './narration.css';
 
@@ -82,6 +83,28 @@ export function NarrationBar() {
   useEffect(() => player.pageChanged(), [pathname]);
   useEffect(() => setCollapsed(readCollapsed()), []);
 
+  // Rebuild the lens map whenever the capsule's size changes (collapse, viewport resize).
+  const bar = useRef<HTMLDivElement>(null);
+  const [lens, setLens] = useState<{ url: string; w: number; h: number } | null>(null);
+  const visible = ids.length > 0;
+  useEffect(() => {
+    const el = bar.current;
+    if (!el || !supportsBackdropSvgFilter()) return;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const { width, height } = el.getBoundingClientRect();
+        setLens({ url: lensMap(width, height), w: width, h: height });
+      });
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [visible]);
+
   const toggleCollapsed = () => {
     setCollapsed(!collapsed);
     try {
@@ -89,7 +112,7 @@ export function NarrationBar() {
     } catch {}
   };
 
-  if (ids.length === 0) return null;
+  if (!visible) return null;
   const index = current ? ids.indexOf(current) : -1;
   const total = ids.reduce((s, id) => s + player.duration(id), 0);
   const done = ids.slice(0, Math.max(0, index)).reduce((s, id) => s + player.duration(id), 0) + (index >= 0 ? elapsed : 0);
@@ -98,7 +121,29 @@ export function NarrationBar() {
   const ring = 2 * Math.PI * 22;
 
   return (
-    <div className={`narration-bar${collapsed ? ' is-collapsed' : ''}`} role="region" aria-label="语音讲解">
+    <div
+      ref={bar}
+      className={`narration-bar${collapsed ? ' is-collapsed' : ''}${lens ? ' has-lens' : ''}`}
+      role="region"
+      aria-label="语音讲解"
+    >
+      {lens ? (
+        <svg className="narration-lens-defs" aria-hidden="true">
+          <filter
+            id="narration-lens"
+            x="0"
+            y="0"
+            width={lens.w}
+            height={lens.h}
+            filterUnits="userSpaceOnUse"
+            primitiveUnits="userSpaceOnUse"
+            colorInterpolationFilters="sRGB"
+          >
+            <feImage href={lens.url} x="0" y="0" width={lens.w} height={lens.h} preserveAspectRatio="none" result="map" />
+            <feDisplacementMap in="SourceGraphic" in2="map" scale="44" xChannelSelector="R" yChannelSelector="G" />
+          </filter>
+        </svg>
+      ) : null}
       <div className="narration-side">
         <button type="button" onClick={() => player.step(-1)} aria-label="上一句">
           <Icon d={ICONS.prev} />

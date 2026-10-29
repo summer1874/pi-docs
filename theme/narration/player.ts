@@ -153,10 +153,14 @@ function normalize(path: string) {
   return path.replace(/\.html$/, '').replace(/\/index$/, '/').replace(/\/$/, '') || '/';
 }
 
-/** Keep the active line in the lower part of the viewport, below the sticky diagram. */
+/**
+ * Scroll the active line into the reading area: about 40% down when the diagram is docked on the
+ * right, and in the lower part of the viewport when the diagram strip is stuck to the top.
+ */
 function bringIntoView(el: HTMLElement) {
+  const docked = window.matchMedia('(width >= 1280px)').matches;
   const rect = el.getBoundingClientRect();
-  const top = window.scrollY + rect.top - window.innerHeight * 0.68;
+  const top = window.scrollY + rect.top - window.innerHeight * (docked ? 0.4 : 0.62);
   window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
 }
 
@@ -165,6 +169,9 @@ function bringIntoView(el: HTMLElement) {
 // The viewer's toolbars are hidden too: the embedded frame is too small for them, and "全屏打开" keeps them.
 const DIAGRAM_CSS = `
 .toolbar, .diagram-nav, .archify-toast, .header { display: none !important; }
+.diagram-container { border-radius: 0 !important; box-shadow: none !important; border: 0 !important; }
+/* Archify keeps wide diagrams at least 720px; the docked panel is narrower, so fit to width instead of cropping. */
+.diagram-container > svg { min-width: 0 !important; }
 html.narration-cue svg g[data-node-id] { transition: opacity .35s, filter .35s; }
 html.narration-cue svg g[data-node-id]:not(.narration-on) { opacity: .28; }
 svg g[data-node-id].narration-on { filter: drop-shadow(0 0 6px #ffcc00) drop-shadow(0 0 14px rgba(255,204,0,.6)); }

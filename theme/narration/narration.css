@@ -22,73 +22,146 @@ html.dark {
   background: linear-gradient(transparent 52%, var(--narration-mark) 52%);
 }
 
-/* ---------- Diagram card ---------- */
+/* ---------- Diagram panel: square, hairline-bordered ---------- */
 .narration-diagram {
   position: relative;
   margin: 20px 0 28px;
-  border-radius: 16px;
-  overflow: hidden;
   background: var(--rp-c-bg, #fff);
-  border: 1px solid var(--rp-c-divider-light, rgba(0, 0, 0, 0.08));
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px rgba(15, 23, 42, 0.06);
-  transition: box-shadow 0.3s ease;
+  border: 1px solid var(--rp-c-divider-light, rgba(0, 0, 0, 0.1));
 }
 .narration-diagram iframe {
   display: block;
   width: 100%;
   height: min(54vh, 540px);
   border: 0;
-  transition: height 0.45s cubic-bezier(0.32, 0.72, 0, 1);
 }
 .narration-diagram a {
   position: absolute;
-  right: 12px;
-  bottom: 12px;
+  right: 0;
+  bottom: 0;
   padding: 4px 10px;
-  border-radius: 999px;
   font-size: 12px;
-  color: var(--rp-c-text-1, #222);
+  color: var(--rp-c-text-2, #666);
   text-decoration: none;
-  background: rgba(255, 255, 255, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.7);
-  backdrop-filter: blur(12px) saturate(160%);
+  background: var(--rp-c-bg, #fff);
+  border-top: 1px solid var(--rp-c-divider-light, rgba(0, 0, 0, 0.1));
+  border-left: 1px solid var(--rp-c-divider-light, rgba(0, 0, 0, 0.1));
 }
-html.dark .narration-diagram a {
-  background: rgba(40, 40, 46, 0.55);
-  border-color: rgba(255, 255, 255, 0.12);
+.narration-diagram a:hover {
+  color: var(--rp-c-brand, #ff5e00);
 }
-/* While narrating, the diagram stays in view and the text scrolls beneath it. */
-html.narrating .narration-diagram {
-  position: sticky;
-  top: calc(var(--rp-nav-height, 64px) + var(--rp-sidebar-menu-height, 0px) + 10px);
-  z-index: 5;
-  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06), 0 18px 40px rgba(15, 23, 42, 0.14);
+
+/*
+ * While narrating, the diagram must stay visible without eating the reading area.
+ * Wide screens: it docks as a full-height panel on the right (replacing the outline) and the text
+ * keeps the whole viewport height. Narrow screens: a compact strip sticks under the nav.
+ */
+@media (width >= 1280px) {
+  html.narrating {
+    --narration-dock-w: clamp(420px, 40vw, 760px);
+    --rp-sidebar-margin-left: 0px;
+    --rp-content-padding-x: 56px;
+  }
+  /* Centre the player over the text column, between the sidebar and the dock. */
+  html.narrating .narration-bar {
+    --bar-left: calc((var(--rp-sidebar-width) + 100vw - var(--narration-dock-w)) / 2);
+    width: min(700px, calc(100vw - var(--rp-sidebar-width) - var(--narration-dock-w) - 32px));
+  }
+  html.narrating .rp-doc-layout__outline,
+  html.narrating .rp-doc-layout__outline-placeholder {
+    display: none;
+  }
+  html.narrating .rp-doc-layout__doc {
+    max-width: none;
+    margin-right: var(--narration-dock-w);
+  }
+  html.narrating .narration-diagram {
+    position: fixed;
+    z-index: 40;
+    top: calc(var(--rp-nav-height, 64px) + var(--rp-banner-height, 0px));
+    right: 0;
+    bottom: 0;
+    width: var(--narration-dock-w);
+    margin: 0;
+    border-width: 0 0 0 1px;
+  }
+  html.narrating .narration-diagram iframe {
+    height: 100%;
+  }
 }
-html.narrating .narration-diagram iframe {
-  height: min(40vh, 420px);
+@media (width < 1280px) {
+  html.narrating .narration-diagram {
+    position: sticky;
+    top: calc(var(--rp-nav-height, 64px) + var(--rp-sidebar-menu-height, 0px));
+    z-index: 5;
+    margin-left: calc(-1 * var(--rp-content-padding-x, 24px));
+    margin-right: calc(-1 * var(--rp-content-padding-x, 24px));
+    border-width: 0 0 1px;
+  }
+  html.narrating .narration-diagram iframe {
+    height: 30vh;
+  }
+  /* The doc column scrolls on x (overflow: auto), which would pin the sticky strip to that box instead of the window. */
+  html.narrating .rp-doc-layout__doc {
+    overflow: visible;
+  }
 }
-/* The doc column scrolls on x (overflow: auto), which would pin the sticky diagram to that box instead of the window. */
-html.narrating .rp-doc-layout__doc {
-  overflow: visible;
+
+/* ---------- Sidebar drag handle ---------- */
+html:root {
+  --rp-sidebar-width: 260px;
+}
+.sidebar-resizer {
+  position: fixed;
+  z-index: 55;
+  top: var(--rp-nav-height, 64px);
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sidebar-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: transparent;
+  transition: background-color 0.15s ease;
+}
+.sidebar-resizer:hover::after,
+.sidebar-resizer.is-dragging::after {
+  background: var(--rp-c-brand, #ff5e00);
+}
+html:has(.sidebar-resizer.is-dragging) {
+  cursor: col-resize;
+  user-select: none;
 }
 
 /* ---------- Player: a liquid-glass capsule ---------- */
 .narration-bar {
-  --glass-bg: linear-gradient(135deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.28));
-  --glass-edge: rgba(255, 255, 255, 0.75);
-  --glass-shine: rgba(255, 255, 255, 0.95);
-  --glass-text: #1d1d1f;
-  --glass-sub: rgba(29, 29, 31, 0.6);
-  --glass-hover: rgba(255, 255, 255, 0.55);
-  --glass-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 12px 32px rgba(15, 23, 42, 0.16), 0 24px 60px rgba(15, 23, 42, 0.1);
+  /* Clear glass: a thin tint, little frost; the rim and the lens (when supported) carry the material. */
+  --glass-bg: linear-gradient(160deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.12) 60%, rgba(255, 255, 255, 0.22));
+  --glass-blur: blur(7px) saturate(180%) brightness(1.06);
+  --glass-rim: rgba(255, 255, 255, 0.85);
+  --glass-rim-low: rgba(255, 255, 255, 0.4);
+  --glass-text: #111114;
+  --glass-sub: rgba(17, 17, 20, 0.62);
+  --glass-halo: 0 0 10px rgba(255, 255, 255, 0.85);
+  --glass-hover: rgba(255, 255, 255, 0.4);
+  --glass-shadow: 0 2px 6px rgba(15, 23, 42, 0.08), 0 16px 40px rgba(15, 23, 42, 0.16);
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  /* Centred over the reading area; in dock mode that area excludes the diagram panel. */
+  --bar-left: calc((100vw - var(--narration-dock-w, 0px)) / 2);
+  --bar-gap: 24px;
 
   position: fixed;
-  left: 50%;
-  bottom: 20px;
+  left: var(--bar-left);
+  bottom: var(--bar-gap);
   z-index: 100;
   transform: translateX(-50%);
-  width: min(700px, calc(100vw - 32px));
+  width: min(700px, calc(100vw - var(--narration-dock-w, 0px) - 32px));
   height: 64px;
   display: flex;
   align-items: center;
@@ -98,16 +171,33 @@ html.narrating .rp-doc-layout__doc {
   overflow: hidden;
   color: var(--glass-text);
   background: var(--glass-bg);
-  backdrop-filter: blur(22px) saturate(190%) brightness(1.04);
-  border: 1px solid var(--glass-edge);
+  backdrop-filter: var(--glass-blur);
+  border: 0;
   box-shadow:
-    inset 0 1px 0 var(--glass-shine),
-    inset 0 -1px 1px rgba(255, 255, 255, 0.35),
-    inset 0 0 18px rgba(255, 255, 255, 0.28),
+    inset 1.5px 1.5px 0 -0.5px var(--glass-rim),
+    inset -1px -1px 0 -0.5px var(--glass-rim-low),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.28),
+    inset 0 -10px 22px -14px rgba(255, 255, 255, 0.6),
     var(--glass-shadow);
-  transition: width 0.5s var(--ease);
+  transition:
+    width 0.5s var(--ease),
+    transform 0.5s var(--ease),
+    left 0.5s var(--ease);
 }
-/* Specular sheen: light catching the top of the glass. */
+/* Chromium: bend the backdrop at the rim through the lens map (see glass.ts). */
+.narration-bar.has-lens {
+  backdrop-filter: url(#narration-lens) var(--glass-blur);
+}
+.narration-lens-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+.narration-line,
+.narration-meta {
+  text-shadow: var(--glass-halo);
+}
+/* Specular sheen: light catching the upper-left of the glass. */
 .narration-bar::before {
   content: '';
   position: absolute;
@@ -115,18 +205,19 @@ html.narrating .rp-doc-layout__doc {
   border-radius: inherit;
   pointer-events: none;
   background:
-    radial-gradient(120% 90% at 18% -20%, rgba(255, 255, 255, 0.55), transparent 55%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.28), transparent 50%);
+    radial-gradient(90% 120% at 12% -30%, rgba(255, 255, 255, 0.7), transparent 50%),
+    radial-gradient(60% 80% at 100% 130%, rgba(255, 255, 255, 0.35), transparent 60%);
   mix-blend-mode: soft-light;
 }
 html.dark .narration-bar {
-  --glass-bg: linear-gradient(135deg, rgba(58, 58, 66, 0.55), rgba(24, 24, 28, 0.42));
-  --glass-edge: rgba(255, 255, 255, 0.14);
-  --glass-shine: rgba(255, 255, 255, 0.22);
+  --glass-bg: linear-gradient(160deg, rgba(80, 80, 90, 0.32), rgba(20, 20, 24, 0.22) 60%, rgba(60, 60, 70, 0.3));
+  --glass-rim: rgba(255, 255, 255, 0.45);
+  --glass-rim-low: rgba(255, 255, 255, 0.14);
   --glass-text: #f5f5f7;
-  --glass-sub: rgba(245, 245, 247, 0.6);
-  --glass-hover: rgba(255, 255, 255, 0.1);
-  --glass-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.45), 0 24px 60px rgba(0, 0, 0, 0.3);
+  --glass-sub: rgba(245, 245, 247, 0.64);
+  --glass-halo: 0 0 10px rgba(0, 0, 0, 0.75);
+  --glass-hover: rgba(255, 255, 255, 0.12);
+  --glass-shadow: 0 2px 6px rgba(0, 0, 0, 0.35), 0 16px 40px rgba(0, 0, 0, 0.45);
 }
 html.dark .narration-bar::before {
   background: radial-gradient(120% 90% at 18% -20%, rgba(255, 255, 255, 0.16), transparent 55%);
@@ -239,9 +330,11 @@ html.dark .narration-bar::before {
   color: var(--glass-sub);
 }
 
+/* Collapsed: a small capsule parked in the bottom-right corner. */
 .narration-bar.is-collapsed {
   width: 116px;
   gap: 4px;
+  transform: translateX(calc(100vw - var(--bar-left) - 100% - var(--bar-gap)));
 }
 .narration-bar.is-collapsed .narration-side {
   opacity: 0;
@@ -254,7 +347,7 @@ html.dark .narration-bar::before {
 
 @media (max-width: 520px) {
   .narration-bar {
-    bottom: 12px;
+    --bar-gap: 12px;
   }
   .narration-bar .narration-rate {
     display: none;
@@ -268,7 +361,8 @@ html.dark .narration-bar::before {
   }
 }
 @media (prefers-reduced-transparency: reduce) {
-  .narration-bar {
+  .narration-bar,
+  .narration-bar.has-lens {
     background: var(--rp-c-bg, #fff);
     backdrop-filter: none;
   }
