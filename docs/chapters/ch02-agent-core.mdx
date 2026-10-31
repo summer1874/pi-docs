@@ -2,7 +2,7 @@
 title: 第 2 章　pi-agent-core：Agent 循环
 ---
 
-import { Diagram, Say } from '../../theme/narration';
+import { Diagram, LectureVideo, Say } from '../../theme/narration';
 
 # 第 2 章　pi-agent-core：Agent 循环
 
@@ -18,6 +18,12 @@ import { Diagram, Say } from '../../theme/narration';
 <Say id="k02-06" cue="followup">没有工具调用也没有插话，内层循环结束。外层循环再看 follow-up 队列，有消息就再跑一轮。</Say>
 <Say id="k02-07" cue="done">两个队列都空了，发出 agent_end。Agent 类把这一切包成状态、队列、中止和事件订阅。</Say>
 <Say id="k02-08">读完这一章，你应该能说出每个钩子在循环的哪一步被调用，以及一次运行发出的完整事件序列。</Say>
+
+## 视频讲解
+
+约 20 分钟，按本章小节逐段讲解源码，画面中的代码取自固定提交 `44f6851`。点下方按钮跳到对应小节；播放器里可以打开字幕。
+
+<LectureVideo src="/video/ch02.mp4" poster="/video/ch02.jpg" captions="/video/ch02.vtt" title="第 2 章　pi-agent-core：Agent 循环" />
 
 ## 1. 这个包解决什么问题
 

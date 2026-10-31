@@ -1,6 +1,7 @@
 import { useDark, useLocation, useNavigate, withBase } from '@rspress/core/runtime';
 import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { lensMap, supportsBackdropSvgFilter } from './glass';
+import lectures from './lectures.json';
 import { player, prepareDiagram } from './player';
 import './narration.css';
 
@@ -42,6 +43,79 @@ export function Diagram({ src, title }: { src: string; title: string }) {
       <a href={withBase(src)} target="_blank" rel="noreferrer">
         全屏打开
       </a>
+    </div>
+  );
+}
+
+/**
+ * A video that follows the narration: each line seeks it to that line's start (theme/narration/videos.json).
+ * Played on its own it keeps its sound; pausing it mid-narration pauses the narration.
+ */
+export function NarratedVideo({ src, poster, title }: { src: string; poster?: string; title: string }) {
+  return (
+    <div className="narration-diagram narration-video">
+      <video
+        data-video={src}
+        src={withBase(src)}
+        poster={poster && withBase(poster)}
+        aria-label={title}
+        controls
+        playsInline
+        preload="metadata"
+        onPlay={(e) => {
+          if (!player.getState().playing) e.currentTarget.muted = false;
+        }}
+        onPause={(e) => {
+          if (player.getState().playing && !e.currentTarget.ended) player.pause();
+        }}
+      />
+    </div>
+  );
+}
+
+type Chapter = { title: string; start: number };
+const lectureChapters = lectures as Record<string, Chapter[]>;
+
+/**
+ * A long lecture video with its own voice: caption track, and one button per section that seeks it
+ * (chapter list in theme/narration/lectures.json). Playing it pauses the page narration.
+ */
+export function LectureVideo({ src, poster, captions, title }: { src: string; poster?: string; captions?: string; title: string }) {
+  const video = useRef<HTMLVideoElement>(null);
+  const [time, setTime] = useState(0);
+  const chapters = lectureChapters[src] ?? [];
+  const current = chapters.findLastIndex((c) => time >= c.start);
+  const seek = (t: number) => {
+    const v = video.current;
+    if (!v) return;
+    v.currentTime = t;
+    v.play().catch(() => {});
+  };
+  return (
+    <div className="lecture-video">
+      <video
+        ref={video}
+        src={withBase(src)}
+        poster={poster && withBase(poster)}
+        aria-label={title}
+        controls
+        playsInline
+        preload="metadata"
+        onPlay={() => player.pause()}
+        onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+      >
+        {captions ? <track kind="subtitles" srcLang="zh" label="中文" src={withBase(captions)} /> : null}
+      </video>
+      {chapters.length ? (
+        <div className="lecture-chapters">
+          {chapters.map((c, i) => (
+            <button key={c.start} type="button" className={i === current ? 'is-current' : undefined} onClick={() => seek(c.start)}>
+              <span>{fmt(c.start)}</span>
+              {c.title}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

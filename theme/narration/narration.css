@@ -51,6 +51,49 @@ html.dark {
   color: var(--rp-c-brand, #ff5e00);
 }
 
+/* A narrated video takes the diagram's place; it keeps 16:9 and is centred when docked. */
+.narration-video video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+/* A lecture video: its own voice and captions, section buttons below. */
+.lecture-video {
+  margin: 20px 0 28px;
+}
+.lecture-video video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+.lecture-chapters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.lecture-chapters button {
+  padding: 4px 10px;
+  font-size: 13px;
+  color: var(--rp-c-text-2, #666);
+  background: var(--rp-c-bg-soft, rgba(0, 0, 0, 0.04));
+  border: 1px solid var(--rp-c-divider-light, rgba(0, 0, 0, 0.1));
+  cursor: pointer;
+}
+.lecture-chapters button span {
+  margin-right: 6px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+.lecture-chapters button:hover,
+.lecture-chapters button.is-current {
+  color: var(--rp-c-brand, #ff5e00);
+  border-color: var(--rp-c-brand, #ff5e00);
+}
+
 /*
  * While narrating, the diagram must stay visible without eating the reading area.
  * Wide screens: it docks as a full-height panel on the right (replacing the outline) and the text
@@ -88,6 +131,10 @@ html.dark {
   html.narrating .narration-diagram iframe {
     height: 100%;
   }
+  html.narrating .narration-video {
+    display: flex;
+    align-items: center;
+  }
 }
 @media (width < 1280px) {
   html.narrating .narration-diagram {
@@ -100,6 +147,10 @@ html.dark {
   }
   html.narrating .narration-diagram iframe {
     height: 30vh;
+  }
+  html.narrating .narration-video video {
+    height: 30vh;
+    object-fit: contain;
   }
   /* The doc column scrolls on x (overflow: auto), which would pin the sticky strip to that box instead of the window. */
   html.narrating .rp-doc-layout__doc {

@@ -1,4 +1,5 @@
 import manifest from './manifest.json';
+import videoCues from './videos.json';
 
 /** Narration manifest written by scripts/narrate.py. */
 type Manifest = { pages: string[]; lines: Record<string, { duration: number; hash: string }> };
@@ -16,6 +17,8 @@ export type PlayerState = {
 
 const RATES = [1, 1.25, 1.5, 0.8];
 const data = manifest as Manifest;
+/** Per video (by public path): the second at which each narrated line starts in it. */
+const cueTimes = videoCues as Record<string, Record<string, number>>;
 
 let state: PlayerState = { playing: false, current: null, rate: 1, elapsed: 0, ids: [] };
 const listeners = new Set<() => void>();
@@ -52,6 +55,7 @@ export const player = {
   },
   pause() {
     audio?.pause();
+    pauseVideos();
     setState({ playing: false });
   },
   toggle() {
@@ -67,6 +71,7 @@ export const player = {
   cycleRate() {
     const rate = RATES[(RATES.indexOf(state.rate) + 1) % RATES.length];
     if (audio) audio.playbackRate = rate;
+    for (const v of pageVideos()) v.playbackRate = rate;
     setState({ rate });
   },
 
@@ -114,6 +119,7 @@ function start(el: HTMLElement) {
   document.documentElement.classList.add('narrating');
   bringIntoView(el);
   cue(el);
+  syncVideo(el, id);
 
   audio ??= createAudio();
   audio.src = resolveUrl(`/audio/${id}.mp3`);
@@ -142,6 +148,7 @@ function goToNextPage() {
     clearHighlight();
     document.documentElement.classList.remove('narrating');
     clearCues();
+    pauseVideos();
     setState({ playing: false, current: null });
     return;
   }
@@ -194,9 +201,7 @@ export function prepareDiagram(frame: HTMLIFrameElement, dark: boolean) {
 function cue(el: HTMLElement) {
   const ids = el.dataset.cue?.split(',').filter(Boolean);
   if (!ids?.length) return;
-  const frames = Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe[data-diagram]'));
-  const frame = frames.filter((f) => f.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING).pop();
-  const doc = frame?.contentDocument;
+  const doc = nearestAbove<HTMLIFrameElement>('iframe[data-diagram]', el)?.contentDocument;
   if (!doc?.body) return;
   doc.documentElement.classList.add('narration-cue');
   for (const g of doc.querySelectorAll('svg g[data-node-id]')) {
@@ -208,4 +213,32 @@ function clearCues() {
   for (const frame of document.querySelectorAll<HTMLIFrameElement>('iframe[data-diagram]')) {
     frame.contentDocument?.documentElement.classList.remove('narration-cue');
   }
+}
+
+/** The last element matching `selector` that comes before `el` in the document. */
+function nearestAbove<T extends Element>(selector: string, el: HTMLElement): T | undefined {
+  const all = Array.from(document.querySelectorAll<T>(selector));
+  return all.filter((f) => f.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING).pop();
+}
+
+function pageVideos() {
+  return Array.from(document.querySelectorAll<HTMLVideoElement>('video[data-video]'));
+}
+
+function pauseVideos() {
+  for (const v of pageVideos()) v.pause();
+}
+
+/**
+ * Seek the nearest narrated video above the line to where that line starts, and play it muted:
+ * the video's voice track is the same audio the player is reading, so only the picture is needed.
+ */
+function syncVideo(el: HTMLElement, id: string) {
+  const video = nearestAbove<HTMLVideoElement>('video[data-video]', el);
+  const at = video ? cueTimes[video.dataset.video!]?.[id] : undefined;
+  if (!video || at === undefined) return;
+  video.muted = true;
+  video.playbackRate = state.rate;
+  video.currentTime = at;
+  video.play().catch(() => {});
 }
